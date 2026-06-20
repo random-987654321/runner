@@ -3,7 +3,7 @@ name: Run Server & Update Chat Config
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 */1 * * *'
 
 jobs:
   run:
@@ -63,7 +63,7 @@ jobs:
 
       - name: Pull models
         run: |
-          ollama pull smallthinker:3b
+          ollama pull Phi-4-mini-flash-reasoning
           ollama pull nomic-embed-text
 
       - name: Start API server + Cloudflare tunnel
