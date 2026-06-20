@@ -92,7 +92,7 @@ jobs:
             chmod +x cloudflared
           fi
 
-          ./cloudflared tunnel --url http://localhost:8000 2>&1 | tee tunnel.log &
+          ./cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee tunnel.log &
 
           echo "Waiting for tunnel URL..."
           for i in {1..30}; do
