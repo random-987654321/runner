@@ -1,33 +1,38 @@
 name: Self‑Replicating Server (24/7)
 
 on:
-  workflow_dispatch:   # manual start – no schedule
+  workflow_dispatch:   # manual start only – no schedule
 
 permissions:
-  actions: write       # required for GITHUB_TOKEN to trigger a new run
-  contents: read       # default; not strictly needed
+  actions: write       # needed to trigger a new run via the GitHub API
+  contents: read       # (default) to read the runner repo
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 5   # maximum allowed – 6 hours
 
     steps:
-      # --- Check out the runner repo (this repo) ---
-      # Uses the default GITHUB_TOKEN (automatically provided)
+      # --------------------------------------------------------------
+      # 1. Check out the RUNNER repo (this repo) – needed so we can use
+      #    the workflow file and keep the root as a git repo (though
+      #    we won't write to it).
       - name: Checkout runner repo
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- Check out the backend repo into ./backend ---
-      # Uses your PAT (TOKEN) because it's a different repository
+      # --------------------------------------------------------------
+      # 2. Check out the BACKEND repo into a subfolder called ./backend
       - name: Checkout backend repo
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/backend
-          token: ${{ secrets.TOKEN }}
+          token: ${{ secrets.TOKEN }}          # PAT with repo scope
           path: backend
 
-      # --- Caches ---
+      # --------------------------------------------------------------
+      # 3. Caches (paths now point inside ./backend)
       - name: Cache Rust binary
         uses: actions/cache@v4
         id: binary-cache
@@ -47,10 +52,11 @@ jobs:
         uses: actions/cache@v4
         id: cloudflared-cache
         with:
-          path: ./cloudflared
+          path: ./cloudflared          # stored in the root of the runner repo
           key: cloudflared-${{ runner.os }}-v1
 
-      # --- Rust & build ---
+      # --------------------------------------------------------------
+      # 4. Setup Rust & build (inside ./backend)
       - name: Setup Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -65,7 +71,8 @@ jobs:
           cargo build --release
           cp target/release/unified-api ./
 
-      # --- Ollama ---
+      # --------------------------------------------------------------
+      # 5. Setup Ollama and pull models (cached)
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v2
 
@@ -74,21 +81,22 @@ jobs:
           ollama pull gemma3:1b
           ollama pull qwen3-embedding:0.6b
 
-      # --- Main service + self‑replication ---
-      - name: Start server, tunnel, and replicate
+      # --------------------------------------------------------------
+      # 6. Main service: start server, tunnel, update config, and self‑replicate
+      - name: Run & replicate
         env:
-          GH_TOKEN: ${{ secrets.TOKEN }}   # used for GitHub API calls to update config
+          GH_TOKEN: ${{ secrets.TOKEN }}          # used for config update and cloning
         run: |
           set -e
 
-          cd backend
+          cd backend   # everything runs inside the backend folder
 
-          # Start server
+          # --- Start the server ---
           chmod +x ./unified-api
           pkill -f unified-api 2>/dev/null || true
           ./unified-api &
 
-          # Health check
+          # Wait for health
           for i in {1..10}; do
             if curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
               echo "Server ready"
@@ -98,7 +106,8 @@ jobs:
           done
           curl -s http://localhost:8000/health | grep -q '"status":"ok"' || { echo "Server failed"; exit 1; }
 
-          # Cloudflare tunnel
+          # --- Start Cloudflare tunnel ---
+          # cloudflared binary is in the parent directory (./)
           if [ ! -f ../cloudflared ]; then
             curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ../cloudflared
             chmod +x ../cloudflared
@@ -106,7 +115,7 @@ jobs:
           pkill -f cloudflared 2>/dev/null || true
           ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee tunnel.log &
 
-          # Extract tunnel URL
+          # Extract the tunnel URL from the log
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             [ -n "$TUNNEL_URL" ] && break
@@ -114,7 +123,7 @@ jobs:
           done
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # Update config.js in chat repo (uses TOKEN)
+          # --- Update config.js in the chat repo ---
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG="const API_URL = \"${TUNNEL_URL}\";"
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -141,15 +150,16 @@ jobs:
 
           # --- Self‑replication loop ---
           START_TIME=$(date +%s)
-          TRIGGER_AT=$(( 350 * 60 ))   # 5 minutes before 6h timeout
+          TRIGGER_AT=$(( 2 * 60 ))   # 5 minutes before the 6‑hour timeout (350 min)
           TRIGGERED=false
 
           while true; do
             ELAPSED=$(( $(date +%s) - START_TIME ))
 
-            # Trigger new run at the right time (only once)
+            # Trigger a new run at the designated time (only once)
             if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
               echo "Triggering replacement workflow..."
+              # Use GITHUB_TOKEN (has actions:write) to dispatch a new run
               curl -X POST \
                 -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
                 -H "Accept: application/vnd.github.v3+json" \
@@ -158,7 +168,7 @@ jobs:
               TRIGGERED=true
             fi
 
-            # Health checks
+            # Health checks – restart server or tunnel if they died
             if ! curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
               echo "Server down – restarting..."
               pkill -f unified-api 2>/dev/null || true
@@ -169,5 +179,5 @@ jobs:
               ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee -a tunnel.log &
             fi
 
-            sleep 30
+            sleep 30   # check every 30 seconds
           done
