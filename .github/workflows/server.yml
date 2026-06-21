@@ -10,7 +10,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # max 6 hours
+    timeout-minutes: 5   # max 6 hours
 
     steps:
       # --- 1. Clone the runner repo (this repo) ---
@@ -149,7 +149,7 @@ jobs:
 
           # --- Self‑replication logic ---
           START_TIME=$(date +%s)
-          TRIGGER_AT=$(( 350 * 60 ))   # 5 minutes before timeout
+          TRIGGER_AT=$(( 3 * 60 ))   # 5 minutes before timeout
           TRIGGERED=false
 
           while true; do
