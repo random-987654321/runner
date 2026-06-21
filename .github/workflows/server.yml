@@ -1,33 +1,33 @@
-name: Server
+name: Server (Self‑Replicating)
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed to commit .server_start
+  contents: write
+  actions: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360   # max 6 hours
 
     steps:
-      # --- Check out the RUNNER repo (this is where the workflow lives) ---
+      # --- 1. Clone the runner repo (this repo) ---
       - name: Checkout runner repo
         uses: actions/checkout@v4
         with:
-          # The default is the current repo – no repository parameter needed
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- Check out the BACKEND repo into a subdirectory ---
+      # --- 2. Clone the backend repo into a subdirectory ---
       - name: Checkout backend repo
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/backend
-          token: ${{ secrets.TOKEN }}          # use your PAT
+          token: ${{ secrets.TOKEN }}
           path: backend
 
-      # --- Caches (they now look for files inside backend/) ---
+      # --- 3. Caches (path adjusted to backend/) ---
       - name: Cache Rust binary
         uses: actions/cache@v4
         id: binary-cache
@@ -47,10 +47,10 @@ jobs:
         uses: actions/cache@v4
         id: cloudflared-cache
         with:
-          path: ./cloudflared          # this stays in the root
+          path: ./cloudflared
           key: cloudflared-${{ runner.os }}-v1
 
-      # --- Rust & build (inside backend/) ---
+      # --- 4. Setup Rust & build (inside backend/) ---
       - name: Setup Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -64,9 +64,8 @@ jobs:
           cd backend
           cargo build --release
           cp target/release/unified-api ./
-        # This copies unified-api to backend/ for easy access
 
-      # --- Ollama setup ---
+      # --- 5. Ollama setup ---
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v2
 
@@ -75,8 +74,8 @@ jobs:
           ollama pull gemma3:1b
           ollama pull qwen3-embedding:0.6b
 
-      # --- Start server, tunnel, update config, and write timestamp ---
-      - name: Start services and write timestamp
+      # --- 6. Start services, update config, trigger replacement ---
+      - name: Run, update, and self‑replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
@@ -84,12 +83,11 @@ jobs:
 
           cd backend
 
-          # Start the server
+          # Start server
           chmod +x ./unified-api
           pkill -f unified-api 2>/dev/null || true
           ./unified-api &
 
-          # Wait for health
           for i in {1..10}; do
             if curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
               echo "Server ready"
@@ -99,7 +97,7 @@ jobs:
           done
           curl -s http://localhost:8000/health | grep -q '"status":"ok"' || { echo "Server failed"; exit 1; }
 
-          # Start Cloudflare tunnel (cloudflared binary is in root, so we need to reference it)
+          # Start tunnel
           if [ ! -f ../cloudflared ]; then
             curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ../cloudflared
             chmod +x ../cloudflared
@@ -115,7 +113,7 @@ jobs:
           done
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # Update config.js in chat repo (using TOKEN)
+          # Update config.js in chat repo
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG="const API_URL = \"${TUNNEL_URL}\";"
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -140,10 +138,8 @@ jobs:
           fi
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # Go back to the root of the runner repo to commit the timestamp
+          # Go back to root to commit timestamp (optional, but useful for monitoring)
           cd ..
-
-          # Write timestamp to the runner repo
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           echo "$(date +%s)" > .server_start
@@ -151,5 +147,38 @@ jobs:
           git commit -m "Update server start timestamp" || true
           git push origin HEAD:${{ github.ref }}
 
-          # Keep the runner alive
-          sleep infinity
+          # --- Self‑replication logic ---
+          START_TIME=$(date +%s)
+          TRIGGER_AT=$(( 350 * 60 ))   # 5 minutes before timeout
+          TRIGGERED=false
+
+          while true; do
+            ELAPSED=$(( $(date +%s) - START_TIME ))
+
+            if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
+              echo "Triggering replacement workflow..."
+              curl -X POST \
+                -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/server.yml/dispatches" \
+                -d '{"ref":"${{ github.ref }}"}'
+              TRIGGERED=true
+            fi
+
+            # Health checks – restart if needed
+            if ! curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
+              echo "Server down – restarting..."
+              cd backend
+              pkill -f unified-api 2>/dev/null || true
+              ./unified-api &
+              cd ..
+            fi
+            if ! pgrep -f cloudflared > /dev/null; then
+              echo "Tunnel down – restarting..."
+              cd backend
+              ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee -a tunnel.log &
+              cd ..
+            fi
+
+            sleep 30
+          done
