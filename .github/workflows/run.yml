@@ -3,12 +3,11 @@ name: Run Server & Update Chat Config
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '* * * * *'
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 320
 
     steps:
       - name: Clone private backend
