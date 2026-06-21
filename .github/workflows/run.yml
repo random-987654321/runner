@@ -8,7 +8,8 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 5
+
     steps:
       - name: Clone private backend
         uses: actions/checkout@v4
@@ -62,8 +63,8 @@ jobs:
 
       - name: Pull models
         run: |
-          ollama pull gemma3:1b
-          ollama pull qwen3-embedding:0.6b
+          ollama pull Phi-4-mini-flash-reasoning
+          ollama pull nomic-embed-text
 
       - name: Start API server + Cloudflare tunnel
         run: |
@@ -130,4 +131,4 @@ jobs:
 
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          sleep 5m
+          sleep infinity
