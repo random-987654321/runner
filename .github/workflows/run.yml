@@ -3,7 +3,7 @@ name: Run Server & Update Chat Config
 on:
   workflow_dispatch:
   schedule:
-    - cron: '* * * * *'
+    - cron: '3 * * * *'
 
 jobs:
   run:
@@ -130,4 +130,4 @@ jobs:
 
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          sleep infinity
+          sleep 3m
