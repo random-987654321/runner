@@ -4,23 +4,24 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write   # needed to trigger a new run via the API
+  actions: write   
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # max 6 hours
+    timeout-minutes: 360   
 
     steps:
-      # --- The runner repository is already checked out by default.
-      # --- We clone the backend repo into a subdirectory.
+      # --------------------------------------------------------------------
+      # 1. Check out the backend repository
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/backend
           token: ${{ secrets.TOKEN }}
           path: backend
 
-      # --- Caches for speed ---
+      # --------------------------------------------------------------------
+      # 2. Restore caches (if they exist from previous runs)
       - uses: actions/cache@v4
         id: binary-cache
         with:
@@ -29,43 +30,85 @@ jobs:
           restore-keys: rust-binary-${{ runner.os }}-
 
       - uses: actions/cache@v4
+        id: ollama-cache
         with:
           path: ~/.ollama/models
           key: ollama-models-${{ hashFiles('.github/workflows/server.yml') }}
           restore-keys: ollama-models-
 
       - uses: actions/cache@v4
+        id: cloudflared-cache
         with:
           path: ./cloudflared
           key: cloudflared-${{ runner.os }}-v1
 
-      # --- Rust & build (only on cache miss) ---
+      # --------------------------------------------------------------------
+      # 3. Set up Rust and build (only on cache miss)
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
           toolchain: stable
           override: true
 
-      - run: |
+      - name: Build Rust binary (if cache miss)
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        run: |
           cd backend
           cargo build --release
           cp target/release/unified-api ./
-        if: steps.binary-cache.outputs.cache-hit != 'true'
 
-      # --- Ollama models ---
+      # --------------------------------------------------------------------
+      # 4. Save binary cache (only if we built it)
+      - name: Save binary cache
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: backend/target/release/unified-api
+          key: rust-binary-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}
+
+      # --------------------------------------------------------------------
+      # 5. Pull Ollama models (cached after first run)
       - uses: ai-action/setup-ollama@v2
-      - run: |
+      - name: Pull Ollama models
+        run: |
           ollama pull gemma3:1b
           ollama pull qwen3-embedding:0.6b
 
-      # --- Main step: start services, update config, and self‑replicate ---
-      - name: Run & replicate
+      # --------------------------------------------------------------------
+      # 6. Save Ollama cache (always – it will skip if key already exists)
+      - name: Save Ollama cache
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-models-${{ hashFiles('.github/workflows/server.yml') }}
+
+      # --------------------------------------------------------------------
+      # 7. Download cloudflared (if not cached)
+      - name: Download cloudflared
+        if: steps.cloudflared-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+      # --------------------------------------------------------------------
+      # 8. Save cloudflared cache (only if we downloaded it)
+      - name: Save cloudflared cache
+        if: steps.cloudflared-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ./cloudflared
+          key: cloudflared-${{ runner.os }}-v1
+
+      # --------------------------------------------------------------------
+      # 9. Start the server, create tunnel, update config, and self‑replicate
+      #    This step runs forever – the caches were already saved above.
+      - name: Run server & self‑replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
           cd backend
 
-          # 1. Start the server
+          # Start the server
           chmod +x ./unified-api
           pkill -f unified-api 2>/dev/null || true
           ./unified-api &
@@ -79,7 +122,7 @@ jobs:
           done
           curl -s http://localhost:8000/health | grep -q '"status":"ok"' || exit 1
 
-          # 2. Start Cloudflare tunnel (download if not cached)
+          # Start Cloudflare tunnel
           if [ ! -f ../cloudflared ]; then
             curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ../cloudflared
             chmod +x ../cloudflared
@@ -95,7 +138,7 @@ jobs:
           done
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # 3. Update config.js in the chat repo
+          # Update config.js in the chat repository
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG="const API_URL = \"${TUNNEL_URL}\";"
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -120,15 +163,14 @@ jobs:
           fi
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # 4. Self‑replication: trigger a new run ~5 minutes before timeout
+          # Self‑replication: trigger a new run ~5 minutes before timeout
           START_TIME=$(date +%s)
-          TRIGGER_AT=$(( 350 * 60 ))   # 350 minutes = 5h50m
+          TRIGGER_AT=$(( 350 * 60 ))   # 5 hours 50 minutes
           TRIGGERED=false
 
           while true; do
             ELAPSED=$(( $(date +%s) - START_TIME ))
 
-            # Trigger only once
             if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
               echo "Triggering replacement workflow..."
               curl -X POST \
