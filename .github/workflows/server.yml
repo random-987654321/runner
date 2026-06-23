@@ -21,22 +21,22 @@ jobs:
       - uses: actions/cache@v4
         id: binary
         with:
-          path: backend/target/release/backend
-          key: rust-binary-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}
+          path: backend/backend
+          key: rust-binary-${{ runner.os }}-v1
           restore-keys: rust-binary-${{ runner.os }}-
 
       - uses: actions/cache@v4
         id: ollama
         with:
           path: ~/.ollama/models
-          key: ollama-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}-granite4
+          key: ollama-granite4-v1
           restore-keys: ollama-
 
       - uses: actions/cache@v4
         id: cloudflared
         with:
           path: ./cloudflared
-          key: cloudflared-${{ runner.os }}
+          key: cloudflared-${{ runner.os }}-v1
 
       - uses: actions-rs/toolchain@v1
         with:
@@ -48,28 +48,25 @@ jobs:
         run: |
           cd backend
           cargo build --release
-
-      - name: Prepare binary
-        run: |
-          cp backend/target/release/backend backend/backend
-          chmod +x backend/backend
-          rm -rf backend/target
+          cp target/release/backend ./backend
+          chmod +x ./backend
 
       - if: steps.binary.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: backend/target/release/backend
-          key: rust-binary-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}
+          path: backend/backend
+          key: rust-binary-${{ runner.os }}-v1
+
+      - name: Clean build artifacts
+        run: rm -rf backend/target
 
       - uses: ai-action/setup-ollama@v2
-      - run: |
-          ollama pull ibm/granite4:3b-h
-          ollama pull qwen3-embedding:0.6b
+      - run: ollama pull ibm/granite4:3b-h
 
       - uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ollama-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}-granite4
+          key: ollama-granite4-v1
 
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
@@ -80,7 +77,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ./cloudflared
-          key: cloudflared-${{ runner.os }}
+          key: cloudflared-${{ runner.os }}-v1
 
       - name: Run & replicate
         env:
