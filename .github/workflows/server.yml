@@ -12,14 +12,12 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # --- Checkout backend ---
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/backend
           token: ${{ secrets.TOKEN }}
           path: backend
 
-      # --- Restore caches ---
       - uses: actions/cache@v4
         id: binary
         with:
@@ -40,86 +38,62 @@ jobs:
           path: ./cloudflared
           key: cloudflared-${{ runner.os }}
 
-      # --- Rust setup + build (if cache miss) ---
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
           toolchain: stable
           override: true
 
-      - name: Build binary (if cache miss)
-        if: steps.binary.outputs.cache-hit != 'true'
+      - if: steps.binary.outputs.cache-hit != 'true'
         run: |
           cd backend
           cargo build --release
 
-      # --- Always copy the binary to backend/unified-api ---
       - name: Prepare binary
         run: |
-          if [ -f backend/target/release/unified-api ]; then
-            cp backend/target/release/unified-api backend/unified-api
-            chmod +x backend/unified-api
-            # Remove large build artifacts to free space
-            rm -rf backend/target
-          else
-            echo "Binary not found!"
-            exit 1
-          fi
+          cp backend/target/release/unified-api backend/unified-api
+          chmod +x backend/unified-api
+          rm -rf backend/target
 
-      # --- Save binary cache (if we built it) ---
-      - name: Save binary
-        if: steps.binary.outputs.cache-hit != 'true'
+      - if: steps.binary.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: backend/target/release/unified-api
           key: rust-binary-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}
 
-      # --- Ollama ---
       - uses: ai-action/setup-ollama@v2
       - run: |
           ollama pull ibm/granite4:3b-h
           ollama pull qwen3-embedding:0.6b
 
-      - name: Save ollama
-        uses: actions/cache/save@v4
+      - uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
           key: ollama-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}-granite4
 
-      # --- Cloudflared ---
-      - name: Download cloudflared
-        if: steps.cloudflared.outputs.cache-hit != 'true'
+      - if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Save cloudflared
-        if: steps.cloudflared.outputs.cache-hit != 'true'
+      - if: steps.cloudflared.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ./cloudflared
           key: cloudflared-${{ runner.os }}
 
-      # --- Main service (starts server, tunnel, config update, and self‑replicates) ---
       - name: Run & replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
           cd backend
-
-          # Start server
-          chmod +x ./unified-api
-          pkill -f unified-api 2>/dev/null || true
           ./unified-api &
-
-          # Wait for health
           for i in {1..10}; do
             curl -s http://localhost:8000/health | grep -q '"status":"ok"' && break
             sleep 2
           done
           curl -s --fail http://localhost:8000/health | grep -q '"status":"ok"' || exit 1
 
-          # Start tunnel (cloudflared is in the parent directory)
           if [ ! -f ../cloudflared ]; then
             curl -Lo ../cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x ../cloudflared
@@ -127,7 +101,6 @@ jobs:
           pkill -f cloudflared 2>/dev/null || true
           ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee tunnel.log &
 
-          # Extract tunnel URL
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             [ -n "$TUNNEL_URL" ] && break
@@ -135,59 +108,44 @@ jobs:
           done
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # Update config.js
           CHAT_REPO="${{ github.repository_owner }}/chat"
-          NEW_CONFIG="const API_URL = \"${TUNNEL_URL}\";"
+          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
-
           FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.js")
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
           SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-
           if [ "$SHA" != "null" ]; then
-            curl -s -X PUT \
-              -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+            curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.js" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
               -d "{\"message\":\"update API URL\",\"content\":\"${ENCODED}\",\"sha\":\"${SHA}\"}"
           else
-            curl -s -X PUT \
-              -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+            curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.js" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
               -d "{\"message\":\"add API URL\",\"content\":\"${ENCODED}\"}"
           fi
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # Self‑replication loop
           START_TIME=$(date +%s)
-          TRIGGER_AT=$(( 350 * 60 ))
+          TRIGGER_AT=$((350 * 60))
           TRIGGERED=false
-
           while true; do
             ELAPSED=$(( $(date +%s) - START_TIME ))
-
             if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
-              echo "Triggering replacement..."
-              curl -X POST \
-                -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+              curl -X POST -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
                 -H "Accept: application/vnd.github.v3+json" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/workflows/server.yml/dispatches" \
                 -d '{"ref":"${{ github.ref }}"}'
               TRIGGERED=true
             fi
-
-            # Health checks
             if ! curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
-              echo "Server down – restarting..."
               pkill -f unified-api 2>/dev/null || true
               ./unified-api &
             fi
             if ! pgrep -f cloudflared > /dev/null; then
-              echo "Tunnel down – restarting..."
               ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee -a tunnel.log &
             fi
-
             sleep 30
           done
