@@ -22,8 +22,8 @@ jobs:
         id: binary
         with:
           path: backend/backend
-          key: rust-binary-${{ runner.os }}-v1
-          restore-keys: rust-binary-${{ runner.os }}-
+          key: backend-v1
+          restore-keys: backend-
 
       - uses: actions/cache@v4
         id: ollama
@@ -36,7 +36,7 @@ jobs:
         id: cloudflared
         with:
           path: ./cloudflared
-          key: cloudflared-${{ runner.os }}
+          key: cloudflared
 
       - uses: actions-rs/toolchain@v1
         with:
@@ -55,9 +55,9 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: backend/backend
-          key: rust-binary-${{ runner.os }}-v1
+          key: backend-v1
 
-      - name: Clean build artifacts
+      - name: Clean build
         run: rm -rf backend/target
 
       - uses: ai-action/setup-ollama@v2
@@ -66,7 +66,7 @@ jobs:
       - uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ollama-granite4-v1
+          key: ollama-granite4
 
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
@@ -77,9 +77,9 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ./cloudflared
-          key: cloudflared-${{ runner.os }}-v1
+          key: cloudflared
 
-      - name: Run & replicate
+      - name: Run and Replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
