@@ -54,8 +54,7 @@ jobs:
         id: ollama
         with:
           path: ~/.ollama/models
-          key: ollama-granite4-v1
-          restore-keys: ollama-
+          key: ollama-granite4
           
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: ai-action/setup-ollama@v2
@@ -67,15 +66,14 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ollama-granite4-v1
+          key: ollama-granite4
 
       # Cloudflare Setup
       - uses: actions/cache@v4
         id: cloudflared
         with:
           path: ./cloudflared
-          key: cloudflared-v1
-          restore-keys: cloudflared-
+          key: cloudflared
 
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
