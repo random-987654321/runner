@@ -18,8 +18,7 @@ jobs:
         id: binary
         with:
           path: backend/backend
-          key: backend-v1
-          restore-keys: backend-
+          key: backend
 
       - if: steps.binary.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
@@ -47,7 +46,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: backend/backend
-          key: backend-v1
+          key: backend
 
       # Ollama Setup
       - uses: actions/cache@v4
