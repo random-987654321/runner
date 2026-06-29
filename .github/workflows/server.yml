@@ -16,22 +16,22 @@ jobs:
       - name: Check disk space
         run: df -h /
 
-      # ----- 2. Cache: Ollama Models (Q4_K_M) -----
+      # ----- 2. Caching: Ollama Models -----
       - uses: actions/cache@v4
         id: ollama
         with:
           path: ~/.ollama/models
-          key: ollama-distilled-tiny-q4km
+          key: ollama-q4km-v1
           restore-keys: ollama-
 
-      # ----- 3. Cache: Docker image for Open WebUI -----
-      - name: Cache Open WebUI Docker image
-        id: docker-cache
+      # ----- 3. Caching: Open WebUI Docker image -----
+      - name: Cache Open WebUI image
+        id: openwebui
         uses: actions/cache@v4
         with:
-          path: /tmp/open-webui.tar
-          key: openwebui-image-${{ hashFiles('.github/workflows/server.yml') }}
-          restore-keys: openwebui-image-
+          path: openwebui.tar
+          key: openwebui-v1
+          restore-keys: openwebui-
 
       # ----- 4. Setup Ollama (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
@@ -46,48 +46,34 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ollama-distilled-tiny-q4km
+          key: ollama-q4km-v1
 
-      # ----- 7. Load or pull Open WebUI Docker image -----
-      - name: Load Docker image
+      # ----- 7. Download/load Open WebUI image -----
+      - name: Load or pull Open WebUI
         run: |
-          if [ -f /tmp/open-webui.tar ]; then
-            echo "Loading cached Docker image..."
-            docker load -i /tmp/open-webui.tar
+          if [ -f openwebui.tar ]; then
+            echo "Loading Open WebUI from cache..."
+            docker load < openwebui.tar
           else
             echo "Pulling Open WebUI image..."
             docker pull ghcr.io/open-webui/open-webui:main
-            docker save ghcr.io/open-webui/open-webui:main -o /tmp/open-webui.tar
+            docker save ghcr.io/open-webui/open-webui:main -o openwebui.tar
           fi
 
-      # ----- 8. Cache: Cloudflared -----
-      - uses: actions/cache@v4
-        id: cloudflared
+      # ----- 8. Save Open WebUI cache (if not already cached) -----
+      - if: steps.openwebui.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
         with:
-          path: ./cloudflared
-          key: cloudflared
-          restore-keys: cloudflared-
+          path: openwebui.tar
+          key: openwebui-v1
 
-      # ----- 9. Download Cloudflared (only on cache miss) -----
-      - if: steps.cloudflared.outputs.cache-hit != 'true'
+      # ----- 9. Download Cloudflared (no cache, small) -----
+      - name: Download cloudflared
         run: |
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ----- 10. Save Cloudflared cache (only on cache miss) -----
-      - if: steps.cloudflared.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ./cloudflared
-          key: cloudflared
-
-      # ----- 11. Save Docker image cache (only if we pulled it) -----
-      - name: Save Docker image cache
-        if: steps.docker-cache.outputs.cache-hit != 'true'
-        run: |
-          docker save ghcr.io/open-webui/open-webui:main -o /tmp/open-webui.tar
-
-      # ----- 12. Main: Run Ollama, Open WebUI, Tunnel, Update Config, Self‑Replicate -----
+      # ----- 10. Main: Run Ollama, Open WebUI, Tunnel, Config Update, Self‑Replicate -----
       - name: Run and Replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -115,45 +101,41 @@ jobs:
             exit 1
           fi
 
-          # Ensure model is available (pull is idempotent)
-          echo "📦 Ensuring model is present..."
-          ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
-
-          # ----- Start Open WebUI (Docker, port 3000) -----
-          echo "🐳 Starting Open WebUI container..."
+          # ----- Start Open WebUI (already loaded) -----
+          echo "🐳 Starting Open WebUI..."
           docker rm -f open-webui 2>/dev/null || true
           docker run -d \
             --name open-webui \
-            -p 3000:8080 \
-            -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+            --network host \
+            -e OLLAMA_BASE_URL=http://localhost:11434 \
             -v open-webui-data:/app/backend/data \
             ghcr.io/open-webui/open-webui:main
 
-          # Wait for Open WebUI
+          # Wait for Open WebUI (port 8080)
           echo "⏳ Waiting for Open WebUI..."
-          for i in {1..20}; do
-            if curl -s http://localhost:3000 > /dev/null; then
+          for i in {1..30}; do
+            if curl -s http://localhost:8080 > /dev/null; then
               echo "✅ Open WebUI is ready"
               break
             fi
-            echo "⏳ Attempt $i/20 ..."
+            echo "⏳ Attempt $i/30 ..."
             sleep 2
           done
 
-          if ! curl -s http://localhost:3000 > /dev/null; then
-            echo "❌ Open WebUI failed to start"
+          if ! curl -s http://localhost:8080 > /dev/null; then
+            echo "❌ Open WebUI failed to start after 60 seconds"
             docker logs open-webui --tail 20
             exit 1
           fi
 
-          # ----- Start Cloudflare tunnel -----
+          # ----- Start Cloudflare tunnel (pointing to port 8080) -----
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
           pkill -f cloudflared 2>/dev/null || true
-          ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
+          ./cloudflared tunnel --protocol http2 --url http://localhost:8080 2>&1 | tee tunnel.log &
 
           # Extract tunnel URL
           echo "⏳ Waiting for tunnel URL..."
@@ -176,7 +158,7 @@ jobs:
 
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # ----- Update config.json -----
+          # ----- Update config.json in the chat repository -----
           echo "📝 Updating frontend config..."
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
@@ -229,7 +211,7 @@ jobs:
               TRIGGERED=true
             fi
 
-            # Health checks
+            # Health checks – restart if needed
             if ! curl -s http://localhost:11434/api/tags > /dev/null; then
               echo "⚠️ Ollama down – restarting..."
               pkill -f ollama 2>/dev/null || true
@@ -239,16 +221,14 @@ jobs:
 
             if ! pgrep -f cloudflared > /dev/null; then
               echo "⚠️ Tunnel down – restarting..."
-              ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee -a tunnel.log &
+              ./cloudflared tunnel --protocol http2 --url http://localhost:8080 2>&1 | tee -a tunnel.log &
             fi
 
-            if ! curl -s http://localhost:3000 > /dev/null; then
+            if ! curl -s http://localhost:8080 > /dev/null; then
               echo "⚠️ Open WebUI down – restarting container..."
               docker rm -f open-webui 2>/dev/null || true
-              docker run -d \
-                --name open-webui \
-                -p 3000:8080 \
-                -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+              docker run -d --name open-webui --network host \
+                -e OLLAMA_BASE_URL=http://localhost:11434 \
                 -v open-webui-data:/app/backend/data \
                 ghcr.io/open-webui/open-webui:main
               sleep 5
