@@ -56,11 +56,10 @@ jobs:
           path: ./cloudflared
           key: cloudflared
 
-      # ----- Main: Run Ollama, Tunnel, Update Config, Self‑Replicate -----
+      # ----- Main: Run Ollama, Open WebUI, Tunnel, Update Config, Self‑Replicate -----
       - name: Run and Replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
-          # 🔑 CRITICAL FIX – Bind Ollama to all network interfaces
           OLLAMA_HOST: 0.0.0.0:11434
         run: |
           set -e
@@ -80,25 +79,55 @@ jobs:
             sleep 2
           done
 
-          # Verify Ollama is running
           if ! curl -s http://localhost:11434/api/tags > /dev/null; then
-            echo "❌ Ollama failed to start after 40 seconds"
+            echo "❌ Ollama failed to start"
             ps aux | grep ollama || true
             exit 1
           fi
 
-          # Ensure the model is pulled (idempotent)
           echo "📦 Pulling model..."
           ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
 
-          # Start Cloudflare tunnel
+          # ----- Install Open WebUI (Python) -----
+          echo "🐍 Installing Open WebUI..."
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-pip python3-venv
+
+          # Create a virtual environment
+          python3 -m venv openwebui-env
+          source openwebui-env/bin/activate
+
+          # Install open-webui
+          pip install --quiet open-webui
+
+          # Start Open WebUI (bind to all interfaces, port 3000)
+          echo "🌐 Starting Open WebUI on port 3000..."
+          open-webui serve --host 0.0.0.0 --port 3000 &
+
+          # Wait for Open WebUI to be ready
+          echo "⏳ Waiting for Open WebUI..."
+          for i in {1..10}; do
+            if curl -s http://localhost:3000 > /dev/null; then
+              echo "✅ Open WebUI is ready"
+              break
+            fi
+            echo "⏳ Attempt $i/10 ..."
+            sleep 2
+          done
+
+          if ! curl -s http://localhost:3000 > /dev/null; then
+            echo "❌ Open WebUI failed to start"
+            exit 1
+          fi
+
+          # ----- Start Cloudflare tunnel (pointing to Open WebUI on port 3000) -----
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
           pkill -f cloudflared 2>/dev/null || true
-          ./cloudflared tunnel --protocol http2 --url http://localhost:11434 2>&1 | tee tunnel.log &
+          ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
 
           # Extract tunnel URL
           echo "⏳ Waiting for tunnel URL..."
@@ -121,7 +150,7 @@ jobs:
 
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # Update config.json in the chat repository
+          # ----- Update config.json in the chat repository -----
           echo "📝 Updating frontend config..."
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
@@ -156,7 +185,7 @@ jobs:
 
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # Self‑replication loop
+          # ----- Self‑replication loop -----
           echo "🔄 Entering self‑replication loop..."
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
@@ -184,7 +213,15 @@ jobs:
 
             if ! pgrep -f cloudflared > /dev/null; then
               echo "⚠️ Tunnel down – restarting..."
-              ./cloudflared tunnel --protocol http2 --url http://localhost:11434 2>&1 | tee -a tunnel.log &
+              ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee -a tunnel.log &
+            fi
+
+            if ! curl -s http://localhost:3000 > /dev/null; then
+              echo "⚠️ Open WebUI down – restarting..."
+              pkill -f open-webui 2>/dev/null || true
+              source openwebui-env/bin/activate
+              open-webui serve --host 0.0.0.0 --port 3000 &
+              sleep 5
             fi
 
             sleep 30
