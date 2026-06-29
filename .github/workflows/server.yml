@@ -12,58 +12,8 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ================================================================
-      # STEP 1: AGGRESSIVE DISK CLEANUP ("Surgical Strikes")
-      # ================================================================
-      - name: Aggressive Disk Cleanup (Surgical Strikes)
-        run: |
-          echo "🔄 Starting aggressive disk cleanup (max space recovery)..."
-
-          # 1. System Update & Package Cleanup
-          sudo apt-get update -qq
-          echo "Removing large package groups..."
-          sudo apt-get remove -y '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' azure-cli google-cloud-cli || true
-          sudo apt-get autoremove -y
-          sudo apt-get clean
-
-          # 2. Remove Android SDK, .NET, and Haskell (the biggest space hogs)
-          echo "Removing Android SDK (~10 GB)..."
-          sudo rm -rf /usr/local/lib/android
-          echo "Removing .NET SDK (~2 GB)..."
-          sudo rm -rf /usr/share/dotnet
-          echo "Removing Haskell/GHC (~2 GB)..."
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/share/ghc
-
-          # 3. Clean Homebrew, Docker Images, and Browsers
-          echo "Removing Homebrew (~1-2 GB)..."
-          sudo rm -rf /home/linuxbrew
-          echo "Pruning Docker images..."
-          docker system prune -af --volumes
-          echo "Removing browsers and web drivers (~1.5 GB)..."
-          sudo rm -rf /usr/share/chromium /usr/local/share/chrome* /usr/local/share/edge* /usr/local/share/gecko* /usr/local/share/firefox*
-
-          # 4. Nuke Snap and Swap
-          echo "Removing Snap packages..."
-          sudo snap remove --purge lxd core20 snapd 2>/dev/null || true
-          echo "Removing swap file..."
-          sudo swapoff -a 2>/dev/null || true
-          sudo rm -f /swapfile
-
-          # 5. Final cleanup
-          echo "Cleaning up temporary files..."
-          sudo rm -rf /tmp/* /var/tmp/*
-          sudo journalctl --rotate
-          sudo journalctl --vacuum-time=1s
-          sudo apt-get autoremove -y --purge
-
-          # 6. Sync and check available space
-          sync
-          echo "✅ Cleanup complete. Disk usage:"
-          df -h /
-
-      # Fallback: use the standard free-disk-space action (extra safety)
-      - name: Free disk space (fallback)
+      # ----- 1. Free disk space (critical for 14 GB runner) -----
+      - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -74,20 +24,19 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      # Debug: check free space again
-      - name: Check available space
+      # ----- 2. Check available space (optional debug) -----
+      - name: Check disk space
         run: df -h /
 
-      # ================================================================
-      # STEP 2: CACHING
-      # ================================================================
+      # ----- 3. Caching: Ollama Models -----
       - uses: actions/cache@v4
         id: ollama
         with:
           path: ~/.ollama/models
-          key: ollama-distilled-tiny-q4km-v2
+          key: ollama-distilled-tiny-q8_0-v1
           restore-keys: ollama-
 
+      # ----- 4. Caching: Cloudflared -----
       - uses: actions/cache@v4
         id: cloudflared
         with:
@@ -95,38 +44,35 @@ jobs:
           key: cloudflared-v1
           restore-keys: cloudflared-
 
-      # ================================================================
-      # STEP 3: OLLAMA SETUP & MODEL PULL
-      # ================================================================
+      # ----- 5. Setup Ollama (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: ai-action/setup-ollama@v2
 
+      # ----- 6. Pull Q8_0 model (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
-        run: ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
+        run: ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q8_0
 
+      # ----- 7. Save Ollama cache (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ollama-distilled-tiny-q4km-v2
+          key: ollama-distilled-tiny-q8_0-v1
 
-      # ================================================================
-      # STEP 4: CLOUDFLARED
-      # ================================================================
+      # ----- 8. Download Cloudflared (only on cache miss) -----
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
+      # ----- 9. Save Cloudflared cache (only on cache miss) -----
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ./cloudflared
           key: cloudflared-v1
 
-      # ================================================================
-      # STEP 5: MAIN SERVICE – OLLAMA, OPEN WEBUI, TUNNEL, SELF‑REPLICATE
-      # ================================================================
+      # ----- 10. Main: Run Ollama, Open WebUI, Tunnel, Update Config, Self-Replicate -----
       - name: Run and Replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -156,8 +102,8 @@ jobs:
           fi
 
           # Ensure model is pulled (idempotent)
-          echo "📦 Pulling model..."
-          ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
+          echo "📦 Pulling Q8_0 model..."
+          ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q8_0
 
           # ----- Start Open WebUI in Docker (fast) -----
           echo "🐳 Starting Open WebUI in Docker..."
