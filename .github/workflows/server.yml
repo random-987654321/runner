@@ -12,31 +12,15 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ----- 1. Free disk space (critical for 14 GB runner) -----
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      # ----- 2. Check available space (optional debug) -----
-      - name: Check disk space
-        run: df -h /
-
-      # ----- 3. Caching: Ollama Models -----
+      # ----- 1. Caching: Ollama Models (Q4_K_M) -----
       - uses: actions/cache@v4
         id: ollama
         with:
           path: ~/.ollama/models
-          key: ollama-distilled-tiny-q8_0-v1
+          key: ollama-distilled-tiny-q4km-v1
           restore-keys: ollama-
 
-      # ----- 4. Caching: Cloudflared -----
+      # ----- 2. Caching: Cloudflared -----
       - uses: actions/cache@v4
         id: cloudflared
         with:
@@ -44,35 +28,35 @@ jobs:
           key: cloudflared-v1
           restore-keys: cloudflared-
 
-      # ----- 5. Setup Ollama (only on cache miss) -----
+      # ----- 3. Setup Ollama (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: ai-action/setup-ollama@v2
 
-      # ----- 6. Pull Q8_0 model (only on cache miss) -----
+      # ----- 4. Pull Q4_K_M model (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
-        run: ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q8_0
+        run: ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
 
-      # ----- 7. Save Ollama cache (only on cache miss) -----
+      # ----- 5. Save Ollama cache (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ollama-distilled-tiny-q8_0-v1
+          key: ollama-distilled-tiny-q4km-v1
 
-      # ----- 8. Download Cloudflared (only on cache miss) -----
+      # ----- 6. Download Cloudflared (only on cache miss) -----
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ----- 9. Save Cloudflared cache (only on cache miss) -----
+      # ----- 7. Save Cloudflared cache (only on cache miss) -----
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ./cloudflared
           key: cloudflared-v1
 
-      # ----- 10. Main: Run Ollama, Open WebUI, Tunnel, Update Config, Self-Replicate -----
+      # ----- 8. Main: Run Ollama, Open WebUI, Tunnel, Update Config, Self-Replicate -----
       - name: Run and Replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -102,10 +86,10 @@ jobs:
           fi
 
           # Ensure model is pulled (idempotent)
-          echo "📦 Pulling Q8_0 model..."
-          ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q8_0
+          echo "📦 Pulling Q4_K_M model..."
+          ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
 
-          # ----- Start Open WebUI in Docker (fast) -----
+          # ----- Start Open WebUI in Docker -----
           echo "🐳 Starting Open WebUI in Docker..."
           docker rm -f open-webui 2>/dev/null || true
 
