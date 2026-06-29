@@ -116,19 +116,19 @@ jobs:
             -v open-webui-data:/app/backend/data \
             ghcr.io/open-webui/open-webui:main
 
-          # Wait for Open WebUI to be ready
+          # Wait for Open WebUI to be ready (increased timeout to 60 seconds)
           echo "⏳ Waiting for Open WebUI..."
-          for i in {1..10}; do
+          for i in {1..30}; do
             if curl -s http://localhost:3000 > /dev/null; then
               echo "✅ Open WebUI is ready"
               break
             fi
-            echo "⏳ Attempt $i/10 ..."
+            echo "⏳ Attempt $i/30 ..."
             sleep 2
           done
 
           if ! curl -s http://localhost:3000 > /dev/null; then
-            echo "❌ Open WebUI failed to start"
+            echo "❌ Open WebUI failed to start after 60 seconds"
             docker logs open-webui --tail 20
             exit 1
           fi
