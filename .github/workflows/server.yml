@@ -1,208 +1,188 @@
-name: GitHub Swarm
+name: Distributed AI Cluster (No Tailscale)
 
 on:
   workflow_dispatch:
 
 permissions:
   actions: write
-  contents: write
+  contents: write # Required for Bees to write their IPs to the repo
+
+concurrency:
+  group: ai-cluster
+  cancel-in-progress: false
 
 jobs:
-  swarm:
+  # ──────────────────────────────────────────────────────────────
+  # WORKER BEES: 19 RPC Nodes providing 304 GB RAM / 76 vCPUs
+  # ──────────────────────────────────────────────────────────────
+  bees:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
-      fail-fast: false
+      max-parallel: 19
       matrix:
-        # 20 concurrent jobs: 0 = coordinator, 1-19 = workers
-        id: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        id: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - name: 🛠 Install Tools & Download Model
+        run: |
+          sudo apt-get update && sudo apt-get install -y build-essential cmake wget jq
+          # Replace with your direct HuggingFace .gguf download link
+          wget -q -O model.gguf "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/Q4_K_M.gguf"
 
+      - name: 🔨 Compile llama.cpp with RPC Support
+        run: |
+          git clone https://github.com/ggerganov/llama.cpp
+          cd llama.cpp
+          cmake -B build -DGGML_RPC=ON
+          cmake --build build --config Release -j 4
+
+      - name: 🐝 Start RPC Server
+        run: |
+          cd llama.cpp/build/bin
+          # Start the math computation node on local port 50052
+          ./rpc-server --host 0.0.0.0 --port 50052 -m ../../../model.gguf &
+
+      - name: 🌐 Start Bore Tunnel & Report to Queen
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          BEE_ID: ${{ matrix.id }}
+        run: |
+          # Download bore (a free public TCP tunnel, no account needed)
+          wget -q https://github.com/ekzhang/bore/releases/download/0.5.1/bore-0.5.1-x86_64-unknown-linux-musl -O bore
+          chmod +x bore
+          
+          # Expose local port 50052 to the public internet via bore.pub
+          ./bore local 50052 --to bore.pub > bore.log 2>&1 &
+          sleep 5
+          
+          # Extract the public port assigned by bore
+          PUBLIC_PORT=$(grep -oP 'listening at bore.pub:\K\d+' bore.log | head -1)
+          BORE_ADDR="bore.pub:${PUBLIC_PORT}"
+          echo "Bee $BEE_ID is live at $BORE_ADDR"
+          
+          # Report this address to the GitHub repo so the Queen can find it
+          REPO="${{ github.repository }}"
+          FILE_PATH="cluster-${{ github.run_id }}/bee-${BEE_ID}.txt"
+          
+          ENCODED=$(echo -n "$BORE_ADDR" | base64 -w0)
+          PAYLOAD=$(jq -n --arg msg "Bee $BEE_ID reporting" --arg content "$ENCODED" '{message: $msg, content: $content}')
+          
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/${FILE_PATH}" \
+            -d "$PAYLOAD"
+          
+          # Keep alive for 6 hours so Queen can route traffic
+          sleep 21600
+
+  # ──────────────────────────────────────────────────────────────
+  # QUEEN NODE: Main API, Open WebUI, Cloudflare Tunnel
+  # ──────────────────────────────────────────────────────────────
+  queen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
-      # ----- Common setup -----
-      - name: Cache Ollama models
-        uses: actions/cache@v4
-        id: ollama-cache
-        with:
-          path: ~/.ollama/models
-          key: ollama-swarm-${{ hashFiles('**/model.txt') }}
-          restore-keys: ollama-swarm-
-
-      - name: Setup Ollama
-        if: steps.ollama-cache.outputs.cache-hit != 'true'
-        uses: ai-action/setup-ollama@v2
-
-      - name: Pull model (only on cache miss)
-        if: steps.ollama-cache.outputs.cache-hit != 'true'
+      - name: 🛠 Install Tools, Docker, Model
         run: |
-          ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
+          sudo apt-get update && sudo apt-get install -y build-essential cmake wget jq
+          wget -q -O model.gguf "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/Q4_K_M.gguf"
 
-      # ----- Worker jobs (id 1-19) -----
-      - name: Start worker (runs Ollama + tunnel)
-        if: matrix.id != 0
+      - name: 🔨 Compile llama.cpp
         run: |
-          # Start Ollama with optimised settings
-          export OLLAMA_HOST=0.0.0.0:11434
-          export OLLAMA_NUM_PARALLEL=4
-          export OLLAMA_CONTEXT_LENGTH=4096
-          ollama serve &
+          git clone https://github.com/ggerganov/llama.cpp
+          cd llama.cpp
+          cmake -B build -DGGML_RPC=ON
+          cmake --build build --config Release -j 4
 
-          # Download and start Cloudflare tunnel
+      - name: ⏳ Wait for 19 Bees to report
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          DIR="cluster-${{ github.run_id }}"
+          echo "Waiting for 19 bees to write their addresses to ${DIR}..."
+          
+          while true; do
+            # List files in the cluster directory
+            FILES=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/${DIR}")
+              
+            COUNT=$(echo "$FILES" | jq -r 'if type == "array" then length else 0 end')
+            echo "Bees reported: $COUNT/19"
+            
+            if [ "$COUNT" -ge 19 ]; then
+              break
+            fi
+            sleep 15
+          done
+          
+          # Extract all Bee addresses
+          RPC_IPS=""
+          for i in {1..19}; do
+            ADDR=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/${DIR}/bee-${i}.txt" | jq -r '.content' | base64 -d)
+            RPC_IPS="${RPC_IPS},${ADDR}"
+          done
+          
+          # Remove leading comma
+          RPC_IPS="${RPC_IPS#,}"
+          echo "✅ All bees connected: $RPC_IPS"
+          echo "RPC_IPS=$RPC_IPS" >> $GITHUB_ENV
+
+      - name: 👑 Start Clustered Llama Server
+        run: |
+          cd llama.cpp/build/bin
+          # The Queen connects to all 19 bees over the public internet via bore
+          ./llama-server \
+            --model ../../../model.gguf \
+            --rpc "${{ env.RPC_IPS }}" \
+            --host 0.0.0.0 \
+            --port 11434 \
+            --ctx-size 4096 &
+          
+          # Wait for server to boot
+          sleep 15
+
+      - name: 🐳 Start Open WebUI
+        run: |
+          docker rm -f open-webui 2>/dev/null || true
+          docker run -d --name open-webui --network host \
+            -e OLLAMA_BASE_URL=http://localhost:11434 \
+            -v open-webui-data:/app/backend/data \
+            ghcr.io/open-webui/open-webui:main
+
+      - name: 🌐 Start Cloudflare Tunnel & Replicate
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+        run: |
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
-          ./cloudflared tunnel --url http://localhost:11434 2>&1 | tee tunnel.log &
-
-          # Wait for tunnel URL
+          ./cloudflared tunnel --protocol http2 --url http://localhost:8080 2>&1 | tee tunnel.log &
+          
+          TUNNEL_URL=""
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
-              break
-            fi
+            if [ -n "$TUNNEL_URL" ]; then break; fi
             sleep 2
           done
+          echo "::notice::Tunnel URL: ${TUNNEL_URL}"
+          
+          # [INSERT YOUR config.json GITHUB API UPDATE SCRIPT HERE]
 
-      - name: Register worker in repository
-        if: matrix.id != 0
-        run: |
-          # Create a registry branch if it doesn't exist
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin swarm-registry || true
-          git checkout -b swarm-registry || git checkout swarm-registry
-
-          # Write the worker's tunnel URL
-          echo "$TUNNEL_URL" > worker_${{ matrix.id }}.url
-          git add worker_${{ matrix.id }}.url
-          git commit -m "Register worker ${{ matrix.id }}" || true
-          git push origin swarm-registry
-
-      # ----- Coordinator job (id 0) -----
-      - name: Wait for all workers to register
-        if: matrix.id == 0
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin swarm-registry || true
-          git checkout -b swarm-registry || git checkout swarm-registry
-
-          # Wait for all 19 workers
-          for i in {1..19}; do
-            while [ ! -f worker_$i.url ]; do
-              echo "Waiting for worker $i..."
-              sleep 3
-              git pull origin swarm-registry
-            done
-            echo "Worker $i registered"
-          done
-
-          # Build a list of worker URLs
-          urls=""
-          for i in {1..19}; do
-            url=$(cat worker_$i.url)
-            if [ -n "$url" ]; then
-              urls="$urls,$url"
-            fi
-          done
-          echo "WORKER_URLS=${urls#*,}" >> $GITHUB_ENV
-
-      - name: Coordinator – start load‑balancing proxy
-        if: matrix.id == 0
-        run: |
-          # Install Python dependencies
-          pip install fastapi uvicorn httpx
-
-          # Write the proxy script
-          cat > proxy.py << 'EOF'
-          import asyncio
-          import json
-          import random
-          import httpx
-          from fastapi import FastAPI, Request
-          from fastapi.responses import StreamingResponse
-          import uvicorn
-
-          app = FastAPI()
-          WORKER_URLS = "${{ env.WORKER_URLS }}".split(',')
-          current = 0
-
-          @app.post("/ask")
-          async def ask(request: Request):
-              global current
-              body = await request.json()
-              # Round-robin selection
-              worker = WORKER_URLS[current % len(WORKER_URLS)]
-              current += 1
-              # Forward request to worker
-              async with httpx.AsyncClient(timeout=120.0) as client:
-                  resp = await client.post(worker + "/api/generate", json={
-                      "model": "granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M",
-                      "prompt": body.get("question", ""),
-                      "stream": True
-                  })
-                  # Stream back the response
-                  return StreamingResponse(resp.aiter_bytes(), media_type="text/plain")
-          EOF
-
-          # Run the proxy
-          nohup uvicorn proxy:app --host 0.0.0.0 --port 8000 &
-
-      - name: Expose coordinator via Cloudflare tunnel
-        if: matrix.id == 0
-        run: |
-          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-          ./cloudflared tunnel --url http://localhost:8000 2>&1 | tee coordinator.log &
-          for i in {1..30}; do
-            COORD_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' coordinator.log | head -1)
-            if [ -n "$COORD_URL" ]; then
-              echo "COORD_URL=$COORD_URL" >> $GITHUB_ENV
-              break
-            fi
-            sleep 2
-          done
-
-      - name: Update frontend config.json
-        if: matrix.id == 0
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-        run: |
-          CHAT_REPO="${{ github.repository_owner }}/chat"
-          NEW_CONFIG=$(jq -n --arg url "$COORD_URL" '{apiUrl: $url}')
-          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
-          FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-          if [ "$SHA" != "null" ]; then
-            PAYLOAD=$(jq -n \
-              --arg msg "update API URL" \
-              --arg content "$ENCODED" \
-              --arg sha "$SHA" \
-              --arg name "github-actions[bot]" \
-              --arg email "github-actions[bot]@users.noreply.github.com" \
-              '{message: $msg, content: $content, sha: $sha, author: {name: $name, email: $email}, committer: {name: $name, email: $email}}')
-          else
-            PAYLOAD=$(jq -n \
-              --arg msg "add API URL" \
-              --arg content "$ENCODED" \
-              --arg name "github-actions[bot]" \
-              --arg email "github-actions[bot]@users.noreply.github.com" \
-              '{message: $msg, content: $content, author: {name: $name, email: $email}, committer: {name: $name, email: $email}}')
-          fi
-          curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-            -d "$PAYLOAD"
-
-      - name: Self‑replication (keep coordinator alive)
-        if: matrix.id == 0
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-        run: |
-          # The coordinator runs forever – keeping the runner alive.
+          # Self-Replication Loop
+          START_TIME=$(date +%s)
+          TRIGGER_AT=$((350 * 60))
+          TRIGGERED=false
           while true; do
-            sleep 60
-            # Health check: restart workers if needed (optional)
+            ELAPSED=$(( $(date +%s) - START_TIME ))
+            if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
+              curl -X POST -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/server.yml/dispatches" \
+                -d '{"ref":"${{ github.ref }}"}'
+              TRIGGERED=true
+            fi
+            sleep 30
           done
