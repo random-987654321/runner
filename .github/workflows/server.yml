@@ -12,55 +12,25 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ----- 1. Caching: Ollama Models (Q4_K_M) -----
-      - uses: actions/cache@v4
-        id: ollama
-        with:
-          path: ~/.ollama/models
-          key: ollama-distilled-tiny-q4km-v1
-          restore-keys: ollama-
+      # ----- 1. Check disk space (optional) -----
+      - name: Check disk space
+        run: df -h /
 
-      # ----- 2. Caching: Cloudflared -----
-      - uses: actions/cache@v4
-        id: cloudflared
-        with:
-          path: ./cloudflared
-          key: cloudflared-v1
-          restore-keys: cloudflared-
+      # ----- 2. Setup Ollama -----
+      - uses: ai-action/setup-ollama@v2
 
-      # ----- 3. Setup Ollama (only on cache miss) -----
-      - if: steps.ollama.outputs.cache-hit != 'true'
-        uses: ai-action/setup-ollama@v2
+      # ----- 3. Download F16 model (every time) -----
+      - name: Download model
+        run: ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:F16
 
-      # ----- 4. Pull Q4_K_M model (only on cache miss) -----
-      - if: steps.ollama.outputs.cache-hit != 'true'
-        run: ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
-
-      # ----- 5. Save Ollama cache (only on cache miss) -----
-      - if: steps.ollama.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.ollama/models
-          key: ollama-distilled-tiny-q4km-v1
-
-      # ----- 6. Download Cloudflared (only on cache miss) -----
-      - if: steps.cloudflared.outputs.cache-hit != 'true'
+      # ----- 4. Download Cloudflared (every time) -----
+      - name: Download cloudflared
         run: |
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ----- 7. Save Cloudflared cache (only on cache miss) -----
-      - if: steps.cloudflared.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ./cloudflared
-          key: cloudflared-v1
-
-      # ----- 8. Main: Run Ollama, Open WebUI, Tunnel, Update Config, Self-Replicate -----
+      # ----- 5. Run Server, Tunnel, Config Update, Self‑Replicate -----
       - name: Run and Replicate
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          OLLAMA_HOST: 0.0.0.0:11434
         run: |
           set -e
 
@@ -68,8 +38,8 @@ jobs:
           pkill -f ollama 2>/dev/null || true
           ollama serve &
 
-          # Wait for Ollama to become ready
-          echo "⏳ Waiting for Ollama to be ready..."
+          # Wait for Ollama
+          echo "⏳ Waiting for Ollama..."
           for i in {1..20}; do
             if curl -s http://localhost:11434/api/tags > /dev/null; then
               echo "✅ Ollama is ready"
@@ -81,18 +51,12 @@ jobs:
 
           if ! curl -s http://localhost:11434/api/tags > /dev/null; then
             echo "❌ Ollama failed to start"
-            ps aux | grep ollama || true
             exit 1
           fi
 
-          # Ensure model is pulled (idempotent)
-          echo "📦 Pulling Q4_K_M model..."
-          ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
-
-          # ----- Start Open WebUI in Docker -----
-          echo "🐳 Starting Open WebUI in Docker..."
+          # Start Open WebUI
+          echo "🐳 Starting Open WebUI..."
           docker rm -f open-webui 2>/dev/null || true
-
           docker run -d \
             --name open-webui \
             --network host \
@@ -100,7 +64,7 @@ jobs:
             -v open-webui-data:/app/backend/data \
             ghcr.io/open-webui/open-webui:main
 
-          # Wait for Open WebUI to be ready (increased timeout to 60 seconds)
+          # Wait for Open WebUI
           echo "⏳ Waiting for Open WebUI..."
           for i in {1..30}; do
             if curl -s http://localhost:3000 > /dev/null; then
@@ -112,12 +76,12 @@ jobs:
           done
 
           if ! curl -s http://localhost:3000 > /dev/null; then
-            echo "❌ Open WebUI failed to start after 60 seconds"
+            echo "❌ Open WebUI failed to start"
             docker logs open-webui --tail 20
             exit 1
           fi
 
-          # ----- Start Cloudflare tunnel (pointing to Open WebUI on port 3000) -----
+          # Start Cloudflare tunnel
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -147,7 +111,7 @@ jobs:
 
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # ----- Update config.json in the chat repository -----
+          # Update config.json
           echo "📝 Updating frontend config..."
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
@@ -182,7 +146,7 @@ jobs:
 
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # ----- Self‑replication loop -----
+          # Self‑replication loop
           echo "🔄 Entering self‑replication loop..."
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
@@ -200,7 +164,7 @@ jobs:
               TRIGGERED=true
             fi
 
-            # Health checks – restart if needed
+            # Health checks
             if ! curl -s http://localhost:11434/api/tags > /dev/null; then
               echo "⚠️ Ollama down – restarting..."
               pkill -f ollama 2>/dev/null || true
