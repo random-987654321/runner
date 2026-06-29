@@ -31,6 +31,9 @@ jobs:
 
       # ----- 5. Run Server, Tunnel, Config Update, Self‑Replicate -----
       - name: Run and Replicate
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          OLLAMA_HOST: 0.0.0.0:11434
         run: |
           set -e
 
@@ -54,7 +57,7 @@ jobs:
             exit 1
           fi
 
-          # Start Open WebUI
+          # ----- Start Open WebUI (with --network=host, listens on 8080) -----
           echo "🐳 Starting Open WebUI..."
           docker rm -f open-webui 2>/dev/null || true
           docker run -d \
@@ -64,10 +67,10 @@ jobs:
             -v open-webui-data:/app/backend/data \
             ghcr.io/open-webui/open-webui:main
 
-          # Wait for Open WebUI
+          # Wait for Open WebUI – now checking port 8080
           echo "⏳ Waiting for Open WebUI..."
           for i in {1..30}; do
-            if curl -s http://localhost:3000 > /dev/null; then
+            if curl -s http://localhost:8080 > /dev/null; then
               echo "✅ Open WebUI is ready"
               break
             fi
@@ -75,20 +78,20 @@ jobs:
             sleep 2
           done
 
-          if ! curl -s http://localhost:3000 > /dev/null; then
-            echo "❌ Open WebUI failed to start"
+          if ! curl -s http://localhost:8080 > /dev/null; then
+            echo "❌ Open WebUI failed to start after 60 seconds"
             docker logs open-webui --tail 20
             exit 1
           fi
 
-          # Start Cloudflare tunnel
+          # ----- Start Cloudflare tunnel (pointing to port 8080) -----
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
           pkill -f cloudflared 2>/dev/null || true
-          ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
+          ./cloudflared tunnel --protocol http2 --url http://localhost:8080 2>&1 | tee tunnel.log &
 
           # Extract tunnel URL
           echo "⏳ Waiting for tunnel URL..."
@@ -111,7 +114,7 @@ jobs:
 
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # Update config.json
+          # ----- Update config.json in the chat repository -----
           echo "📝 Updating frontend config..."
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
@@ -146,7 +149,7 @@ jobs:
 
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # Self‑replication loop
+          # ----- Self‑replication loop -----
           echo "🔄 Entering self‑replication loop..."
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
@@ -164,7 +167,7 @@ jobs:
               TRIGGERED=true
             fi
 
-            # Health checks
+            # Health checks – restart if needed
             if ! curl -s http://localhost:11434/api/tags > /dev/null; then
               echo "⚠️ Ollama down – restarting..."
               pkill -f ollama 2>/dev/null || true
@@ -174,10 +177,10 @@ jobs:
 
             if ! pgrep -f cloudflared > /dev/null; then
               echo "⚠️ Tunnel down – restarting..."
-              ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee -a tunnel.log &
+              ./cloudflared tunnel --protocol http2 --url http://localhost:8080 2>&1 | tee -a tunnel.log &
             fi
 
-            if ! curl -s http://localhost:3000 > /dev/null; then
+            if ! curl -s http://localhost:8080 > /dev/null; then
               echo "⚠️ Open WebUI down – restarting container..."
               docker rm -f open-webui 2>/dev/null || true
               docker run -d --name open-webui --network host \
