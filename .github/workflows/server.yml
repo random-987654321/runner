@@ -13,6 +13,9 @@ permissions:
   contents: read
 
 jobs:
+  # ════════════════════════════════════════════════════════════
+  #  JOB 0 – COORDINATOR (Tailscale node + Exo orchestrator)
+  # ════════════════════════════════════════════════════════════
   coordinator:
     name: "🧠 Coordinator"
     runs-on: ubuntu-latest
@@ -21,7 +24,13 @@ jobs:
       tunnel_url: ${{ steps.tunnel.outputs.url }}
 
     steps:
-      # ── Cache: cloudflared ──
+      # ── 1. Install uv (required for exo) ──
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      # ── 2. Cache cloudflared ──
       - uses: actions/cache@v4
         id: cf_cache
         with:
@@ -33,16 +42,17 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ── Install Tailscale ──
+      # ── 3. Install Tailscale ──
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} --hostname exo-coordinator-${{ github.run_id }}
+          sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
+            --hostname exo-coordinator-${{ github.run_id }}
           sleep 5
           echo "✅ Tailscale connected"
           echo "📡 IP: $(tailscale ip -4)"
 
-      # ── Setup Python and Exo ──
+      # ── 4. Setup Python and install exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -51,7 +61,7 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
-      # ── Start EXO coordinator ──
+      # ── 5. Start EXO coordinator ──
       - name: Start EXO coordinator
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
@@ -60,7 +70,7 @@ jobs:
           uv run exo &
           sleep 10
 
-      # ── Start Cloudflare tunnel ──
+      # ── 6. Start Cloudflare tunnel → Exo dashboard ──
       - name: Start Cloudflare tunnel
         id: tunnel
         run: |
@@ -77,7 +87,7 @@ jobs:
           echo "::notice::EXO Dashboard: ${TUNNEL_URL}"
           echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
 
-      # ── Self-replication keepalive ──
+      # ── 7. Self‑replication keepalive ──
       - name: Self-replication keepalive
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -85,8 +95,10 @@ jobs:
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
           TRIGGERED=false
+
           while true; do
             ELAPSED=$(( $(date +%s) - START_TIME ))
+
             if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
               echo "⏰ Triggering replacement workflow..."
               curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
@@ -95,11 +107,20 @@ jobs:
                 -d "{\"ref\":\"${{ github.ref }}\",\"inputs\":{\"model\":\"${{ github.event.inputs.model }}\"}}"
               TRIGGERED=true
             fi
+
+            # Health checks
             pgrep -f exo > /dev/null || (source venv/bin/activate && uv run exo &)
             pgrep -f cloudflared > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
+            sudo tailscale status > /dev/null || sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
+              --hostname exo-coordinator-${{ github.run_id }}
+
             sleep 30
           done
 
+
+  # ════════════════════════════════════════════════════════════
+  #  JOBS 1–19 – EXO WORKER NODES (Tailscale + Exo worker)
+  # ════════════════════════════════════════════════════════════
   worker:
     name: "⚙️ Worker ${{ matrix.worker_id }}"
     runs-on: ubuntu-latest
@@ -111,16 +132,23 @@ jobs:
         worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
-      # ── Install Tailscale ──
+      # ── 1. Install uv ──
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      # ── 2. Install Tailscale ──
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} --hostname exo-worker-${{ matrix.worker_id }}-${{ github.run_id }}
+          sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
+            --hostname exo-worker-${{ matrix.worker_id }}-${{ github.run_id }}
           sleep 5
           echo "✅ Tailscale connected"
           echo "📡 IP: $(tailscale ip -4)"
 
-      # ── Setup Python and Exo ──
+      # ── 3. Setup Python and install exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -129,7 +157,7 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
-      # ── Join EXO cluster ──
+      # ── 4. Join EXO cluster ──
       - name: Join EXO cluster
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
@@ -141,6 +169,10 @@ jobs:
           while true; do
             if ! pgrep -f exo > /dev/null; then
               uv run exo &
+            fi
+            if ! sudo tailscale status > /dev/null; then
+              sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
+                --hostname exo-worker-${{ matrix.worker_id }}-${{ github.run_id }}
             fi
             sleep 30
           done
