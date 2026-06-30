@@ -21,6 +21,39 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake
 
+      # ----- Clean up old worker files -----
+      - name: Clean up old worker files
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🧹 Cleaning up old worker files from previous runs..."
+
+          # List all files in the workers/ directory
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+
+          # If the directory doesn't exist or is empty, skip
+          if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
+            echo "✅ No workers directory found – nothing to clean."
+            exit 0
+          fi
+
+          # Delete each file in the workers/ directory
+          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .path' | while read -r file; do
+            echo "  Deleting $file"
+            SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/${file}" | jq -r '.sha')
+            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -d "{\"message\":\"cleanup worker files\",\"sha\":\"${SHA}\"}" \
+              "https://api.github.com/repos/${REPO}/contents/${file}" > /dev/null
+          done
+
+          echo "✅ Cleanup complete – all old worker files removed."
+
+      # ----- Build llama-cli with RPC support -----
       - name: Build llama-cli with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
@@ -40,10 +73,12 @@ jobs:
             exit 1
           fi
 
+      # ----- Download the model -----
       - name: Download model (GGUF)
         run: |
           curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
 
+      # ----- Wait for workers and collect URLs -----
       - name: Wait for workers and collect URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -93,6 +128,7 @@ jobs:
 
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
 
+      # ----- Run distributed inference -----
       - name: Run distributed inference
         run: |
           echo "🧠 Distributed inference with workers: ${RPC_ADDRS}"
@@ -102,6 +138,7 @@ jobs:
             -p "What is the meaning of life?" \
             -n 256
 
+      # ----- Keep queen alive (for 24/7 operation) -----
       - name: Keep queen alive
         run: sleep infinity
 
@@ -141,22 +178,22 @@ jobs:
           cd ../..
           chmod +x ggml-rpc-server
 
-      - name: Start RPC server and register
+      - name: Start RPC server and register (idempotent)
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
-      
+
           PORT=$((65430 + INSTANCE_ID))
-      
+
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
-      
+
           bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
           sleep 5
-      
+
           BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
           if [ -z "$BORE_URL" ]; then
             echo "❌ Failed to get bore URL"
@@ -164,47 +201,31 @@ jobs:
             exit 1
           fi
           echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
-      
-          # ---------- Write to workers/w<id>.json with SHA handling ----------
+
+          # ----- Idempotent registration -----
           WORKER_FILE="workers/w${INSTANCE_ID}.json"
           mkdir -p workers
-          echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
-          ENCODED=$(base64 -w0 ${WORKER_FILE})
-      
-          # Check if file exists and get SHA
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
-      
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha // ""')
-      
-          # Build payload with or without SHA
-          if [ -n "$SHA" ] && [ "$SHA" != "null" ]; then
-            PAYLOAD=$(jq -n \
-              --arg msg "register worker $INSTANCE_ID" \
-              --arg content "$ENCODED" \
-              --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
+
+          # Check if already registered
+          if curl -s -f -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" > /dev/null 2>&1; then
+            echo "✅ Worker $INSTANCE_ID already registered – skipping"
           else
-            PAYLOAD=$(jq -n \
-              --arg msg "register worker $INSTANCE_ID" \
-              --arg content "$ENCODED" \
-              '{message: $msg, content: $content}')
+            echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
+            ENCODED=$(base64 -w0 ${WORKER_FILE})
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -d "{\"message\":\"register worker $INSTANCE_ID\",\"content\":\"${ENCODED}\"}" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+              echo "✅ Worker $INSTANCE_ID registered successfully!"
+            else
+              echo "❌ Failed to register worker $INSTANCE_ID"
+              echo "Response: $RESPONSE"
+              exit 1
+            fi
           fi
-      
-          RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -d "$PAYLOAD" \
-            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
-      
-          if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-            echo "✅ Worker $INSTANCE_ID registered successfully!"
-          else
-            echo "❌ Failed to register worker $INSTANCE_ID"
-            echo "Response: $RESPONSE"
-            exit 1
-          fi
-      
+
           # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
