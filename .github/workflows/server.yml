@@ -5,16 +5,12 @@ on:
 
 permissions:
   actions: write
-  contents: write   # needed to update config.json
+  contents: write
 
 jobs:
-  # ===================================================================
-  # QUEEN JOB – orchestrates everything
-  # ===================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     steps:
       - name: Install dependencies
         run: |
@@ -33,58 +29,47 @@ jobs:
           cd ../..
           chmod +x llama-cli
 
-      - name: Download model (GGUF)
+      - name: Download model
         run: |
           curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
 
-      - name: Wait for all workers to register
+      - name: Wait for workers to register
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
-          echo "👑 Queen waiting for 19 workers to register..."
-
+          echo "👑 Queen waiting for 19 workers..."
           for i in {1..60}; do
             curl -s -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
               > /tmp/config.json
-
             WORKER_COUNT=$(jq '.workers | length' /tmp/config.json 2>/dev/null || echo 0)
             echo "  Attempt $i: $WORKER_COUNT workers registered"
-
             if [ "$WORKER_COUNT" -ge 19 ]; then
               echo "✅ All workers registered!"
               break
             fi
             sleep 10
           done
-
           if [ "$WORKER_COUNT" -lt 19 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
-
-          # Build RPC connection string
           RPC_ADDRS=$(jq -r '.workers | join(",")' /tmp/config.json)
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
 
       - name: Run distributed inference
         run: |
-          echo "🧠 Starting distributed inference with workers: ${RPC_ADDRS}"
+          echo "🧠 Distributed inference with workers: ${RPC_ADDRS}"
           ./llama-cli -m model.gguf \
             --rpc ${RPC_ADDRS} \
             --tensor-split 19 \
             -p "What is the meaning of life?" \
             -n 256
 
-      - name: Keep queen alive (optional)
-        run: |
-          echo "👑 Queen finished inference – keeping alive for 6 hours."
-          sleep infinity
+      - name: Keep queen alive
+        run: sleep infinity
 
-  # ===================================================================
-  # WORKER JOBS – 19 instances, each runs an RPC server + bore tunnel
-  # ===================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -100,9 +85,11 @@ jobs:
 
       - name: Install bore
         run: |
-          curl -Lo bore https://github.com/ekzhang/bore/releases/latest/download/bore-linux-amd64
+          curl -Lo bore.tar.gz https://github.com/ekzhang/bore/releases/latest/download/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf bore.tar.gz
           chmod +x bore
           sudo mv bore /usr/local/bin/
+          bore --version
 
       - name: Build ggml-rpc-server
         run: |
@@ -123,15 +110,11 @@ jobs:
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
-
           PORT=$((65430 + INSTANCE_ID))
 
-          # Start ggml-rpc-server on the assigned port
           ./ggml-rpc-server -p ${PORT} &
-
           sleep 5
 
-          # Create bore tunnel to the RPC server port
           bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
           sleep 5
 
@@ -143,7 +126,6 @@ jobs:
           fi
           echo "✅ Worker $INSTANCE_ID registered at: ${BORE_URL}"
 
-          # Register in config.json
           curl -s -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
             > /tmp/current.json
@@ -161,7 +143,6 @@ jobs:
 
           echo "✅ Worker $INSTANCE_ID registered successfully!"
 
-          # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
