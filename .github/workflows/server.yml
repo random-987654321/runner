@@ -38,7 +38,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "👑 Queen waiting for 19 workers..."
+          echo "👑 Queen waiting for 5 workers..."
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -50,13 +50,13 @@ jobs:
               WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
             fi
             echo "  Attempt $attempt: $WORKER_COUNT workers registered"
-            if [ "$WORKER_COUNT" -ge 19 ]; then
+            if [ "$WORKER_COUNT" -ge 5 ]; then
               echo "✅ All workers registered!"
               break
             fi
             sleep 5
           done
-          if [ "$WORKER_COUNT" -lt 19 ]; then
+          if [ "$WORKER_COUNT" -lt 5 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
