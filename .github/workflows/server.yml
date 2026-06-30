@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "Model to run (HuggingFace ID)"
+        description: "Model to run (HuggingFace path)"
         required: false
-        default: "mlx-community/Llama-3.2-1B-Instruct-4bit"
+        default: "ibm-granite/granite-4.0-h-tiny"
 
 permissions:
   actions: write
@@ -14,8 +14,8 @@ permissions:
 
 jobs:
   # ─────────────────────────────────────────────────────────────
-  #  JOB 0 – COORDINATOR NODE
-  #  Runs Exo in coordinator mode (or full mode)
+  #  JOB 0 – CLUSTER COORDINATOR
+  #  Hosts the Exo node that starts the cluster
   # ─────────────────────────────────────────────────────────────
   coordinator:
     name: "🧠 Coordinator Node"
@@ -25,13 +25,6 @@ jobs:
       tunnel_url: ${{ steps.tunnel.outputs.url }}
 
     steps:
-      # ── Checkout Exo repo ──
-      - uses: actions/checkout@v4
-        with:
-          repository: exo-explore/exo
-          token: ${{ secrets.TOKEN }}
-          path: exo
-
       # ── Cache: cloudflared ──
       - uses: actions/cache@v4
         id: cf_cache
@@ -44,53 +37,41 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ── Setup Python, Node, Rust ──
-      - name: Setup dependencies
+      # ── Setup Python and Exo ──
+      - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-pip python3-venv nodejs npm curl
+          sudo apt-get install -y python3-pip python3-venv
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --quiet exo
 
-          # Install uv
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-
-          # Install Rust
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source $HOME/.cargo/env
-          rustup toolchain install nightly
-
-          # Install Node dependencies
-          cd exo/dashboard
-          npm install
-          npm run build
-          cd ../..
-
-      # ── Start Exo coordinator ──
-      - name: Start Exo
+      # ── Start Exo node ──
+      - name: Start Exo node
         run: |
-          cd exo
-          source $HOME/.cargo/env
-          export PATH="$HOME/.cargo/bin:$PATH"
+          source venv/bin/activate
 
-          # Start Exo (runs dashboard on port 52415)
-          uv run exo &
+          # Exo runs on port 52415 by default
+          # Start in the background with auto-discovery
+          exo &
           EXO_PID=$!
 
           # Wait for Exo to be ready
           for i in {1..20}; do
             if curl -s http://localhost:52415/health > /dev/null 2>&1; then
-              echo "✅ Exo coordinator ready"
+              echo "✅ Exo node ready"
               break
             fi
             sleep 2
           done
 
-          # ── Start Cloudflare tunnel ──
-          if [ ! -f ../cloudflared ]; then
-            curl -Lo ../cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x ../cloudflared
+          # ── Start Cloudflare tunnel to Exo dashboard ──
+          if [ ! -f ./cloudflared ]; then
+            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x cloudflared
           fi
           pkill -f cloudflared 2>/dev/null || true
-          ../cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee tunnel.log &
+          ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee tunnel.log &
 
           # Extract tunnel URL
           for i in {1..30}; do
@@ -105,7 +86,11 @@ jobs:
           echo "::notice::Exo Dashboard: ${TUNNEL_URL}"
           echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
 
-          # ── Self-replication loop ──
+      # ── Self-replication loop ──
+      - name: Self-replication keepalive
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+        run: |
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
           TRIGGERED=false
@@ -122,12 +107,13 @@ jobs:
               TRIGGERED=true
             fi
 
+            # Health checks
             if ! curl -s http://localhost:52415/health > /dev/null 2>&1; then
-              cd exo
-              uv run exo &
+              source venv/bin/activate
+              exo &
             fi
             if ! pgrep -f cloudflared > /dev/null; then
-              ../cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
+              ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
             fi
 
             sleep 30
@@ -136,10 +122,10 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────
   #  JOBS 1–19 – EXO WORKER NODES
-  #  Each node runs Exo and joins the cluster automatically
+  #  Each node runs Exo and joins the cluster via P2P discovery
   # ─────────────────────────────────────────────────────────────
   worker:
-    name: "⚙️ Worker ${{ matrix.node_id }}"
+    name: "⚙️ Worker Node ${{ matrix.node_id }}"
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
@@ -148,40 +134,23 @@ jobs:
         node_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
-      # ── Checkout Exo repo ──
-      - uses: actions/checkout@v4
-        with:
-          repository: exo-explore/exo
-          token: ${{ secrets.TOKEN }}
-          path: exo
-
-      # ── Setup dependencies ──
-      - name: Setup dependencies
+      # ── Setup Python and Exo ──
+      - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-pip python3-venv nodejs npm curl
+          sudo apt-get install -y python3-pip python3-venv
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --quiet exo
 
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source $HOME/.cargo/env
-          rustup toolchain install nightly
-
-          cd exo/dashboard
-          npm install
-          npm run build
-          cd ../..
-
-      # ── Start Exo worker ──
+      # ── Start Exo worker node ──
       - name: Start Exo worker
         run: |
-          cd exo
-          source $HOME/.cargo/env
-          export PATH="$HOME/.cargo/bin:$PATH"
+          source venv/bin/activate
 
-          # Exo automatically discovers other nodes via libp2p/zenoh
+          # Exo automatically discovers other nodes via mDNS
           # No configuration needed – just start it
-          uv run exo &
+          exo &
           EXO_PID=$!
 
           # Wait for Exo to be ready
@@ -198,8 +167,8 @@ jobs:
           # ── Keepalive loop ──
           while true; do
             if ! curl -s http://localhost:52415/health > /dev/null 2>&1; then
-              cd exo
-              uv run exo &
+              source venv/bin/activate
+              exo &
             fi
             sleep 30
           done
