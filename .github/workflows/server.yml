@@ -75,36 +75,18 @@ jobs:
           path: ./cloudflared
           key: cloudflared-v1
 
-      # ── Cache: Ollama models ──
-      - uses: actions/cache@v4
-        id: ollama_cache
-        with:
-          path: ~/.ollama/models
-          key: ollama-${{ github.event.inputs.model }}
-          restore-keys: ollama-
-
-      - if: steps.ollama_cache.outputs.cache-hit != 'true'
-        uses: ai-action/setup-ollama@v2
-
-      - if: steps.ollama_cache.outputs.cache-hit != 'true'
-        run: ollama pull "${{ github.event.inputs.model }}"
-
-      - if: steps.ollama_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.ollama/models
-          key: ollama-${{ github.event.inputs.model }}
-
       # ── Install Python tools ──
+      # NOTE: Coordinator does NOT install Ollama or pull any model.
+      # It only orchestrates workers — the model lives entirely in worker shards.
       - name: Setup Python env
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-pip python3-venv jq curl
           python3 -m venv venv
           source venv/bin/activate
-          pip install --quiet open-webui flask requests
+          pip install --quiet flask requests
 
-      # ── Build shard manifest & upload shards as artifacts ──
+      # ── Download model (for sharding only), split, upload, then purge ──
       - name: Shard model and upload artifacts
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -112,41 +94,46 @@ jobs:
           MODEL: ${{ github.event.inputs.model }}
         run: |
           set -e
-          MODEL_SAFE=$(echo "$MODEL" | tr '/:' '__')
-          MODEL_DIR=$(find ~/.ollama/models -name "*.gguf" | head -1)
 
-          if [ -z "$MODEL_DIR" ]; then
-            # Fallback: find blobs directory
-            MODEL_DIR=$(find ~/.ollama -type f -size +1M | head -1)
+          # Install Ollama transiently — only needed to pull the model file for splitting
+          # It is NOT started as a server; we never run inference here
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama pull "$MODEL"
+
+          MODEL_FILE=$(find ~/.ollama/models -type f \( -name "*.gguf" -o -size +10M \) | head -1)
+          if [ -z "$MODEL_FILE" ]; then
+            echo "❌ Could not locate model blob after pull"
+            find ~/.ollama -type f | head -20
+            exit 1
           fi
 
-          echo "📁 Model file: $MODEL_DIR"
-          FILE_SIZE=$(stat -c%s "$MODEL_DIR")
+          echo "📁 Model file: $MODEL_FILE ($(du -sh "$MODEL_FILE" | cut -f1))"
+          FILE_SIZE=$(stat -c%s "$MODEL_FILE")
           SHARD_SIZE=$(( FILE_SIZE / SHARD_COUNT ))
-
-          echo "📊 Total: ${FILE_SIZE} bytes → ${SHARD_COUNT} shards of ~${SHARD_SIZE} bytes"
+          echo "📊 ${FILE_SIZE} bytes → ${SHARD_COUNT} shards of ~${SHARD_SIZE} bytes each"
 
           mkdir -p shards
-          split -b "$SHARD_SIZE" -d "$MODEL_DIR" shards/shard_
+          split -b "$SHARD_SIZE" -d "$MODEL_FILE" shards/shard_
 
-          # Create manifest JSON
-          ls shards/ | sort > shard_list.txt
-          MANIFEST=$(python3 -c "
+          # Manifest
+          python3 - << PYEOF
           import json, os
-          shards = sorted(os.listdir('shards'))
+          shards = sorted(f for f in os.listdir('shards') if f.startswith('shard_'))
           manifest = {
-            'model': '$MODEL',
+            'model': os.environ['MODEL'],
             'total_shards': len(shards),
             'coordinator_run_id': '${{ github.run_id }}',
             'shards': [{'index': i, 'file': s} for i, s in enumerate(shards)]
           }
+          with open('shards/manifest.json', 'w') as f:
+            json.dump(manifest, f, indent=2)
           print(json.dumps(manifest, indent=2))
-          ")
-          echo "$MANIFEST" > shards/manifest.json
-          echo "📋 Manifest: $MANIFEST"
+          PYEOF
 
-          # Upload ALL shards as a single artifact (workers download by index)
-          echo "⬆️  Uploading shard bundle as artifact..."
+          # Purge Ollama + model — coordinator must NOT run inference
+          pkill -f ollama 2>/dev/null || true
+          rm -rf ~/.ollama
+          echo "🗑️  Ollama purged from coordinator — inference lives in workers only"
 
       - name: Upload shard bundle
         uses: actions/upload-artifact@v4
@@ -156,8 +143,8 @@ jobs:
           retention-days: 1
           compression-level: 0   # Already compressed GGUF
 
-      # ── Start rendezvous server ──
-      - name: Start rendezvous + Ollama + OpenWebUI
+      # ── Start rendezvous + Chat UI + Tunnels (NO Ollama on coordinator) ──
+      - name: Start rendezvous + chat UI + tunnels
         id: tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -170,7 +157,7 @@ jobs:
           # ── Rendezvous server (Flask) ──
           # Workers POST their shard_index + tunnel_url here to register
           # Coordinator tracks which shards are online
-          # Once all registered → broadcasts "START" to all workers
+          # Once all registered → coordinator is ready to handle inference requests
           cat > rendezvous.py << 'PYEOF'
           import threading, json, time, sys, os
           from flask import Flask, request, jsonify
@@ -267,38 +254,144 @@ jobs:
 
           source venv/bin/activate
 
-          # Start rendezvous
+          # ── Start rendezvous (pipeline orchestrator + worker registry) ──
+          # Coordinator does NO model inference — it only holds the ring token
+          # and passes context sequentially through the 19 worker pipeline.
           python3 rendezvous.py &
           RENDEZVOUS_PID=$!
 
-          # ── Ollama (coordinator also runs full model as fallback) ──
-          export OLLAMA_HOST=0.0.0.0:11434
-          export OLLAMA_NUM_PARALLEL=4
-          export OLLAMA_MAX_LOADED_MODELS=1
-          export OLLAMA_FLASH_ATTENTION=true
-          export OLLAMA_CONTEXT_LENGTH=16384
+          # ── Lightweight Chat UI (pure pipeline proxy, zero Ollama) ──
+          # Serves a minimal web UI on port 3000 that POSTs to /infer
+          # /infer runs the full worker pipeline and streams the response back.
+          # No Ollama, no model weights, no fallback inference on this machine.
+          cat > chat_ui.py << 'UIEOF'
+          import os
+          from flask import Flask, request, jsonify, Response, stream_with_context
+          import requests as req, json, threading, time
 
-          ollama serve &
-          sleep 5
+          app = Flask(__name__)
 
-          for i in {1..20}; do
-            curl -s http://localhost:11434/api/tags > /dev/null && echo "✅ Ollama ready" && break
-            sleep 3
+          INFER_URL = "http://localhost:9000/infer"
+          STATUS_URL = "http://localhost:9000/status"
+
+          CHAT_HTML = """<!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>ShardRing Chat</title>
+            <style>
+              body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;background:#0f0f0f;color:#e0e0e0}
+              h1{color:#7c9eff;margin-bottom:4px}
+              #status{font-size:12px;color:#888;margin-bottom:20px}
+              #chat{border:1px solid #333;border-radius:8px;height:420px;overflow-y:auto;padding:16px;background:#1a1a1a;margin-bottom:12px}
+              .msg{margin:10px 0;line-height:1.6}
+              .user{color:#7c9eff;font-weight:600}
+              .assistant{color:#a8e6a3}
+              .error{color:#ff6b6b}
+              #input-row{display:flex;gap:8px}
+              #prompt{flex:1;padding:10px 14px;border-radius:6px;border:1px solid #333;background:#1a1a1a;color:#e0e0e0;font-size:14px}
+              #send{padding:10px 20px;background:#7c9eff;color:#000;border:none;border-radius:6px;cursor:pointer;font-weight:600}
+              #send:disabled{opacity:.4;cursor:default}
+              #workers{font-size:11px;color:#555;margin-top:8px}
+            </style>
+          </head>
+          <body>
+            <h1>⚙️ ShardRing Inference</h1>
+            <div id="status">Checking pipeline status...</div>
+            <div id="chat"></div>
+            <div id="input-row">
+              <input id="prompt" type="text" placeholder="Type a message..." autocomplete="off">
+              <button id="send" onclick="sendMsg()">Send</button>
+            </div>
+            <div id="workers"></div>
+            <script>
+              async function poll(){
+                try{
+                  const r=await fetch('/api/status');
+                  const d=await r.json();
+                  document.getElementById('status').textContent=
+                    d.ready
+                      ? '✅ Pipeline ready — '+d.registered+'/'+d.expected+' shards online'
+                      : '⏳ Waiting for workers: '+d.registered+'/'+d.expected+' registered';
+                  const wu=Object.values(d.workers||{}).map((u,i)=>'Shard '+i+': '+u).join(' | ');
+                  document.getElementById('workers').textContent=wu;
+                }catch(e){document.getElementById('status').textContent='⚠️ Coordinator unreachable';}
+              }
+              setInterval(poll,4000); poll();
+
+              async function sendMsg(){
+                const el=document.getElementById('prompt');
+                const btn=document.getElementById('send');
+                const prompt=el.value.trim();
+                if(!prompt) return;
+                el.value=''; btn.disabled=true;
+                const chat=document.getElementById('chat');
+                chat.innerHTML+='<div class="msg"><span class="user">You:</span> '+escHtml(prompt)+'</div>';
+                const replyEl=document.createElement('div');
+                replyEl.className='msg';
+                replyEl.innerHTML='<span class="assistant">Assistant:</span> <span id="resp">…</span>';
+                chat.appendChild(replyEl);
+                chat.scrollTop=chat.scrollHeight;
+                try{
+                  const r=await fetch('/api/infer',{
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({prompt})
+                  });
+                  const d=await r.json();
+                  document.getElementById('resp').textContent=d.response||d.error||'(empty)';
+                  if(d.error) replyEl.classList.add('error');
+                }catch(e){
+                  document.getElementById('resp').textContent='Error: '+e.message;
+                  replyEl.classList.add('error');
+                }
+                btn.disabled=false; chat.scrollTop=chat.scrollHeight;
+              }
+              document.getElementById('prompt').addEventListener('keydown',e=>{if(e.key==='Enter')sendMsg();});
+              function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+            </script>
+          </body>
+          </html>"""
+
+          @app.route("/")
+          def index():
+              return CHAT_HTML, 200, {"Content-Type": "text/html"}
+
+          @app.route("/api/status")
+          def api_status():
+              try:
+                  r = req.get(STATUS_URL, timeout=5)
+                  return jsonify(r.json())
+              except Exception as e:
+                  return jsonify({"error": str(e), "registered": 0, "expected": 19, "ready": False}), 503
+
+          @app.route("/api/infer", methods=["POST"])
+          def api_infer():
+              data = request.json
+              prompt = data.get("prompt", "")
+              if not prompt:
+                  return jsonify({"error": "empty prompt"}), 400
+              try:
+                  r = req.post(INFER_URL, json={"prompt": prompt}, timeout=300)
+                  return jsonify(r.json())
+              except Exception as e:
+                  return jsonify({"error": str(e)}), 503
+
+          if __name__ == "__main__":
+              print("🖥️  Chat UI starting on :3000 (no local model — pure pipeline proxy)", flush=True)
+              app.run(host="0.0.0.0", port=3000, threaded=True)
+          UIEOF
+
+          python3 chat_ui.py &
+          sleep 3
+
+          for i in {1..10}; do
+            curl -s http://localhost:3000 > /dev/null && echo "✅ Chat UI ready (pipeline proxy only, no local model)" && break
+            sleep 2
           done
 
-          ollama pull "$MODEL" --insecure 2>/dev/null || true
-
-          # ── OpenWebUI (coordinator UI) ──
-          # Configure it to use the rendezvous /infer endpoint OR direct Ollama
-          open-webui serve --host 0.0.0.0 --port 3000 &
-          sleep 8
-
-          for i in {1..15}; do
-            curl -s http://localhost:3000 > /dev/null && echo "✅ OpenWebUI ready" && break
-            sleep 3
-          done
-
-          # ── Cloudflare tunnel → OpenWebUI ──
+          # ── Cloudflare tunnel → Chat UI ──
           ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
 
           for i in {1..30}; do
@@ -379,10 +472,11 @@ jobs:
               TRIGGERED=true
             fi
 
-            # Health checks
-            curl -s http://localhost:11434/api/tags > /dev/null || (pkill -f "ollama serve" 2>/dev/null; ollama serve &)
-            curl -s http://localhost:3000 > /dev/null || (source venv/bin/activate; open-webui serve --host 0.0.0.0 --port 3000 &)
-            pgrep -f cloudflared > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee -a tunnel.log &
+            # Health checks — coordinator runs NO model inference; only guard the UI + tunnels
+            curl -s http://localhost:9000/status > /dev/null || (source venv/bin/activate; python3 rendezvous.py &)
+            curl -s http://localhost:3000 > /dev/null || (source venv/bin/activate; python3 chat_ui.py &)
+            pgrep -f "cloudflared.*3000" > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee -a tunnel.log &
+            pgrep -f "cloudflared.*9000" > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:9000 2>&1 | tee -a rendezvous_tunnel.log &
 
             sleep 30
           done
