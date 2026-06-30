@@ -8,7 +8,6 @@ permissions:
   contents: write
 
 env:
-  # Real llama.cpp release tag. Change this to upgrade.
   LLAMA_COMMIT: "b9850"
   MODEL_URL: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
 
@@ -62,28 +61,32 @@ jobs:
           LLAMA_COMMIT: ${{ env.LLAMA_COMMIT }}
         run: |
           set -e
-          # To always use the latest release tag, uncomment the next line:
-          # LLAMA_COMMIT=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
           echo "Using llama.cpp tag: ${LLAMA_COMMIT}"
 
           git clone --depth 1 --branch "${LLAMA_COMMIT}" \
             https://github.com/ggml-org/llama.cpp.git llama.cpp-src
-
           cd llama.cpp-src
           mkdir -p build && cd build
+
           cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
           cmake --build . --config Release -j4
 
-          RPC_BIN=$(find . -maxdepth 2 -type f \
-            \( -name 'ggml-rpc-server' -o -name 'llama-rpc-server' -o -name 'rpc-server' \) | head -1)
+          echo "---- Built executables ----"
+          find . -maxdepth 2 -type f -executable | sort
+
+          # Prefer llama-rpc-server, fall back to ggml-rpc-server
+          RPC_BIN=$(find . -maxdepth 2 -type f \( -name 'llama-rpc-server' -o -name 'ggml-rpc-server' \) | head -1)
           if [ -z "$RPC_BIN" ]; then
-            echo "❌ Could not find RPC server binary. Built executables:"
-            find . -maxdepth 2 -type f -executable | head -50
+            echo "❌ No RPC server binary found"
             exit 1
           fi
-          echo "✅ RPC server binary: $RPC_BIN"
+          echo "✅ Using RPC binary: $RPC_BIN"
           cp "$RPC_BIN" ../../rpc-server
           cd ../..
+          chmod +x rpc-server
+          ls -lh rpc-server
+          echo "---- RPC binary help ----"
+          ./rpc-server --help 2>&1 | head -30 || true
 
       - name: Start RPC server and Holesail tunnel
         env:
@@ -95,8 +98,9 @@ jobs:
           PORT=50052
           mkdir -p logs
 
-          echo "🐝 Worker $INSTANCE_ID starting RPC server on port ${PORT}..."
-          nohup ./rpc-server -p ${PORT} > logs/rpc.log 2>&1 &
+          echo "🐝 Worker $INSTANCE_ID starting RPC server..."
+          # Bind to 0.0.0.0 so Holesail can reach it no matter which local IP it uses.
+          nohup ./rpc-server --host 0.0.0.0 -p ${PORT} > logs/rpc.log 2>&1 &
 
           for i in $(seq 1 30); do
             if nc -z 127.0.0.1 ${PORT}; then
@@ -111,10 +115,13 @@ jobs:
             sleep 1
           done
 
+          # Quick smoke test: the server should accept a TCP connection and stay alive.
+          ( sleep 1; printf '\x00' ) | nc -q 1 127.0.0.1 ${PORT} > /dev/null 2>&1 || true
+
           echo "🔗 Starting Holesail server on port ${PORT}..."
           rm -f /tmp/holesail_output.txt
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
-          sleep 8
+          sleep 10
 
           CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
           if [ -z "${CONNECTION_STRING}" ]; then
@@ -172,9 +179,11 @@ jobs:
 
           LAST_KEY="${CONNECTION_STRING}"
           while true; do
+            sleep 30
+
             if ! pgrep -f "rpc-server" >/dev/null; then
               echo "⚠️ RPC server died — restarting..."
-              nohup ./rpc-server -p ${PORT} > logs/rpc.log 2>&1 &
+              nohup ./rpc-server --host 0.0.0.0 -p ${PORT} > logs/rpc.log 2>&1 &
               sleep 5
             fi
 
@@ -182,7 +191,7 @@ jobs:
               echo "⚠️ Holesail died — restarting..."
               rm -f /tmp/holesail_output.txt
               holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
-              sleep 8
+              sleep 10
               CURRENT_KEY=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1 || true)
               if [ -n "$CURRENT_KEY" ] && [ "$CURRENT_KEY" != "$LAST_KEY" ]; then
                 echo "🔄 Key changed, re-registering..."
@@ -190,7 +199,6 @@ jobs:
                 LAST_KEY="$CURRENT_KEY"
               fi
             fi
-            sleep 30
           done
 
   queen:
@@ -212,7 +220,6 @@ jobs:
           LLAMA_COMMIT: ${{ env.LLAMA_COMMIT }}
         run: |
           set -e
-          # LLAMA_COMMIT=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
           echo "Using llama.cpp tag: ${LLAMA_COMMIT}"
 
           git clone --depth 1 --branch "${LLAMA_COMMIT}" \
@@ -224,6 +231,7 @@ jobs:
           cmake --build . --config Release -j4 --target llama-server
           cp bin/llama-server ../../
           cd ../..
+          chmod +x llama-server
           ./llama-server --help 2>&1 | grep -qi rpc || { echo "❌ llama-server missing RPC support"; exit 1; }
           echo "✅ llama-server with RPC built"
 
@@ -276,18 +284,19 @@ jobs:
           i=0
           for url in "${URLS[@]}"; do
             port=$((BASE + i))
+            echo "Opening Holesail client $url -> 127.0.0.1:$port"
             nohup holesail "$url" --port $port > logs/holesail_$i.log 2>&1 &
-            for t in $(seq 1 30); do
+            for t in $(seq 1 40); do
               nc -z 127.0.0.1 $port && break
               sleep 1
             done
-            nc -z 127.0.0.1 $port || { echo "❌ Holesail client $i did not open port $port"; exit 1; }
+            nc -z 127.0.0.1 $port || { echo "❌ Holesail client $i did not open port $port"; cat logs/holesail_$i.log; exit 1; }
             [ -z "$RPC_ADDRS" ] && RPC_ADDRS="127.0.0.1:$port" || RPC_ADDRS="$RPC_ADDRS,127.0.0.1:$port"
             i=$((i + 1))
           done
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
           echo "✅ RPC backends: $RPC_ADDRS"
-          sleep 5
+          sleep 8
 
       - name: Start llama-server and Cloudflare tunnel
         env:
@@ -306,7 +315,7 @@ jobs:
             > logs/server.log 2>&1 &
           SERVER_PID=$!
 
-          for i in $(seq 1 40); do
+          for i in $(seq 1 50); do
             if curl -fs --max-time 3 http://localhost:8080/health >/dev/null 2>&1; then
               echo "✅ llama-server is healthy"
               break
@@ -316,7 +325,7 @@ jobs:
               cat logs/server.log
               exit 1
             fi
-            echo "⏳ Waiting for llama-server health... ($i/40)"
+            echo "⏳ Waiting for llama-server health... ($i/50)"
             sleep 3
           done
 
