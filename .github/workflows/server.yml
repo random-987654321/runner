@@ -1,4 +1,4 @@
-name: P2P RPC Inference Mesh (Pinned-Commit)
+name: P2P Exo Inference Mesh (Star Topology)
 
 on:
   workflow_dispatch:
@@ -8,11 +8,18 @@ permissions:
   contents: write
 
 env:
-  LLAMA_COMMIT: "b9850"
-  MODEL_URL: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+  # Exo-compatible tiny model. Exo downloads/weights it automatically.
+  EXO_MODEL: "llama-3.2-1b"
+  # Exo web/API port (hardcoded default).
+  EXO_API_PORT: 8000
+  # Exo peer-to-peer port used by workers.
+  EXO_PEER_PORT: 50052
 
 jobs:
 
+  # ------------------------------------------------------------------------
+  # Bootstrap — create the workers registry directory before anyone writes.
+  # ------------------------------------------------------------------------
   bootstrap:
     runs-on: ubuntu-latest
     steps:
@@ -39,6 +46,9 @@ jobs:
               -d "{\"message\":\"create workers dir\",\"content\":\"$EMPTY\"}" || true
           fi
 
+  # ------------------------------------------------------------------------
+  # Workers — each one runs an Exo node and tunnels it through Holesail.
+  # ------------------------------------------------------------------------
   worker:
     needs: bootstrap
     runs-on: ubuntu-latest
@@ -48,75 +58,58 @@ jobs:
         instance: [1, 2, 3, 4, 5]
 
     steps:
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake git nodejs npm openssl psmisc netcat-traditional
+          sudo apt-get install -y jq curl build-essential git python3 python3-pip python3-venv nodejs npm openssl psmisc netcat-traditional
 
       - name: Install Holesail
         run: sudo npm install -g holesail
 
-      - name: Build RPC server from pinned tag
-        env:
-          LLAMA_COMMIT: ${{ env.LLAMA_COMMIT }}
+      - name: Install Exo
         run: |
-          set -e
-          echo "Using llama.cpp tag: ${LLAMA_COMMIT}"
+          python3 -m pip install --upgrade pip
+          python3 -m pip install exo --quiet
+          echo "---- Exo version / help ----"
+          exo --version 2>&1 || true
+          exo --help 2>&1 | head -60 || true
 
-          git clone --depth 1 --branch "${LLAMA_COMMIT}" \
-            https://github.com/ggml-org/llama.cpp.git llama.cpp-src
-          cd llama.cpp-src
-          mkdir -p build && cd build
+      - name: Pre-download model (optional but recommended)
+        run: |
+          echo "📥 Pre-downloading ${EXO_MODEL} on worker..."
+          # Exo downloads on first use; this just warms the cache.
+          timeout 300 exo --node-id worker-${{ matrix.instance }}-warmup --default-model "${EXO_MODEL}" --timeout 300 --help || true
 
-          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4
-
-          echo "---- Built executables ----"
-          find . -maxdepth 2 -type f -executable | sort
-
-          # Prefer llama-rpc-server, fall back to ggml-rpc-server
-          RPC_BIN=$(find . -maxdepth 2 -type f \( -name 'llama-rpc-server' -o -name 'ggml-rpc-server' \) | head -1)
-          if [ -z "$RPC_BIN" ]; then
-            echo "❌ No RPC server binary found"
-            exit 1
-          fi
-          echo "✅ Using RPC binary: $RPC_BIN"
-          cp "$RPC_BIN" ../../rpc-server
-          cd ../..
-          chmod +x rpc-server
-          ls -lh rpc-server
-          echo "---- RPC binary help ----"
-          ./rpc-server --help 2>&1 | head -30 || true
-
-      - name: Start RPC server and Holesail tunnel
+      - name: Start Exo node and Holesail server
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           set -e
-          PORT=50052
+          PORT=${EXO_PEER_PORT}
           mkdir -p logs
 
-          echo "🐝 Worker $INSTANCE_ID starting RPC server..."
-          # Bind to 0.0.0.0 so Holesail can reach it no matter which local IP it uses.
-          nohup ./rpc-server --host 0.0.0.0 -p ${PORT} > logs/rpc.log 2>&1 &
+          echo "🐝 Worker $INSTANCE_ID starting Exo node..."
+          # Exo node listens on 0.0.0.0 so Holesail can reach it.
+          nohup exo \
+            --node-id "worker-${INSTANCE_ID}" \
+            --host 0.0.0.0 \
+            --port ${PORT} \
+            > logs/exo.log 2>&1 &
 
-          for i in $(seq 1 30); do
+          for i in $(seq 1 40); do
             if nc -z 127.0.0.1 ${PORT}; then
-              echo "✅ RPC server listening on ${PORT}"
+              echo "✅ Exo node listening on ${PORT}"
               break
             fi
-            if ! pgrep -f "rpc-server" >/dev/null; then
-              echo "❌ RPC server died"
-              cat logs/rpc.log
+            if ! pgrep -f "exo" >/dev/null; then
+              echo "❌ Exo process died"
+              cat logs/exo.log
               exit 1
             fi
-            sleep 1
+            sleep 2
           done
-
-          # Quick smoke test: the server should accept a TCP connection and stay alive.
-          ( sleep 1; printf '\x00' ) | nc -q 1 127.0.0.1 ${PORT} > /dev/null 2>&1 || true
 
           echo "🔗 Starting Holesail server on port ${PORT}..."
           rm -f /tmp/holesail_output.txt
@@ -139,38 +132,39 @@ jobs:
             ENCODED=$(base64 -w0 "${file}")
 
             for attempt in $(seq 1 15); do
-              FILE_INFO=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
+              local info sha payload response status
+              info=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
                 -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/${file}")
-              SHA=$(echo "$FILE_INFO" | jq -r '.sha // empty' 2>/dev/null)
+                "https://api.github.com/repos/${REPO}/contents/${file}") || true
+              sha=$(echo "$info" | jq -r '.sha // empty' 2>/dev/null)
 
-              if [ -n "$SHA" ]; then
-                PAYLOAD=$(jq -n --arg msg "worker ${INSTANCE_ID} update" \
-                  --arg content "$ENCODED" --arg sha "$SHA" \
+              if [ -n "$sha" ]; then
+                payload=$(jq -n --arg msg "worker ${INSTANCE_ID} update" \
+                  --arg content "$ENCODED" --arg sha "$sha" \
                   '{message:$msg,content:$content,sha:$sha}')
               else
-                PAYLOAD=$(jq -n --arg msg "worker ${INSTANCE_ID} register" \
+                payload=$(jq -n --arg msg "worker ${INSTANCE_ID} register" \
                   --arg content "$ENCODED" \
                   '{message:$msg,content:$content}')
               fi
 
-              RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer ${GH_TOKEN}" \
+              response=$(curl -s -X PUT -H "Authorization: Bearer ${GH_TOKEN}" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${REPO}/contents/${file}" \
-                -d "$PAYLOAD")
+                -d "$payload") || true
 
-              if echo "$RESPONSE" | jq -e '.content' >/dev/null; then
+              if echo "$response" | jq -e '.content' >/dev/null 2>&1; then
                 echo "✅ Worker $INSTANCE_ID registered"
                 return 0
               fi
 
-              STATUS=$(echo "$RESPONSE" | jq -r '.status // empty' 2>/dev/null)
-              if [ "$STATUS" = "409" ]; then
+              status=$(echo "$response" | jq -r '.status // empty' 2>/dev/null)
+              if [ "$status" = "409" ]; then
                 echo "⚠️ Conflict, retrying..."
                 sleep 3
                 continue
               fi
-              echo "❌ Registration failed: $RESPONSE"
+              echo "❌ Registration failed: $response"
               return 1
             done
           }
@@ -181,9 +175,13 @@ jobs:
           while true; do
             sleep 30
 
-            if ! pgrep -f "rpc-server" >/dev/null; then
-              echo "⚠️ RPC server died — restarting..."
-              nohup ./rpc-server --host 0.0.0.0 -p ${PORT} > logs/rpc.log 2>&1 &
+            if ! pgrep -f "exo.*worker-${INSTANCE_ID}" >/dev/null; then
+              echo "⚠️ Exo process died — restarting..."
+              nohup exo \
+                --node-id "worker-${INSTANCE_ID}" \
+                --host 0.0.0.0 \
+                --port ${PORT} \
+                > logs/exo.log 2>&1 &
               sleep 5
             fi
 
@@ -201,47 +199,32 @@ jobs:
             fi
           done
 
+  # ------------------------------------------------------------------------
+  # Queen — opens Holesail clients to every worker, then starts the central
+  # Exo node in star topology and exposes the web API via Cloudflare.
+  # ------------------------------------------------------------------------
   queen:
     needs: bootstrap
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake git nodejs npm openssl netcat-traditional
+          sudo apt-get install -y jq curl build-essential git python3 python3-pip nodejs npm openssl netcat-traditional
 
       - name: Install Holesail
         run: sudo npm install -g holesail
 
-      - name: Build llama-server with RPC support
-        env:
-          LLAMA_COMMIT: ${{ env.LLAMA_COMMIT }}
+      - name: Install Exo
         run: |
-          set -e
-          echo "Using llama.cpp tag: ${LLAMA_COMMIT}"
+          python3 -m pip install --upgrade pip
+          python3 -m pip install exo --quiet
+          exo --version 2>&1 || true
+          exo --help 2>&1 | head -60 || true
 
-          git clone --depth 1 --branch "${LLAMA_COMMIT}" \
-            https://github.com/ggml-org/llama.cpp.git llama.cpp-src
-
-          cd llama.cpp-src
-          mkdir -p build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-server
-          cp bin/llama-server ../../
-          cd ../..
-          chmod +x llama-server
-          ./llama-server --help 2>&1 | grep -qi rpc || { echo "❌ llama-server missing RPC support"; exit 1; }
-          echo "✅ llama-server with RPC built"
-
-      - name: Download model
-        run: |
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
-          [ "$(head -c 4 model.gguf)" = "GGUF" ] || { echo "❌ Invalid GGUF"; exit 1; }
-          echo "✅ Model downloaded"
-
-      - name: Wait for workers
+      - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -252,27 +235,37 @@ jobs:
             RESPONSE=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null || true)
+
             FILES=$(echo "$RESPONSE" | jq -r '.[]? | select(.type=="file" and (.name | startswith("hole"))) | .name' 2>/dev/null || true)
             COUNT=$(echo "$FILES" | grep -c . || echo 0)
             echo "  Attempt $attempt: $COUNT / ${EXPECTED} workers"
             [ "$COUNT" -ge "${EXPECTED}" ] && break
             sleep 5
           done
-          [ "$COUNT" -ge "${EXPECTED}" ] || { echo "❌ Timeout waiting for workers"; exit 1; }
+
+          [ "$COUNT" -ge "${EXPECTED}" ] || {
+            echo "❌ Timeout waiting for workers"
+            exit 1
+          }
 
           URLS=""
           for f in $FILES; do
             U=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
                  -H "Accept: application/vnd.github+json" \
                  "https://api.github.com/repos/${REPO}/contents/workers/$f" | \
-                jq -r '.content' | base64 -d | jq -r '.url')
+                jq -r '.content' | base64 -d | jq -r '.url' 2>/dev/null)
             [ -n "$U" ] && [ "$U" != "null" ] || continue
             [ -z "$URLS" ] && URLS="$U" || URLS="$URLS,$U"
           done
-          [ -n "$URLS" ] || { echo "❌ No valid URLs"; exit 1; }
+
+          [ -n "$URLS" ] || {
+            echo "❌ No valid worker URLs found"
+            exit 1
+          }
+
           echo "HOLESAIL_URLS=$URLS" >> $GITHUB_ENV
 
-      - name: Open Holesail clients
+      - name: Open Holesail clients to workers
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
@@ -280,58 +273,77 @@ jobs:
           mkdir -p logs
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           BASE=60000
-          RPC_ADDRS=""
+          PEERS=""
           i=0
           for url in "${URLS[@]}"; do
             port=$((BASE + i))
-            echo "Opening Holesail client $url -> 127.0.0.1:$port"
+            echo "🔗 Holesail client $i: $url → 127.0.0.1:$port"
             nohup holesail "$url" --port $port > logs/holesail_$i.log 2>&1 &
-            for t in $(seq 1 40); do
+
+            for t in $(seq 1 50); do
               nc -z 127.0.0.1 $port && break
               sleep 1
             done
-            nc -z 127.0.0.1 $port || { echo "❌ Holesail client $i did not open port $port"; cat logs/holesail_$i.log; exit 1; }
-            [ -z "$RPC_ADDRS" ] && RPC_ADDRS="127.0.0.1:$port" || RPC_ADDRS="$RPC_ADDRS,127.0.0.1:$port"
-            i=$((i + 1))
-          done
-          echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
-          echo "✅ RPC backends: $RPC_ADDRS"
-          sleep 8
 
-      - name: Start llama-server and Cloudflare tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          RPC_ADDRS: ${{ env.RPC_ADDRS }}
-        run: |
-          set -e
-          echo "🧠 Starting llama-server with RPC: ${RPC_ADDRS}"
-          mkdir -p logs
-          nohup ./llama-server \
-            -m model.gguf \
-            --rpc ${RPC_ADDRS} \
-            -c 2048 \
-            --host 0.0.0.0 \
-            --port 8080 \
-            > logs/server.log 2>&1 &
-          SERVER_PID=$!
-
-          for i in $(seq 1 50); do
-            if curl -fs --max-time 3 http://localhost:8080/health >/dev/null 2>&1; then
-              echo "✅ llama-server is healthy"
-              break
-            fi
-            if ! kill -0 $SERVER_PID 2>/dev/null; then
-              echo "❌ llama-server exited before becoming healthy"
-              cat logs/server.log
+            if ! nc -z 127.0.0.1 $port; then
+              echo "❌ Holesail client $i did not open port $port"
+              cat logs/holesail_$i.log
               exit 1
             fi
-            echo "⏳ Waiting for llama-server health... ($i/50)"
-            sleep 3
+
+            [ -z "$PEERS" ] && PEERS="127.0.0.1:$port" || PEERS="$PEERS,127.0.0.1:$port"
+            i=$((i + 1))
           done
 
-          curl -fs --max-time 3 http://localhost:8080/health >/dev/null || {
-            echo "❌ llama-server health check failed"
-            cat logs/server.log
+          echo "EXO_PEERS=$PEERS" >> $GITHUB_ENV
+          echo "✅ Exo worker peers: $PEERS"
+          sleep 8
+
+      - name: Start Exo queen node and Cloudflare tunnel
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          EXO_PEERS: ${{ env.EXO_PEERS }}
+        run: |
+          set -e
+          API_PORT=${EXO_API_PORT}
+          PEER_PORT=$((${EXO_PEER_PORT} + 1000))
+
+          echo "👑 Starting Exo queen node..."
+          echo "   Peers: ${EXO_PEERS}"
+          echo "   API will be on: http://127.0.0.1:${API_PORT}"
+
+          mkdir -p logs
+          # Exo queen: explicit peers so mDNS is not required.
+          nohup exo \
+            --node-id "queen" \
+            --host 0.0.0.0 \
+            --port ${PEER_PORT} \
+            --peers "${EXO_PEERS}" \
+            > logs/exo.log 2>&1 &
+
+          EXO_PID=$!
+          echo "Exo PID: $EXO_PID"
+
+          echo "⏳ Waiting for Exo web API on port ${API_PORT}..."
+          for i in $(seq 1 60); do
+            if curl -fs --max-time 3 "http://127.0.0.1:${API_PORT}/v1/models" >/dev/null 2>&1; then
+              echo "✅ Exo web API is up"
+              break
+            fi
+
+            if ! kill -0 $EXO_PID 2>/dev/null; then
+              echo "❌ Exo queen exited early"
+              cat logs/exo.log
+              exit 1
+            fi
+
+            echo "  ($i/60) Waiting..."
+            sleep 5
+          done
+
+          curl -fs --max-time 3 "http://127.0.0.1:${API_PORT}/v1/models" >/dev/null 2>&1 || {
+            echo "❌ Exo API did not become healthy"
+            cat logs/exo.log
             exit 1
           }
 
@@ -340,7 +352,8 @@ jobs:
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > logs/tunnel.log 2>&1 &
+
+          nohup ./cloudflared tunnel --protocol http2 --url "http://127.0.0.1:${API_PORT}" > logs/tunnel.log 2>&1 &
 
           TUNNEL_URL=""
           for i in $(seq 1 30); do
@@ -357,7 +370,9 @@ jobs:
 
           echo "✅ Tunnel URL: $TUNNEL_URL"
           echo "::notice::Public API: $TUNNEL_URL"
+          echo "::notice::Chat completions: $TUNNEL_URL/v1/chat/completions"
 
+          # Optional: update chat frontend repo config
           CHAT_REPO="${{ github.repository_owner }}/chat"
           CFG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl:$url}')
           ENC=$(echo "$CFG" | base64 -w0)
@@ -373,14 +388,15 @@ jobs:
               "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" -d "$PAYLOAD"
           fi
 
-          while kill -0 $SERVER_PID 2>/dev/null; do
-            if ! curl -fs --max-time 5 http://localhost:8080/health >/dev/null 2>&1; then
-              echo "⚠️ llama-server health check failed"
-              tail -100 logs/server.log
+          # Keep alive with health polling
+          while kill -0 $EXO_PID 2>/dev/null; do
+            if ! curl -fs --max-time 5 "http://127.0.0.1:${API_PORT}/v1/models" >/dev/null 2>&1; then
+              echo "⚠️ Exo API health check failed"
+              tail -80 logs/exo.log
             fi
             sleep 30
           done
 
-          echo "❌ llama-server died"
-          tail -200 logs/server.log
+          echo "❌ Exo queen died"
+          tail -200 logs/exo.log
           exit 1
