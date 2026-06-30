@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   # =====================================================================
-  # QUEEN JOB – Orchestrates everything
+  # QUEEN JOB
   # =====================================================================
   queen:
     runs-on: ubuntu-latest
@@ -28,19 +28,15 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           echo "🧹 Cleaning up old worker files from previous runs..."
-
-          # List all files in the workers/ directory
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
 
-          # If the directory doesn't exist or is empty, skip
           if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
             echo "✅ No workers directory found – nothing to clean."
             exit 0
           fi
 
-          # Delete each file in the workers/ directory
           echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .path' | while read -r file; do
             echo "  Deleting $file"
             SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -50,10 +46,9 @@ jobs:
               -d "{\"message\":\"cleanup worker files\",\"sha\":\"${SHA}\"}" \
               "https://api.github.com/repos/${REPO}/contents/${file}" > /dev/null
           done
-
           echo "✅ Cleanup complete – all old worker files removed."
 
-      # ----- Build llama-cli with RPC support -----
+      # ----- Build llama-cli with RPC -----
       - name: Build llama-cli with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
@@ -65,7 +60,6 @@ jobs:
           cp bin/llama-cli ../../
           cd ../..
           chmod +x llama-cli
-          # Verify RPC support
           if ./llama-cli --help 2>&1 | grep -q rpc; then
             echo "✅ RPC support enabled"
           else
@@ -73,7 +67,7 @@ jobs:
             exit 1
           fi
 
-      # ----- Download the model -----
+      # ----- Download model -----
       - name: Download model (GGUF)
         run: |
           curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
@@ -85,7 +79,6 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           echo "👑 Queen waiting for 5 workers..."
-
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -112,7 +105,7 @@ jobs:
             exit 1
           fi
 
-          # Build RPC connection string
+          # Build RPC address string
           RPC_ADDRS=""
           for file in $WORKER_FILES; do
             curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -138,12 +131,12 @@ jobs:
             -p "What is the meaning of life?" \
             -n 256
 
-      # ----- Keep queen alive (for 24/7 operation) -----
+      # ----- Keep queen alive (optional) -----
       - name: Keep queen alive
         run: sleep infinity
 
   # =====================================================================
-  # WORKER JOBS – 19 instances
+  # WORKER JOBS
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
@@ -178,7 +171,7 @@ jobs:
           cd ../..
           chmod +x ggml-rpc-server
 
-      - name: Start RPC server and register (idempotent)
+      - name: Start RPC server and register (with conflict handling)
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -202,7 +195,7 @@ jobs:
           fi
           echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
 
-          # ----- Idempotent registration -----
+          # ----- Idempotent registration with 409 handling -----
           WORKER_FILE="workers/w${INSTANCE_ID}.json"
           mkdir -p workers
 
@@ -217,8 +210,12 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               -d "{\"message\":\"register worker $INSTANCE_ID\",\"content\":\"${ENCODED}\"}" \
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+
+            # Check for success or 409 conflict
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
               echo "✅ Worker $INSTANCE_ID registered successfully!"
+            elif echo "$RESPONSE" | jq -e '.message' | grep -q "409"; then
+              echo "⚠️ Worker $INSTANCE_ID file already exists (409) – considered registered."
             else
               echo "❌ Failed to register worker $INSTANCE_ID"
               echo "Response: $RESPONSE"
