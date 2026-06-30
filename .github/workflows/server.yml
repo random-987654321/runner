@@ -42,7 +42,7 @@ jobs:
 
       - name: Download model (GGUF)
         run: |
-          curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
+          curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/blob/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf
 
       - name: Wait for workers and collect URLs
         env:
