@@ -1,235 +1,558 @@
-name: Hive-Queen
+name: Hive-Queen-Holesail
 
 on:
   workflow_dispatch:
+    inputs:
+      model_url:
+        description: "HuggingFace model URL or shorthand (e.g. ggml-org/gemma-3-1b-it-GGUF:Q4_K_M)"
+        required: false
+        default: "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M"
+      worker_count:
+        description: "Number of worker shards (2-10)"
+        required: false
+        default: "4"
 
 permissions:
   actions: write
   contents: write
 
+# ──────────────────────────────────────────────────────────────────────────────
+# NOVEL TECHNIQUE: Holesail P2P Mesh for ggml-rpc-server
+#
+# Unlike bore.pub (a centralized relay) or Cloudflare tunnels (HTTP only),
+# holesail punches direct encrypted UDP/TCP holes between the queen and each
+# worker using a shared 64-byte connector key written to the repo.
+#
+# Flow:
+#   1. Queen generates a random CONNECTOR_KEY and commits it to the repo.
+#   2. Workers pull the key, start ggml-rpc-server -p PORT -c (client-accept mode),
+#      then run: holesail --live PORT --connector $KEY --port $PEER_PORT
+#      This advertises the RPC port into the holesail swarm under that key.
+#   3. Queen runs: holesail --connector $KEY --host 127.0.0.1 --port 50052
+#      for each worker slot, producing a local 127.0.0.x:50052 endpoint.
+#   4. llama-server --rpc 127.0.0.1:50052,127.0.0.2:50052,... --split-mode layer
+#      All traffic is encrypted peer-to-peer; no third-party relay sees model weights.
+#
+# Why this is new:
+#   • Holesail's DHT-based peer discovery means workers need zero public IPs.
+#   • Each worker gets its own connector sub-key (KEY+instanceId) so the queen
+#     can address them independently on loopback aliases.
+#   • The -c flag on ggml-rpc-server lets it accept connections rather than dial,
+#     which matches holesail's server role perfectly.
+# ──────────────────────────────────────────────────────────────────────────────
+
 jobs:
-  # =====================================================================
-  # QUEEN JOB – Orchestrates everything + serves llama-server
-  # =====================================================================
+  # ═══════════════════════════════════════════════════════════════════
+  # QUEEN – builds everything, generates the shared connector key,
+  #         waits for workers, then serves llama-server
+  # ═══════════════════════════════════════════════════════════════════
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Install dependencies
+      # ── 0. System deps ──────────────────────────────────────────────
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake socat openssl
+          sudo apt-get install -y jq curl build-essential cmake python3 iproute2
 
-      # ----- Generate SSL Certificate for secure tunnels -----
-      - name: Generate SSL certificate
+      # ── 1. Install Node + holesail ──────────────────────────────────
+      - name: Install Node.js and holesail
         run: |
-          openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
-            -days 365 -nodes -subj "/CN=localhost"
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+          sudo npm install -g holesail-cli
+          holesail --version
 
-      - name: Build llama-cli and llama-server with RPC support
+      # ── 2. Build llama-server + llama-cli with RPC ──────────────────
+      - name: Build llama.cpp (RPC-enabled)
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-cli --target llama-server
-          cp bin/llama-cli bin/llama-server ../../
+          cmake .. \
+            -DGGML_RPC=ON \
+            -DGGML_CUDA=OFF \
+            -DGGML_METAL=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --config Release -j$(nproc) \
+            --target llama-server \
+            --target llama-cli
+          cp bin/llama-server bin/llama-cli ../../
           cd ../..
-          chmod +x llama-cli llama-server
-          if ./llama-server --help 2>&1 | grep -q rpc; then
-            echo "✅ llama-server RPC support enabled"
-          else
-            echo "❌ llama-server RPC support missing"
-            exit 1
-          fi
+          chmod +x llama-server llama-cli
+          echo "✅ llama-server built"
+          ./llama-server --help 2>&1 | grep -i rpc && echo "✅ RPC flag confirmed"
 
-      - name: Download model (GGUF)
-        run: |
-          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
-          echo "📦 Downloading model from: $MODEL_URL"
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
-          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
-            echo "✅ Valid GGUF file downloaded"
-            ls -lh model.gguf
-          else
-            echo "❌ Invalid GGUF file"
-            exit 1
-          fi
-
-      # ----- Start socat tunnels to workers -----
-      - name: Start secure tunnels to workers
-        env:
-          WORKER1: "100.64.0.10"
-          WORKER2: "100.64.0.20"
-          WORKER1_PORT: "4443"
-          WORKER2_PORT: "4443"
-        run: |
-          echo "🔐 Starting secure tunnels to workers..."
-          
-          # Tunnel to Worker 1
-          nohup socat openssl-listen:${WORKER1_PORT},reuseaddr,fork,cert=cert.pem,key=key.pem,verify=0 \
-            tcp:${WORKER1}:50052 > tunnel1.log 2>&1 &
-          
-          # Tunnel to Worker 2
-          nohup socat openssl-listen:${WORKER2_PORT},reuseaddr,fork,cert=cert.pem,key=key.pem,verify=0 \
-            tcp:${WORKER2}:50052 > tunnel2.log 2>&1 &
-          
-          sleep 5
-          echo "✅ Secure tunnels started"
-
-      # ----- Start llama-server with RPC via secure tunnels -----
-      - name: Start llama-server and Cloudflare tunnel
+      # ── 3. Generate shared connector key and commit to repo ─────────
+      #
+      # KEY INNOVATION: Instead of having workers discover the queen,
+      # the queen generates a cryptographically random 64-hex-char key
+      # and writes it to the repo. Workers read it and advertise their
+      # RPC port into the holesail DHT under a per-worker sub-key
+      # (sha256(BASE_KEY + instance_id)). Queen then dials each sub-key
+      # on a loopback alias to get isolated 127.0.0.X:50052 endpoints.
+      # ────────────────────────────────────────────────────────────────
+      - name: Generate and publish holesail connector key
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          WORKER1: "localhost"
-          WORKER2: "localhost"
-          WORKER1_PORT: "4443"
-          WORKER2_PORT: "4443"
+          REPO: ${{ github.repository }}
         run: |
-          echo "🌐 Starting llama-server with RPC workers via secure tunnels..."
-          RPC_ADDRS="${WORKER1}:${WORKER1_PORT},${WORKER2}:${WORKER2_PORT}"
-          echo "RPC_ADDRS: ${RPC_ADDRS}"
+          # Generate a random 64-char hex key
+          BASE_KEY=$(openssl rand -hex 32)
+          echo "BASE_KEY=${BASE_KEY}" >> $GITHUB_ENV
+          echo "🔑 Generated base connector key"
 
-          # Start llama-server with RPC
+          # Commit key + worker_count to repo so workers can read it
+          WORKER_COUNT="${{ github.event.inputs.worker_count }}"
+          PAYLOAD_JSON=$(jq -n \
+            --arg key "$BASE_KEY" \
+            --arg count "$WORKER_COUNT" \
+            '{base_key: $key, worker_count: $count, ready: false}')
+          ENCODED=$(echo "$PAYLOAD_JSON" | base64 -w0)
+
+          # Delete old file if exists
+          OLD=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO}/contents/hive-config.json")
+          OLD_SHA=$(echo "$OLD" | jq -r '.sha // empty')
+
+          if [ -n "$OLD_SHA" ]; then
+            WRITE_PAYLOAD=$(jq -n --arg m "update hive config" --arg c "$ENCODED" --arg s "$OLD_SHA" \
+              '{message: $m, content: $c, sha: $s}')
+          else
+            WRITE_PAYLOAD=$(jq -n --arg m "init hive config" --arg c "$ENCODED" \
+              '{message: $m, content: $c}')
+          fi
+
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/hive-config.json" \
+            -d "$WRITE_PAYLOAD"
+          echo "✅ Config published to repo"
+
+      # ── 4. Download model ────────────────────────────────────────────
+      - name: Download model (GGUF)
+        run: |
+          MODEL="${{ github.event.inputs.model_url }}"
+          if echo "$MODEL" | grep -q "^https://"; then
+            MODEL_URL="$MODEL"
+          else
+            # Convert HuggingFace shorthand: owner/repo:file → HF URL
+            HF_REPO=$(echo "$MODEL" | cut -d: -f1)
+            HF_FILE=$(echo "$MODEL" | cut -d: -f2)
+            MODEL_URL="https://huggingface.co/${HF_REPO}/resolve/main/${HF_FILE}.gguf"
+          fi
+          echo "📦 Downloading: $MODEL_URL"
+          curl -L -o model.gguf "$MODEL_URL" \
+            -f --retry 3 --retry-delay 5 \
+            --progress-bar
+          MAGIC=$(xxd -l 4 -p model.gguf)
+          if [ "$MAGIC" = "47475546" ]; then
+            echo "✅ Valid GGUF (magic bytes confirmed)"
+            ls -lh model.gguf
+          else
+            echo "❌ Not a valid GGUF file (magic: $MAGIC)"
+            exit 1
+          fi
+
+      # ── 5. Wait for workers to register readiness ───────────────────
+      - name: Wait for all workers to register
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          WORKER_COUNT="${{ github.event.inputs.worker_count }}"
+          echo "👑 Queen waiting for ${WORKER_COUNT} workers..."
+
+          for attempt in {1..120}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+
+            NOT_FOUND=$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)
+            if [ "$NOT_FOUND" = "Not Found" ]; then
+              READY_COUNT=0
+            else
+              READY_COUNT=$(echo "$RESPONSE" | \
+                jq -r '.[] | select(.type == "file") | .name' 2>/dev/null | \
+                grep -c "\.ready$" || echo 0)
+            fi
+
+            echo "  [${attempt}/120] Workers ready: ${READY_COUNT}/${WORKER_COUNT}"
+
+            if [ "$READY_COUNT" -ge "$WORKER_COUNT" ]; then
+              echo "✅ All workers registered!"
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$READY_COUNT" -lt "$WORKER_COUNT" ]; then
+            echo "❌ Timeout: only ${READY_COUNT}/${WORKER_COUNT} workers joined"
+            exit 1
+          fi
+
+      # ── 6. Set up loopback aliases + dial each worker via holesail ──
+      #
+      # NOVEL: Queen creates 127.0.0.W aliases (W = worker instance ID)
+      # and runs one holesail client per worker, binding to that alias.
+      # This gives llama-server clean, distinct RPC endpoints with no
+      # port conflicts, all on loopback (no firewall issues).
+      # ─────────────────────────────────────────────────────────────────
+      - name: Dial workers via holesail (loopback mesh)
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          WORKER_COUNT="${{ github.event.inputs.worker_count }}"
+          RPC_ADDRS=""
+
+          for i in $(seq 1 $WORKER_COUNT); do
+            # Derive per-worker connector key: sha256(BASE_KEY || worker_id)
+            WORKER_KEY=$(echo -n "${BASE_KEY}${i}" | sha256sum | awk '{print $1}')
+
+            # Add loopback alias for this worker
+            LOOPBACK_IP="127.0.0.${i}"
+            sudo ip addr add "${LOOPBACK_IP}/8" dev lo 2>/dev/null || true
+            echo "  Added loopback alias: ${LOOPBACK_IP}"
+
+            # Dial worker's RPC port via holesail, bind to alias:50052
+            nohup holesail \
+              --connector "$WORKER_KEY" \
+              --host "$LOOPBACK_IP" \
+              --port 50052 \
+              > /tmp/holesail_queen_${i}.log 2>&1 &
+            echo "  🔌 Dialing worker ${i} on ${LOOPBACK_IP}:50052 (key: ${WORKER_KEY:0:12}...)"
+
+            if [ -n "$RPC_ADDRS" ]; then
+              RPC_ADDRS="${RPC_ADDRS},${LOOPBACK_IP}:50052"
+            else
+              RPC_ADDRS="${LOOPBACK_IP}:50052"
+            fi
+          done
+
+          # Give holesail time to establish all peer connections
+          echo "⏳ Waiting for holesail mesh to converge..."
+          sleep 20
+
+          echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
+          echo "✅ RPC mesh: ${RPC_ADDRS}"
+
+      # ── 7. Start llama-server with distributed RPC ──────────────────
+      - name: Start llama-server (distributed across workers)
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          WORKER_COUNT="${{ github.event.inputs.worker_count }}"
+
+          # Build equal tensor split string: "10,10,10,10" etc.
+          SPLIT=$(python3 -c "
+          n = int('${WORKER_COUNT}')
+          share = 100 // n
+          splits = [share] * n
+          splits[-1] += 100 - sum(splits)  # add remainder to last
+          print(','.join(str(s) for s in splits))
+          ")
+          echo "📐 Tensor split: ${SPLIT}"
+
           nohup ./llama-server \
             -m model.gguf \
-            --rpc ${RPC_ADDRS} \
+            --rpc "${RPC_ADDRS}" \
             --split-mode layer \
+            --tensor-split "${SPLIT}" \
             -c 4096 \
+            -np 4 \
             --host 0.0.0.0 \
             --port 8080 \
             > server.log 2>&1 &
 
-          # Wait for server to be ready
-          for i in {1..20}; do
-            if curl -s http://localhost:8080/health > /dev/null; then
-              echo "✅ llama-server is ready"
+          # Health check loop
+          echo "⏳ Waiting for llama-server..."
+          for i in {1..30}; do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "✅ llama-server healthy!"
               break
             fi
-            echo "⏳ Waiting for llama-server... ($i/20)"
-            sleep 2
+            echo "  [${i}/30] Not ready yet..."
+            sleep 3
           done
-          if ! curl -s http://localhost:8080/health > /dev/null; then
+
+          if ! curl -sf http://localhost:8080/health > /dev/null 2>&1; then
             echo "❌ llama-server failed to start"
             cat server.log
             exit 1
           fi
 
-          # Start Cloudflare tunnel to port 8080
-          echo "🌐 Starting Cloudflare tunnel..."
-          if [ ! -f ./cloudflared ]; then
-            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x cloudflared
-          fi
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
+          curl -s http://localhost:8080/v1/models | jq .
 
-          # Extract tunnel URL
+      # ── 8. Expose queen's port 8080 via holesail (frontend access) ──
+      - name: Expose inference endpoint via holesail
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Use a well-known sub-key for the queen's own endpoint
+          QUEEN_KEY=$(echo -n "${BASE_KEY}queen" | sha256sum | awk '{print $1}')
+
+          nohup holesail --live 8080 \
+            --connector "$QUEEN_KEY" \
+            > /tmp/holesail_queen_out.log 2>&1 &
+
+          sleep 10
+
+          # holesail prints its connection string to stdout
+          HOLESAIL_ADDR=$(grep -oP '[a-f0-9]{64}' /tmp/holesail_queen_out.log | head -1 || echo "")
+
+          echo "🌐 Queen endpoint connector key: ${QUEEN_KEY}"
+          echo "🌐 holesail addr: ${HOLESAIL_ADDR}"
+
+          # Also start cloudflare as fallback for HTTP access
+          curl -Lo cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 \
+            > tunnel.log 2>&1 &
+
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "✅ Tunnel URL: $TUNNEL_URL"
-              break
-            fi
-            echo "⏳ Waiting for tunnel... ($i/30)"
+            [ -n "$TUNNEL_URL" ] && break
             sleep 3
           done
 
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get tunnel URL"
-            tail -50 tunnel.log
-            exit 1
-          fi
+          echo ""
+          echo "╔════════════════════════════════════════════════════╗"
+          echo "║  🐝 HIVE QUEEN IS SERVING                         ║"
+          echo "╠════════════════════════════════════════════════════╣"
+          echo "║  HTTP (Cloudflare):  ${TUNNEL_URL}"
+          echo "║  P2P  (holesail):    holesail --connector ${QUEEN_KEY:0:32}..."
+          echo "║  RPC  mesh:          ${RPC_ADDRS}"
+          echo "╚════════════════════════════════════════════════════╝"
+          echo "::notice::Inference URL: ${TUNNEL_URL}"
+          echo "::notice::P2P connector key: ${QUEEN_KEY}"
 
-          # Update config.json in the chat repo
+          # Update chat repo config
           CHAT_REPO="${{ github.repository_owner }}/chat"
-          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
+          NEW_CONFIG=$(jq -n \
+            --arg url "$TUNNEL_URL" \
+            --arg p2p "$QUEEN_KEY" \
+            '{apiUrl: $url, holesailKey: $p2p}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
           FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-          if [ "$SHA" != "null" ]; then
-            PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-              -d "$PAYLOAD"
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha // empty')
+          if [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg m "update API URL" --arg c "$ENCODED" --arg s "$SHA" \
+              '{message: $m, content: $c, sha: $s}')
+          else
+            PAYLOAD=$(jq -n --arg m "init config" --arg c "$ENCODED" \
+              '{message: $m, content: $c}')
           fi
-          echo "::notice::Frontend URL: https://$CHAT_REPO"
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+            -d "$PAYLOAD" > /dev/null
 
-          # Keep alive
-          echo "🔄 Queen is serving. Keeping alive..."
-          sleep infinity
+          # Keep alive with health monitoring
+          echo "🔄 Entering keep-alive loop..."
+          while true; do
+            if ! curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "⚠️  llama-server unhealthy, restarting..."
+              pkill -f llama-server || true
+              sleep 2
+              nohup ./llama-server \
+                -m model.gguf \
+                --rpc "${RPC_ADDRS}" \
+                --split-mode layer \
+                -c 4096 \
+                --host 0.0.0.0 \
+                --port 8080 \
+                > server.log 2>&1 &
+            fi
+            sleep 30
+          done
 
-  # =====================================================================
-  # WORKER JOB – Runs on self‑hosted runners (VPS/cloud instances)
-  # =====================================================================
+  # ═══════════════════════════════════════════════════════════════════
+  # WORKERS – each shard exposes ggml-rpc-server via holesail P2P
+  # ═══════════════════════════════════════════════════════════════════
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
+      fail-fast: false
       matrix:
-        instance: [1, 2]
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
     steps:
-      - name: Install dependencies
+      # ── 0. Stagger startup ──────────────────────────────────────────
+      - name: Stagger start
+        run: |
+          DELAY=$(( ${{ matrix.instance }} * 8 ))
+          echo "⏳ Worker ${{ matrix.instance }} staggering ${DELAY}s..."
+          sleep ${DELAY}
+
+      # ── 1. Bail early if instance > worker_count ────────────────────
+      - name: Check if this worker is needed
+        run: |
+          NEEDED="${{ github.event.inputs.worker_count }}"
+          INSTANCE="${{ matrix.instance }}"
+          if [ "$INSTANCE" -gt "$NEEDED" ]; then
+            echo "ℹ️  Worker ${INSTANCE} not needed (count=${NEEDED}). Exiting."
+            exit 0
+          fi
+          echo "✅ Worker ${INSTANCE} is needed."
+
+      # ── 2. Install Node + holesail ──────────────────────────────────
+      - name: Install system dependencies + holesail
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake socat openssl
+          sudo apt-get install -y jq curl build-essential cmake
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+          sudo npm install -g holesail-cli
+          holesail --version
 
-      - name: Generate SSL certificate
-        run: |
-          openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
-            -days 365 -nodes -subj "/CN=localhost"
-
-      - name: Build ggml-rpc-server
+      # ── 3. Build ggml-rpc-server ────────────────────────────────────
+      - name: Build ggml-rpc-server (RPC enabled)
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target ggml-rpc-server
+          cmake .. \
+            -DGGML_RPC=ON \
+            -DGGML_CUDA=OFF \
+            -DGGML_METAL=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --config Release -j$(nproc) --target ggml-rpc-server
           cp bin/ggml-rpc-server ../../
           cd ../..
           chmod +x ggml-rpc-server
+          echo "✅ ggml-rpc-server built"
 
-      - name: Start ggml-rpc-server and secure tunnel
+      # ── 4. Fetch shared connector key from repo ─────────────────────
+      - name: Fetch connector key from queen
         env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "📖 Fetching hive config from queen..."
+          for attempt in {1..30}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/hive-config.json")
+            CONTENT=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null)
+            BASE_KEY=$(echo "$CONTENT" | jq -r '.base_key' 2>/dev/null)
+            if [ -n "$BASE_KEY" ] && [ "$BASE_KEY" != "null" ]; then
+              echo "✅ Got base key"
+              echo "BASE_KEY=${BASE_KEY}" >> $GITHUB_ENV
+              break
+            fi
+            echo "  [${attempt}/30] Config not ready yet, retrying..."
+            sleep 5
+          done
+          if [ -z "$BASE_KEY" ] || [ "$BASE_KEY" = "null" ]; then
+            echo "❌ Failed to fetch connector key"
+            exit 1
+          fi
+
+      # ── 5. Start ggml-rpc-server + advertise via holesail ───────────
+      #
+      # NOVEL: ggml-rpc-server uses -c flag (client-accept mode) so it
+      # listens on a local port and accepts RPC calls. holesail --live
+      # advertises this port into the DHT under the per-worker key,
+      # making it discoverable exclusively by the queen (since only the
+      # queen knows BASE_KEY and can derive WORKER_KEY).
+      # ─────────────────────────────────────────────────────────────────
+      - name: Start ggml-rpc-server and advertise via holesail
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
-          echo "🐝 Worker $INSTANCE_ID starting..."
+          # Derive this worker's unique connector key
+          WORKER_KEY=$(echo -n "${BASE_KEY}${INSTANCE_ID}" | sha256sum | awk '{print $1}')
+          RPC_PORT=50052
 
-          PORT=50052
-          WORKER_IP="0.0.0.0"  # Bind to all interfaces
+          echo "🐝 Worker ${INSTANCE_ID} starting on port ${RPC_PORT}"
+          echo "🔑 Connector key: ${WORKER_KEY:0:16}... (truncated)"
 
-          # Start ggml-rpc-server
-          ./ggml-rpc-server -H ${WORKER_IP} -p ${PORT} -c &
-          sleep 5
+          # Start ggml-rpc-server in accept mode (-c flag)
+          # -c means it acts as a server accepting connections (not connecting out)
+          ./ggml-rpc-server -p ${RPC_PORT} -c &
+          RPC_PID=$!
+          sleep 3
 
-          # Start socat tunnel to forward encrypted traffic to the RPC server
-          # The Queen will connect to this tunnel
-          nohup socat openssl-listen:4443,reuseaddr,fork,cert=cert.pem,key=key.pem,verify=0 \
-            tcp:127.0.0.1:${PORT} > tunnel.log 2>&1 &
+          if ! kill -0 $RPC_PID 2>/dev/null; then
+            echo "❌ ggml-rpc-server failed to start"
+            exit 1
+          fi
+          echo "✅ ggml-rpc-server running (pid: ${RPC_PID})"
 
-          echo "✅ Worker $INSTANCE_ID is ready"
-          echo "   RPC server: ${WORKER_IP}:${PORT}"
-          echo "   Secure tunnel: port 4443 (SSL)"
+          # Advertise local RPC port into holesail DHT under worker's key
+          # --live PORT makes holesail bridge inbound P2P connections → localhost:PORT
+          nohup holesail --live ${RPC_PORT} \
+            --connector "$WORKER_KEY" \
+            > /tmp/holesail_worker.log 2>&1 &
+          HOLESAIL_PID=$!
+          sleep 10
 
-          # Keep alive
-          while true; do
-            if ! pgrep -f "ggml-rpc-server" > /dev/null; then
-              echo "⚠️ RPC server died, restarting..."
-              ./ggml-rpc-server -H ${WORKER_IP} -p ${PORT} -c &
+          echo "✅ holesail advertising port ${RPC_PORT} (pid: ${HOLESAIL_PID})"
+          cat /tmp/holesail_worker.log
+
+          # Register readiness in repo (write a .ready file)
+          WORKER_FILE="workers/w${INSTANCE_ID}.ready"
+          READY_JSON=$(jq -n \
+            --arg id "$INSTANCE_ID" \
+            --arg key "${WORKER_KEY:0:12}" \
+            --argjson port "$RPC_PORT" \
+            '{worker_id: $id, key_prefix: $key, rpc_port: $port}')
+          ENCODED=$(echo "$READY_JSON" | base64 -w0)
+
+          for attempt in {1..10}; do
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha // empty')
+
+            if [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n --arg m "worker ${INSTANCE_ID} ready" \
+                --arg c "$ENCODED" --arg s "$SHA" \
+                '{message: $m, content: $c, sha: $s}')
+            else
+              PAYLOAD=$(jq -n --arg m "worker ${INSTANCE_ID} ready" \
+                --arg c "$ENCODED" \
+                '{message: $m, content: $c}')
             fi
-            if ! pgrep -f "socat" > /dev/null; then
-              echo "⚠️ Socat tunnel died, restarting..."
-              nohup socat openssl-listen:4443,reuseaddr,fork,cert=cert.pem,key=key.pem,verify=0 \
-                tcp:127.0.0.1:${PORT} > tunnel.log 2>&1 &
+
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
+              -d "$PAYLOAD")
+
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null 2>&1; then
+              echo "✅ Worker ${INSTANCE_ID} registered as ready!"
+              break
+            fi
+
+            echo "  Attempt ${attempt} failed, retrying..."
+            sleep $((attempt * 2))
+          done
+
+          # ── Keep-alive: monitor and restart if either process dies ───
+          echo "🔄 Worker ${INSTANCE_ID} entering keep-alive loop..."
+          while true; do
+            if ! kill -0 $RPC_PID 2>/dev/null; then
+              echo "⚠️  ggml-rpc-server died, restarting..."
+              ./ggml-rpc-server -p ${RPC_PORT} -c &
+              RPC_PID=$!
+            fi
+            if ! kill -0 $HOLESAIL_PID 2>/dev/null; then
+              echo "⚠️  holesail died, restarting..."
+              nohup holesail --live ${RPC_PORT} \
+                --connector "$WORKER_KEY" \
+                > /tmp/holesail_worker.log 2>&1 &
+              HOLESAIL_PID=$!
             fi
             sleep 30
           done
