@@ -181,7 +181,6 @@ jobs:
           nohup ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
-            --tensor-split 1,1,1,1,1 \
             -c 2048 \
             --host 0.0.0.0 \
             --port 8080 \
