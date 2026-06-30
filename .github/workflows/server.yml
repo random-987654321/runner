@@ -19,36 +19,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake python3
+          sudo apt-get install -y jq curl build-essential cmake socat openssl
 
-      # --- Connect to Tailscale network ---
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          tags: tag:github-actions
-
-      - name: Show Tailscale IP
+      # ----- Generate SSL Certificate for secure tunnels -----
+      - name: Generate SSL certificate
         run: |
-          echo "Queen Tailscale IP: $(tailscale ip -4)"
-
-      - name: Clean and recreate workers directory
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "🧹 Cleaning workers directory..."
-          curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${REPO}/contents/workers" \
-            -d '{"message":"cleanup","sha":""}' 2>/dev/null || true
-          echo "✅ Cleanup done."
-          echo "📁 Creating fresh workers directory..."
-          echo "" | base64 -w0 > empty_keep
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-            -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
-          echo "✅ workers directory ready."
+          openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
+            -days 365 -nodes -subj "/CN=localhost"
 
       - name: Build llama-cli and llama-server with RPC support
         run: |
@@ -81,83 +58,52 @@ jobs:
             exit 1
           fi
 
-      - name: Wait for workers and collect Tailscale IPs
+      # ----- Start socat tunnels to workers -----
+      - name: Start secure tunnels to workers
         env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
+          WORKER1: "100.64.0.10"
+          WORKER2: "100.64.0.20"
+          WORKER1_PORT: "4443"
+          WORKER2_PORT: "4443"
         run: |
-          echo "👑 Queen waiting for 10 workers..."
-          for attempt in {1..60}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
-              WORKER_COUNT=0
-            else
-              WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
-              WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
-            fi
-            echo "  Attempt $attempt: $WORKER_COUNT workers registered"
-            if [ "$WORKER_COUNT" -ge 10 ]; then
-              echo "✅ All workers registered!"
-              break
-            fi
-            sleep 5
-          done
-          if [ "$WORKER_COUNT" -lt 10 ]; then
-            echo "❌ Timeout waiting for workers"
-            exit 1
-          fi
-          RPC_ADDRS=""
-          for file in $WORKER_FILES; do
-            curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
-              > /tmp/worker.json
-            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
-            # URL is now "100.64.0.x:65431"
-            if [ -n "$RPC_ADDRS" ]; then
-              RPC_ADDRS="${RPC_ADDRS},${URL}"
-            else
-              RPC_ADDRS="${URL}"
-            fi
-          done
-          echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
-          echo "RPC_ADDRS=${RPC_ADDRS}"
+          echo "🔐 Starting secure tunnels to workers..."
+          
+          # Tunnel to Worker 1
+          nohup socat openssl-listen:${WORKER1_PORT},reuseaddr,fork,cert=cert.pem,key=key.pem,verify=0 \
+            tcp:${WORKER1}:50052 > tunnel1.log 2>&1 &
+          
+          # Tunnel to Worker 2
+          nohup socat openssl-listen:${WORKER2_PORT},reuseaddr,fork,cert=cert.pem,key=key.pem,verify=0 \
+            tcp:${WORKER2}:50052 > tunnel2.log 2>&1 &
+          
+          sleep 5
+          echo "✅ Secure tunnels started"
 
-      # --- Debug: Test llama-server with RPC ---
-      - name: Debug llama-server
-        run: |
-          echo "🧪 Testing llama-server with Tailscale RPC workers..."
-          echo "RPC_ADDRS: ${RPC_ADDRS}"
-          timeout 10 ./llama-server \
-            -m model.gguf \
-            --rpc ${RPC_ADDRS} \
-            --tensor-split 10 \
-            -c 4096 \
-            --host 0.0.0.0 \
-            --port 8080 \
-            2>&1 | head -50 || true
-          echo "=== Debug test finished ==="
-
-      # --- Start llama-server and Cloudflare tunnel ---
+      # ----- Start llama-server with RPC via secure tunnels -----
       - name: Start llama-server and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
-          RPC_ADDRS: ${{ env.RPC_ADDRS }}
+          WORKER1: "localhost"
+          WORKER2: "localhost"
+          WORKER1_PORT: "4443"
+          WORKER2_PORT: "4443"
         run: |
-          echo "🌐 Starting llama-server with Tailscale RPC workers..."
+          echo "🌐 Starting llama-server with RPC workers via secure tunnels..."
+          RPC_ADDRS="${WORKER1}:${WORKER1_PORT},${WORKER2}:${WORKER2_PORT}"
           echo "RPC_ADDRS: ${RPC_ADDRS}"
 
+          # Start llama-server with RPC
           nohup ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
-            --tensor-split 10 \
+            --split-mode layer \
             -c 4096 \
             --host 0.0.0.0 \
             --port 8080 \
             > server.log 2>&1 &
 
+          # Wait for server to be ready
           for i in {1..20}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
@@ -172,11 +118,15 @@ jobs:
             exit 1
           fi
 
-          # Cloudflare tunnel (port 8080)
-          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
+          # Start Cloudflare tunnel to port 8080
+          echo "🌐 Starting Cloudflare tunnel..."
+          if [ ! -f ./cloudflared ]; then
+            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x cloudflared
+          fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
 
+          # Extract tunnel URL
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -193,7 +143,7 @@ jobs:
             exit 1
           fi
 
-          # Update config.json
+          # Update config.json in the chat repo
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -211,40 +161,30 @@ jobs:
           fi
           echo "::notice::Frontend URL: https://$CHAT_REPO"
 
+          # Keep alive
+          echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
   # =====================================================================
-  # WORKER JOBS – 10 instances with Tailscale
+  # WORKER JOB – Runs on self‑hosted runners (VPS/cloud instances)
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        instance: [1, 2]
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake
+          sudo apt-get install -y jq curl build-essential cmake socat openssl
 
-      - name: Stagger start (10s * instance)
+      - name: Generate SSL certificate
         run: |
-          DELAY=$(( ${{ matrix.instance }} * 10 ))
-          echo "⏳ Worker ${{ matrix.instance }} waiting ${DELAY}s before starting..."
-          sleep ${DELAY}
-
-      # --- Connect to Tailscale ---
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          tags: tag:github-actions
-
-      - name: Show Tailscale IP
-        run: |
-          echo "Worker ${{ matrix.instance }} Tailscale IP: $(tailscale ip -4)"
+          openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
+            -days 365 -nodes -subj "/CN=localhost"
 
       - name: Build ggml-rpc-server
         run: |
@@ -258,82 +198,38 @@ jobs:
           cd ../..
           chmod +x ggml-rpc-server
 
-      - name: Start RPC server and register with Tailscale IP
+      - name: Start ggml-rpc-server and secure tunnel
         env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
-          PORT=$((65430 + INSTANCE_ID))
 
-          # Get Tailscale IP
-          TAILSCALE_IP=$(tailscale ip -4)
-          echo "Worker $INSTANCE_ID Tailscale IP: ${TAILSCALE_IP}"
+          PORT=50052
+          WORKER_IP="0.0.0.0"  # Bind to all interfaces
 
           # Start ggml-rpc-server
-          ./ggml-rpc-server -p ${PORT} &
+          ./ggml-rpc-server -H ${WORKER_IP} -p ${PORT} -c &
           sleep 5
 
-          # Register with Tailscale IP and port
-          WORKER_FILE="workers/w${INSTANCE_ID}.json"
-          mkdir -p workers
-          echo "{\"url\": \"${TAILSCALE_IP}:${PORT}\"}" > ${WORKER_FILE}
-          ENCODED=$(base64 -w0 ${WORKER_FILE})
+          # Start socat tunnel to forward encrypted traffic to the RPC server
+          # The Queen will connect to this tunnel
+          nohup socat openssl-listen:4443,reuseaddr,fork,cert=cert.pem,key=key.pem,verify=0 \
+            tcp:127.0.0.1:${PORT} > tunnel.log 2>&1 &
 
-          for attempt in {1..10}; do
-            echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
+          echo "✅ Worker $INSTANCE_ID is ready"
+          echo "   RPC server: ${WORKER_IP}:${PORT}"
+          echo "   Secure tunnel: port 4443 (SSL)"
 
-            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
-            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-
-            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-              PAYLOAD=$(jq -n \
-                --arg msg "register worker $INSTANCE_ID" \
-                --arg content "$ENCODED" \
-                --arg sha "$SHA" \
-                '{message: $msg, content: $content, sha: $sha}')
-            else
-              PAYLOAD=$(jq -n \
-                --arg msg "register worker $INSTANCE_ID" \
-                --arg content "$ENCODED" \
-                '{message: $msg, content: $content}')
-            fi
-
-            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
-              -d "$PAYLOAD")
-
-            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker $INSTANCE_ID registered successfully!"
-              break
-            fi
-
-            STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
-            if [ "$STATUS" = "409" ]; then
-              echo "⚠️ Conflict detected (409) – retrying in 3 seconds..."
-              sleep 3
-              continue
-            fi
-
-            echo "❌ Failed to register worker $INSTANCE_ID"
-            echo "Response: $RESPONSE"
-            exit 1
-          done
-
-          if [ "$attempt" -ge 10 ]; then
-            echo "❌ Worker $INSTANCE_ID failed after 10 attempts"
-            exit 1
-          fi
-
-          # Keep alive – no bore needed
+          # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
-              ./ggml-rpc-server -p ${PORT} &
+              ./ggml-rpc-server -H ${WORKER_IP} -p ${PORT} -c &
+            fi
+            if ! pgrep -f "socat" > /dev/null; then
+              echo "⚠️ Socat tunnel died, restarting..."
+              nohup socat openssl-listen:4443,reuseaddr,fork,cert=cert.pem,key=key.pem,verify=0 \
+                tcp:127.0.0.1:${PORT} > tunnel.log 2>&1 &
             fi
             sleep 30
           done
