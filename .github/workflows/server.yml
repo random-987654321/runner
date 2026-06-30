@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   # =====================================================================
-  # QUEEN JOB – Orchestrates everything + serves Ollama API
+  # QUEEN JOB – Orchestrates everything + serves API
   # =====================================================================
   queen:
     runs-on: ubuntu-latest
@@ -112,7 +112,7 @@ jobs:
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
           echo "RPC_ADDRS=${RPC_ADDRS}"
 
-      - name: Start Ollama‑compatible API server and Cloudflare tunnel
+      - name: Start API server and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -244,7 +244,7 @@ jobs:
           sleep infinity
 
   # =====================================================================
-  # WORKER JOBS – 10 instances with staggered start + SHA handling
+  # WORKER JOBS – 10 instances with staggered start + retry on conflict
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
@@ -285,7 +285,7 @@ jobs:
           cd ../..
           chmod +x ggml-rpc-server
 
-      - name: Start RPC server and register (with SHA handling)
+      - name: Start RPC server and register (with retry on 409)
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -314,37 +314,62 @@ jobs:
           echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
 
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+          # ---------- Retry loop (handle 409 conflict) ----------
+          for attempt in {1..10}; do
+            echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
 
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n \
-              --arg msg "register worker $INSTANCE_ID" \
-              --arg content "$ENCODED" \
-              --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-          else
-            PAYLOAD=$(jq -n \
-              --arg msg "register worker $INSTANCE_ID" \
-              --arg content "$ENCODED" \
-              '{message: $msg, content: $content}')
-          fi
+            # Get current file info (if it exists)
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
 
-          RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
-            -d "$PAYLOAD")
+            # Build payload
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
+                --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
+                '{message: $msg, content: $content}')
+            fi
 
-          if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-            echo "✅ Worker $INSTANCE_ID registered successfully!"
-          else
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
+              -d "$PAYLOAD")
+
+            # Check for success
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+              echo "✅ Worker $INSTANCE_ID registered successfully!"
+              break
+            fi
+
+            # Check for 409 conflict
+            STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
+            if [ "$STATUS" = "409" ]; then
+              echo "⚠️ Conflict detected (409) – retrying in 3 seconds..."
+              sleep 3
+              continue
+            fi
+
+            # Other errors – fail immediately
             echo "❌ Failed to register worker $INSTANCE_ID"
             echo "Response: $RESPONSE"
             exit 1
+          done
+
+          # If we exhausted retries
+          if [ "$attempt" -ge 10 ]; then
+            echo "❌ Worker $INSTANCE_ID failed to register after 10 attempts"
+            exit 1
           fi
 
+          # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
