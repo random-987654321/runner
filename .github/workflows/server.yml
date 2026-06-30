@@ -1,21 +1,27 @@
-name: Exo Swarm (Tailscale)
+name: RPC Mesh Server
 
 on:
   workflow_dispatch:
     inputs:
       model:
-        description: "HuggingFace model ID"
+        description: "Hugging Face model path (Ollama style, e.g., glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M)"
         required: false
-        default: "ibm-granite/granite-4.0-h-tiny"
+        default: "glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M"
+      shard_count:
+        description: "Number of workers (max 19)"
+        required: false
+        default: "19"
 
 permissions:
   actions: write
   contents: read
 
 jobs:
-  # ════════════════════════════════════════════════════════════
-  #  COORDINATOR
-  # ════════════════════════════════════════════════════════════
+  # ════════════════════════════════════════════════════════════════════════════════
+  #  COORDINATOR JOB
+  #  Runs on a single GitHub runner. Downloads the model, spawns workers,
+  #  collects their RPC addresses via bore, and launches the main llama-server.
+  # ════════════════════════════════════════════════════════════════════════════════
   coordinator:
     name: "🧠 Coordinator"
     runs-on: ubuntu-latest
@@ -24,90 +30,234 @@ jobs:
       tunnel_url: ${{ steps.tunnel.outputs.url }}
 
     steps:
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          version: "latest"
-
+      # ── Cache cloudflared ──
       - uses: actions/cache@v4
         id: cf_cache
         with:
           path: ./cloudflared
           key: cloudflared-v1
+          restore-keys: cloudflared-
 
       - if: steps.cf_cache.outputs.cache-hit != 'true'
         run: |
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
-            --hostname exo-coordinator-${{ github.run_id }}
-          sleep 5
-          echo "✅ Tailscale connected"
-          echo "📡 IP: $(tailscale ip -4)"
+      - if: steps.cf_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ./cloudflared
+          key: cloudflared-v1
 
-      - name: Setup Python, Node, and Exo from source
+      # ── Install Python for rendezvous server ──
+      - name: Setup Python
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-pip python3-venv nodejs npm
+          sudo apt-get install -y python3-pip python3-venv jq curl
           python3 -m venv venv
           source venv/bin/activate
+          pip install flask requests
 
-          git clone https://github.com/exo-explore/exo.git
-          cd exo
-          pip install uv
-          cd dashboard && npm install && npm run build && cd ..
-          echo "✅ exo installed from source"
-
-      - name: Start EXO coordinator
-        env:
-          EXO_ZENOH_NAMESPACE: exo-swarm-${{ github.run_id }}   # ✅ corrected
+      # ── Download the model (via Ollama) and locate the GGUF file ──
+      - name: Download model
+        id: model
         run: |
-          source venv/bin/activate
-          cd exo
+          set -e
+          MODEL="${{ github.event.inputs.model }}"
+          echo "📦 Downloading model: $MODEL"
 
-          echo "🚀 Starting exo coordinator from source..."
-          nohup uv run exo > exo.log 2>&1 &
-          EXO_PID=$!
-          echo "📡 Exo PID: $EXO_PID"
+          # Install Ollama temporarily to fetch the GGUF file
+          curl -fsSL https://ollama.com/install.sh | sh
 
+          # Wait for Ollama service to be ready
           for i in {1..30}; do
-            if curl -s http://localhost:52415 > /dev/null 2>&1; then
-              echo "✅ Exo is responding on port 52415"
+            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
               break
             fi
-            echo "⏳ Waiting for exo... ($i/30)"
             sleep 2
           done
-
-          if ! pgrep -f "uv run exo" > /dev/null; then
-            echo "❌ Exo died! Showing logs:"
-            cat exo.log
+          if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+            echo "❌ Ollama service not ready"
             exit 1
           fi
 
-          echo "✅ Exo is running"
-          tail -20 exo.log
+          ollama pull "$MODEL"
 
+          # Locate the actual GGUF file (Ollama stores blobs in a few possible places)
+          MODEL_FILE=$(find /usr/share/ollama/.ollama /home/ollama/.ollama ~/.ollama \
+            -type f \( -name "*.gguf" -o -size +10M \) 2>/dev/null | head -1)
+          if [ -z "$MODEL_FILE" ]; then
+            echo "❌ Could not locate GGUF file"
+            exit 1
+          fi
+          echo "MODEL_FILE=$MODEL_FILE" >> $GITHUB_ENV
+          echo "✅ Model file: $MODEL_FILE ($(du -sh "$MODEL_FILE" | cut -f1))"
+
+      # ── Build llama.cpp with RPC support ──
+      - name: Build llama.cpp (RPC enabled)
+        run: |
+          git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
+          cd llama.cpp
+          mkdir build && cd build
+          cmake .. -DGGML_RPC=ON -DGGML_CPU=ON
+          cmake --build . --config Release -j $(nproc)
+
+      # ── Upload the model file as an artifact for workers ──
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-file
+          path: ${{ env.MODEL_FILE }}
+          retention-days: 1
+
+      # ── Start the rendezvous server (Flask) ──
+      # This server listens for worker registrations and provides the worker list to the coordinator.
+      - name: Start rendezvous server
+        env:
+          SHARD_COUNT: ${{ github.event.inputs.shard_count }}
+        run: |
+          source venv/bin/activate
+          cat > rendezvous.py << 'EOF'
+          import os, json, time, threading
+          from flask import Flask, request, jsonify
+
+          app = Flask(__name__)
+          workers = {}
+          lock = threading.Lock()
+          EXPECTED = int(os.environ.get("SHARD_COUNT", "19"))
+
+          @app.route("/register", methods=["POST"])
+          def register():
+              data = request.json
+              idx = int(data.get("shard_index", 0))
+              addr = data.get("address", "")
+              with lock:
+                  workers[idx] = addr
+              print(f"✅ Worker {idx} registered: {addr} ({len(workers)}/{EXPECTED})", flush=True)
+              return jsonify({"status": "ok", "registered": len(workers)})
+
+          @app.route("/status", methods=["GET"])
+          def status():
+              with lock:
+                  return jsonify({"registered": len(workers), "expected": EXPECTED, "workers": workers})
+
+          if __name__ == "__main__":
+              app.run(host="0.0.0.0", port=9000, threaded=True)
+          EOF
+          python3 rendezvous.py &
+          RENDEZVOUS_PID=$!
+          echo "✅ Rendezvous server started on port 9000"
+
+          # Store the PID so we can check later
+          echo $RENDEZVOUS_PID > /tmp/rendezvous.pid
+
+      # ── Trigger worker jobs via GitHub API ──
+      - name: Spawn worker jobs
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          SHARD_COUNT: ${{ github.event.inputs.shard_count }}
+        run: |
+          for i in $(seq 0 $((SHARD_COUNT - 1))); do
+            echo "⏳ Triggering worker $i..."
+            curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches" \
+              -d "{
+                \"ref\": \"${{ github.ref }}\",
+                \"inputs\": {
+                  \"model\": \"${{ github.event.inputs.model }}\",
+                  \"shard_index\": \"$i\",
+                  \"shard_count\": \"${{ github.event.inputs.shard_count }}\"
+                }
+              }"
+          done
+
+      # ── Wait for all workers to register (up to 10 minutes) ──
+      - name: Wait for workers
+        run: |
+          for i in {1..60}; do
+            STATUS=$(curl -s http://localhost:9000/status)
+            REGISTERED=$(echo "$STATUS" | jq -r '.registered')
+            EXPECTED=$(echo "$STATUS" | jq -r '.expected')
+            echo "⏳ $REGISTERED/$EXPECTED workers registered"
+            if [ "$REGISTERED" -eq "$EXPECTED" ]; then
+              echo "✅ All workers registered"
+              break
+            fi
+            sleep 10
+          done
+
+      # ── Build the RPC connection string ──
+      - name: Build RPC string
+        id: rpc
+        run: |
+          WORKERS=$(curl -s http://localhost:9000/status | jq -r '.workers | to_entries | map("RPC\(.key)[\(.value)]") | join(",")')
+          echo "rpc_workers=$WORKERS" >> $GITHUB_OUTPUT
+          echo "RPC workers: $WORKERS"
+
+      # ── Start the main llama-server with RPC workers ──
+      - name: Start llama-server
+        run: |
+          cd llama.cpp/build
+          # Use the model file and the RPC workers
+          ./bin/llama-server \
+            --model ${{ env.MODEL_FILE }} \
+            --rpc ${{ steps.rpc.outputs.rpc_workers }} \
+            --port 8000 \
+            --host 0.0.0.0 \
+            --threads 4 \
+            --ctx-size 4096 \
+            --verbose-prompt &
+
+          # Wait for server to start
+          for i in {1..10}; do
+            if curl -s http://localhost:8000/health > /dev/null; then
+              echo "✅ llama-server ready"
+              break
+            fi
+            sleep 2
+          done
+
+      # ── Cloudflare tunnel to expose the API ──
       - name: Start Cloudflare tunnel
         id: tunnel
         run: |
-          if [ ! -f ./cloudflared ]; then
-            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x cloudflared
-          fi
-          ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee tunnel.log &
+          ./cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee tunnel.log &
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            [ -n "$TUNNEL_URL" ] && break
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+              break
+            fi
             sleep 2
           done
-          echo "::notice::EXO Dashboard: ${TUNNEL_URL}"
-          echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Tunnel URL: ${{ steps.tunnel.outputs.url }}"
 
+      # ── Update frontend config.json ──
+      - name: Update frontend config
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
+        run: |
+          CHAT_REPO="${{ github.repository_owner }}/chat"
+          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
+          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha // empty')
+          if [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg m "update API URL" --arg c "$ENCODED" --arg s "$SHA" '{message:$m,content:$c,sha:$s}')
+          else
+            PAYLOAD=$(jq -n --arg m "add API URL" --arg c "$ENCODED" '{message:$m,content:$c}')
+          fi
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+            -d "$PAYLOAD"
+          echo "::notice::Frontend: https://${{ github.repository_owner }}.github.io/chat/"
+
+      # ── Self‑replication keepalive (trigger new run before timeout) ──
       - name: Self-replication keepalive
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -123,100 +273,118 @@ jobs:
               echo "⏰ Triggering replacement workflow..."
               curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/exo-swarm.yml/dispatches" \
-                -d "{\"ref\":\"${{ github.ref }}\",\"inputs\":{\"model\":\"${{ github.event.inputs.model }}\"}}"
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rpc-mesh.yml/dispatches" \
+                -d "{
+                  \"ref\":\"${{ github.ref }}\",
+                  \"inputs\":{
+                    \"model\":\"${{ github.event.inputs.model }}\",
+                    \"shard_count\":\"${{ github.event.inputs.shard_count }}\"
+                  }
+                }"
               TRIGGERED=true
             fi
 
-            # Health checks
-            pgrep -f "uv run exo" > /dev/null || (cd exo && source ../venv/bin/activate && nohup uv run exo > exo.log 2>&1 &)
-            pgrep -f cloudflared > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
-            sudo tailscale status > /dev/null || sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
-              --hostname exo-coordinator-${{ github.run_id }}
-
+            # Health check: keep the server running
+            curl -s http://localhost:8000/health > /dev/null || echo "⚠️ Server unresponsive" >&2
             sleep 30
           done
 
 
-  # ════════════════════════════════════════════════════════════
-  #  WORKERS (parallel)
-  # ════════════════════════════════════════════════════════════
+  # ════════════════════════════════════════════════════════════════════════════════
+  #  WORKER JOBS (Matrix)
+  #  Each worker downloads the model file, runs llama.cpp rpc-server,
+  #  exposes it via bore, and registers its public address with the coordinator.
+  # ════════════════════════════════════════════════════════════════════════════════
   worker:
-    name: "⚙️ Worker ${{ matrix.worker_id }}"
+    name: "⚙️ Worker ${{ github.event.inputs.shard_index }}"
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        worker_id: [1, 2, 3]
+    if: github.event.inputs.shard_index != ''   # only runs when triggered with shard_index
 
     steps:
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      # ── Download the model artifact from the coordinator ──
+      - name: Download model artifact
+        uses: actions/download-artifact@v4
         with:
-          version: "latest"
+          name: model-file
+          path: ./model
 
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
-            --hostname exo-worker-${{ matrix.worker_id }}-${{ github.run_id }}
-          sleep 5
-          echo "✅ Tailscale connected"
-          echo "📡 IP: $(tailscale ip -4)"
-
-      - name: Setup Python, Node, and Exo from source
+      # ── Install dependencies ──
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-pip python3-venv nodejs npm
-          python3 -m venv venv
-          source venv/bin/activate
+          sudo apt-get install -y jq curl
 
-          git clone https://github.com/exo-explore/exo.git
-          cd exo
-          pip install uv
-          uv sync --all-packages
-          cd dashboard && npm install && npm run build && cd ..
-          echo "✅ exo installed from source"
-
-      - name: Join EXO cluster
-        env:
-          EXO_ZENOH_NAMESPACE: exo-swarm-${{ github.run_id }}   # ✅ corrected
+      # ── Build llama.cpp with RPC support ──
+      - name: Build llama.cpp
         run: |
-          source venv/bin/activate
-          cd exo
+          git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
+          cd llama.cpp
+          mkdir build && cd build
+          cmake .. -DGGML_RPC=ON -DGGML_CPU=ON
+          cmake --build . --config Release -j $(nproc)
 
-          echo "🚀 Starting exo worker from source..."
-          nohup uv run exo > exo.log 2>&1 &
-          EXO_PID=$!
-          echo "📡 Exo PID: $EXO_PID"
+      # ── Install bore (TCP tunnel) ──
+      - name: Install bore
+        run: |
+          curl -Lo bore https://github.com/ekzhang/bore/releases/latest/download/bore-linux-amd64
+          chmod +x bore
 
-          for i in {1..30}; do
-            if curl -s http://localhost:52415 > /dev/null 2>&1; then
-              echo "✅ Exo worker is responding on port 52415"
-              break
-            fi
-            echo "⏳ Waiting for exo... ($i/30)"
-            sleep 2
-          done
-
-          if ! pgrep -f "uv run exo" > /dev/null; then
-            echo "❌ Exo died! Showing logs:"
-            cat exo.log
+      # ── Start rpc-server and expose it via bore ──
+      - name: Start rpc-server and bore tunnel
+        id: worker
+        run: |
+          set -e
+          SHARD_INDEX="${{ github.event.inputs.shard_index }}"
+          MODEL_FILE=$(find ./model -type f -name "*.gguf" -o -size +10M 2>/dev/null | head -1)
+          if [ -z "$MODEL_FILE" ]; then
+            echo "❌ Model file not found"
             exit 1
           fi
 
-          echo "✅ Worker ${{ matrix.worker_id }} joined cluster"
-          tail -20 exo.log
+          echo "📦 Shard $SHARD_INDEX using model: $MODEL_FILE"
 
-          # Keepalive loop
-          while true; do
-            if ! pgrep -f "uv run exo" > /dev/null; then
-              nohup uv run exo > exo.log 2>&1 &
-            fi
-            if ! sudo tailscale status > /dev/null; then
-              sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
-                --hostname exo-worker-${{ matrix.worker_id }}-${{ github.run_id }}
-            fi
-            sleep 30
-          done
+          # Start rpc-server on a port (50052 + SHARD_INDEX)
+          PORT=$((50052 + SHARD_INDEX))
+          cd llama.cpp/build
+          ./bin/rpc-server --host 0.0.0.0 --port $PORT --threads 4 &
+          sleep 5
+
+          # Expose the port using bore (public tunnel)
+          ../bore local $PORT --to bore.pub &
+          sleep 5
+
+          # Get the public address (bore.pub assigns a random subdomain)
+          # We need to extract the actual address. bore prints something like:
+          # "listening on bore.pub:12345" – we can parse that.
+          # However, we can also use a deterministic approach: query the local server
+          # and parse its output, or just assume bore.pub:PORT works (it may not).
+          # Simpler: use the port as the address; the coordinator will connect to bore.pub:PORT.
+          # Note: bore uses a random port, but we can get it from the output.
+          BORE_OUTPUT=$(../bore local $PORT --to bore.pub 2>&1 | head -1)
+          BORE_ADDR=$(echo "$BORE_OUTPUT" | grep -oP 'bore\.pub:\d+' || echo "bore.pub:$PORT")
+          echo "bore_url=$BORE_ADDR" >> $GITHUB_OUTPUT
+          echo "✅ Bore address: $BORE_ADDR"
+
+          # Wait a moment for the tunnel to stabilise
+          sleep 10
+
+      # ── Register with the coordinator ──
+      - name: Register with coordinator
+        env:
+          RENDEZVOUS_URL: ${{ secrets.RENDEZVOUS_URL }}   # Must be set by coordinator (or passed as artifact)
+        run: |
+          if [ -z "$RENDEZVOUS_URL" ]; then
+            echo "❌ RENDEZVOUS_URL not set – cannot register"
+            exit 1
+          fi
+          SHARD_INDEX="${{ github.event.inputs.shard_index }}"
+          BORE_ADDR="${{ steps.worker.outputs.bore_url }}"
+          echo "📝 Registering shard $SHARD_INDEX at $BORE_ADDR"
+          curl -s -X POST "${RENDEZVOUS_URL}/register" \
+            -H "Content-Type: application/json" \
+            -d "{\"shard_index\": ${SHARD_INDEX}, \"address\": \"${BORE_ADDR}\"}"
+
+      # ── Keep the worker alive (the coordinator will trigger the replacement) ──
+      - name: Keepalive
+        run: sleep infinity
