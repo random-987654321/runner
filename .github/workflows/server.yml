@@ -9,18 +9,18 @@ permissions:
 
 jobs:
   # =====================================================================
-  # QUEEN JOB
+  # QUEEN JOB – Orchestrates everything
   # =====================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
+  
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake
-
+  
       - name: Build llama-cli with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
@@ -32,13 +32,14 @@ jobs:
           cp bin/llama-cli ../../
           cd ../..
           chmod +x llama-cli
+          # Verify RPC support
           if ./llama-cli --help 2>&1 | grep -q rpc; then
             echo "✅ RPC support enabled"
           else
             echo "❌ RPC support missing"
             exit 1
           fi
-
+  
       - name: Download model (GGUF)
         run: |
           MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
@@ -51,7 +52,7 @@ jobs:
             echo "❌ Invalid GGUF file – first 4 bytes: $(head -c 4 model.gguf)"
             exit 1
           fi
-
+  
       - name: Wait for workers and collect URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -92,7 +93,7 @@ jobs:
             fi
           done
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
-
+  
       - name: Run distributed inference
         run: |
           echo "🧠 Distributed inference with workers: ${RPC_ADDRS}"
@@ -101,19 +102,19 @@ jobs:
             --tensor-split 5 \
             -p "What is the meaning of life?" \
             -n 256
-
+  
       - name: Keep queen alive
         run: sleep infinity
 
   # =====================================================================
-  # WORKER JOBS
+  # WORKER JOBS – 19 instances
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5]
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
       - name: Install dependencies
@@ -151,12 +152,15 @@ jobs:
 
           PORT=$((65430 + INSTANCE_ID))
 
+          # Start RPC server
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
+          # Create bore tunnel
           bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
           sleep 5
 
+          # Extract bore URL
           BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
           if [ -z "$BORE_URL" ]; then
             echo "❌ Failed to get bore URL"
@@ -165,7 +169,7 @@ jobs:
           fi
           echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
 
-          # Direct write – each worker writes its own file
+          # Write to workers/w<id>.json
           WORKER_FILE="workers/w${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
