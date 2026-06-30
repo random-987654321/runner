@@ -9,13 +9,70 @@ permissions:
 
 jobs:
   # =====================================================================
-  # QUEEN JOB – Orchestrates everything + serves llama-server
+  # QUEEN JOB
   # =====================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
+      # ========== STEP 1: CLEAN WORKERS DIRECTORY ==========
+      - name: Clean workers directory (delete all files)
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🧹 STEP 1: Cleaning workers directory..."
+
+          # List all files in workers/
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+
+          # Delete each file individually
+          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
+            if [ -n "$name" ] && [ -n "$sha" ]; then
+              echo "  Deleting: workers/$name"
+              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
+                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
+            fi
+          done
+          echo "✅ Cleanup done."
+
+      # ========== STEP 2: CREATE WORKERS DIRECTORY ==========
+      - name: Create workers directory
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "📁 STEP 2: Creating fresh workers directory..."
+
+          # Check if .keep already exists
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers/.keep" 2>/dev/null)
+          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
+
+          echo "" | base64 -w0 > empty_keep
+
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            # Update existing file
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\",\"sha\":\"${SHA}\"}" || true
+          else
+            # Create new file
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
+          fi
+          echo "✅ workers directory ready."
+          
+      # ---------- INSTALL DEPENDENCIES (BEFORE CLEANUP) ----------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
@@ -24,25 +81,7 @@ jobs:
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
-      # ---------- CLEAN WORKERS DIRECTORY ----------
-      - name: Clean and recreate workers directory
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "🧹 Cleaning workers directory..."
-          curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${REPO}/contents/workers" \
-            -d '{"message":"cleanup","sha":""}' 2>/dev/null || true
-          echo "✅ Cleanup done."
-          echo "📁 Creating fresh workers directory..."
-          echo "" | base64 -w0 > empty_keep
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-            -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
-          echo "✅ workers directory ready."
-
+      # ---------- BUILD LLAMA-SERVER ----------
       - name: Build llama-server with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
@@ -61,6 +100,7 @@ jobs:
             exit 1
           fi
 
+      # ---------- DOWNLOAD MODEL ----------
       - name: Download model (GGUF)
         run: |
           MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
@@ -78,7 +118,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "👑 Queen waiting for 5 workers (using Holesail keys)..."
+          echo "👑 Queen waiting for 5 workers..."
 
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -116,8 +156,6 @@ jobs:
               else
                 HOLESAIL_KEYS="${KEY}"
               fi
-            else
-              echo "⚠️ Skipping empty key for file: $file"
             fi
           done
 
@@ -142,18 +180,16 @@ jobs:
             PORT=$((PORT+1))
           done
 
-          # Wait for connections to establish
           sleep 15
           echo "✅ Holesail tunnels established."
 
-      # ---------- START LLAMA-SERVER WITH RPC ----------
+      # ---------- START LLAMA-SERVER WITH RPC AND TUNNEL ----------
       - name: Start llama-server with RPC and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
           HOLESAIL_KEYS: ${{ env.HOLESAIL_KEYS }}
         run: |
-          # Build RPC address list (localhost:50052, localhost:50053, ...)
           IFS=',' read -ra KEYS <<< "${HOLESAIL_KEYS}"
           RPC_ADDRS=""
           PORT=50052
@@ -177,7 +213,6 @@ jobs:
             --port 8080 \
             > server.log 2>&1 &
 
-          # Wait for server to be ready
           for i in {1..20}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
@@ -192,7 +227,6 @@ jobs:
             exit 1
           fi
 
-          # Start Cloudflare tunnel to port 8080
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -200,7 +234,6 @@ jobs:
           fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
 
-          # Extract tunnel URL
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -217,7 +250,7 @@ jobs:
             exit 1
           fi
 
-          # Update config.json in the chat repo
+          # Update config.json in chat repo
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -235,12 +268,11 @@ jobs:
           fi
           echo "::notice::Frontend URL: https://$CHAT_REPO"
 
-          # Keep alive
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
   # =====================================================================
-  # WORKER JOBS – 5 instances (each runs RPC server + Holesail tunnel)
+  # WORKER JOBS – 5 instances
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
@@ -280,19 +312,16 @@ jobs:
 
           PORT=50052
 
-          # Start ggml-rpc-server on port 50052
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
-          # ✅ Generate a valid base32 Holesail key (32 chars, A-Z and 2-7 only)
+          # Generate valid Base32 key
           KEY=$(openssl rand -base64 20 | base32 | tr -d '=' | head -c 32)
           echo "✅ Worker $INSTANCE_ID generated key: ${KEY}"
 
-          # Create Holesail tunnel that exposes the RPC server
           holesail --listen localhost:${PORT} --key ${KEY} &
           sleep 5
 
-          # Register the Holesail key in the runner repo
           WORKER_FILE="workers/hole${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"key\": \"${KEY}\"}" > ${WORKER_FILE}
@@ -341,7 +370,6 @@ jobs:
             exit 1
           done
 
-          # Keep the RPC server and Holesail tunnel alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
