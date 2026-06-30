@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-     # ---------- CLEANUP ----------
+
       - name: Clean workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -45,7 +45,7 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
             -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           echo "✅ workers directory ready."
-    
+          
       # ---------- DEPENDENCIES ----------
       - name: Install dependencies
         run: |
@@ -56,6 +56,9 @@ jobs:
       - name: Install Ray and vLLM
         run: pip install ray[default] vllm
 
+      # ---------- CLEANUP ----------
+      
+
       # ---------- START RAY HEAD + HOLESAIL TUNNEL ----------
       - name: Start Ray head and expose via Holesail
         env:
@@ -63,6 +66,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           echo "🚀 Starting Ray head node..."
+          # Bind to all interfaces so the Holesail tunnel can forward
           ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265
 
           echo "🔗 Exposing Ray head port via Holesail..."
@@ -131,7 +135,10 @@ jobs:
           from vllm import LLM, SamplingParams
           import time
 
+          # Connect to the local Ray cluster
           ray.init(address='auto', ignore_reinit_error=True)
+
+          # Load the model with tensor parallelism across 5 workers
           llm = LLM(
               model='./model.gguf',
               tensor_parallel_size=5,
@@ -166,7 +173,7 @@ jobs:
           chmod +x cloudflared
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 > tunnel.log 2>&1 &
 
-          for i in {1..90}; do
+          for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
               echo "✅ Tunnel URL: $TUNNEL_URL"
@@ -227,7 +234,7 @@ jobs:
           echo "🐝 Worker $INSTANCE_ID starting..."
 
           # Poll until the Ray head connection string appears
-          for attempt in {1..90}; do
+          for attempt in {1..120}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/workers/ray_head.json")
@@ -251,8 +258,9 @@ jobs:
           holesail "$CONN_STR" --listen localhost:6379 &
           sleep 5
 
-          # Join the Ray cluster
-          ray start --address='localhost:6379' --num-cpus=4
+          # ✅ Force Ray to use the local tunnel (not the head's private IP)
+          export RAY_ADDRESS=localhost:6379
+          ray start --address='localhost:6379' --num-cpus=4 &
 
           # Register this worker so the Queen knows it's ready
           WORKER_FILE="workers/ray_worker_${INSTANCE_ID}.json"
@@ -300,7 +308,8 @@ jobs:
           while true; do
             if ! pgrep -f "ray" > /dev/null; then
               echo "⚠️ Ray worker died, restarting..."
-              ray start --address='localhost:6379' --num-cpus=4
+              export RAY_ADDRESS=localhost:6379
+              ray start --address='localhost:6379' --num-cpus=4 &
             fi
             if ! pgrep -f "holesail" > /dev/null; then
               echo "⚠️ Holesail client died, restarting..."
