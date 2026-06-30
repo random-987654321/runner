@@ -13,9 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  # ─────────────────────────────────────────────────────────────
-  #  COORDINATOR (long‑running – does NOT finish)
-  # ─────────────────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════
+  #  JOB 0 – COORDINATOR (Tailscale + Exo orchestrator)
+  # ════════════════════════════════════════════════════════════
   coordinator:
     name: "🧠 Coordinator"
     runs-on: ubuntu-latest
@@ -24,11 +24,13 @@ jobs:
       tunnel_url: ${{ steps.tunnel.outputs.url }}
 
     steps:
+      # ── 1. Install uv (package manager for exo) ──
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           version: "latest"
 
+      # ── 2. Cache cloudflared ──
       - uses: actions/cache@v4
         id: cf_cache
         with:
@@ -40,6 +42,7 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
+      # ── 3. Install and connect Tailscale ──
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -49,6 +52,7 @@ jobs:
           echo "✅ Tailscale connected"
           echo "📡 IP: $(tailscale ip -4)"
 
+      # ── 4. Setup Python, install exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -57,14 +61,42 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
+      # ── 5. Start EXO coordinator with logging ──
       - name: Start EXO coordinator
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
         run: |
           source venv/bin/activate
-          uv run exo &
-          sleep 10
 
+          echo "🔍 Verifying exo installation..."
+          python -c "import exo; print('✅ exo installed')"
+
+          echo "🚀 Starting exo coordinator..."
+          nohup python -m exo > exo.log 2>&1 &
+          EXO_PID=$!
+          echo "📡 Exo PID: $EXO_PID"
+
+          # Wait for exo to respond on port 52415
+          for i in {1..20}; do
+            if curl -s http://localhost:52415 > /dev/null 2>&1; then
+              echo "✅ Exo is responding on port 52415"
+              break
+            fi
+            echo "⏳ Waiting for exo... ($i/20)"
+            sleep 2
+          done
+
+          if ! pgrep -f "python -m exo" > /dev/null; then
+            echo "❌ Exo died! Showing logs:"
+            cat exo.log
+            exit 1
+          fi
+
+          echo "✅ Exo is running"
+          echo "📋 Exo logs:"
+          cat exo.log
+
+      # ── 6. Start Cloudflare tunnel to Exo dashboard ──
       - name: Start Cloudflare tunnel
         id: tunnel
         run: |
@@ -81,6 +113,7 @@ jobs:
           echo "::notice::EXO Dashboard: ${TUNNEL_URL}"
           echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
 
+      # ── 7. Self‑replication keepalive ──
       - name: Self-replication keepalive
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -101,7 +134,8 @@ jobs:
               TRIGGERED=true
             fi
 
-            pgrep -f exo > /dev/null || (source venv/bin/activate && uv run exo &)
+            # Health checks
+            pgrep -f "python -m exo" > /dev/null || (source venv/bin/activate && nohup python -m exo > exo.log 2>&1 &)
             pgrep -f cloudflared > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
             sudo tailscale status > /dev/null || sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
               --hostname exo-coordinator-${{ github.run_id }}
@@ -109,25 +143,28 @@ jobs:
             sleep 30
           done
 
-  # ─────────────────────────────────────────────────────────────
-  #  WORKERS (start in parallel – do NOT depend on coordinator)
-  # ─────────────────────────────────────────────────────────────
+
+  # ════════════════════════════════════════════════════════════
+  #  JOBS 1–19 – EXO WORKER NODES (parallel, no dependency on coordinator)
+  # ════════════════════════════════════════════════════════════
   worker:
     name: "⚙️ Worker ${{ matrix.worker_id }}"
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    # ❌ REMOVED: needs: coordinator
+    # ❌ No 'needs' – workers start immediately in parallel
     strategy:
       fail-fast: false
       matrix:
-        worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        worker_id: [1, 2, 3, 4, 5]
 
     steps:
+      # ── 1. Install uv ──
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           version: "latest"
 
+      # ── 2. Install and connect Tailscale ──
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -137,6 +174,7 @@ jobs:
           echo "✅ Tailscale connected"
           echo "📡 IP: $(tailscale ip -4)"
 
+      # ── 3. Setup Python and install exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -145,17 +183,45 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
+      # ── 4. Join EXO cluster (worker) ──
       - name: Join EXO cluster
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
         run: |
           source venv/bin/activate
-          uv run exo &
-          echo "✅ Worker ${{ matrix.worker_id }} joined cluster"
 
+          echo "🔍 Verifying exo installation..."
+          python -c "import exo; print('✅ exo installed')"
+
+          echo "🚀 Starting exo worker..."
+          nohup python -m exo > exo.log 2>&1 &
+          EXO_PID=$!
+          echo "📡 Exo PID: $EXO_PID"
+
+          # Wait for exo to respond (optional)
+          for i in {1..20}; do
+            if curl -s http://localhost:52415 > /dev/null 2>&1; then
+              echo "✅ Exo worker is responding on port 52415"
+              break
+            fi
+            echo "⏳ Waiting for exo... ($i/20)"
+            sleep 2
+          done
+
+          if ! pgrep -f "python -m exo" > /dev/null; then
+            echo "❌ Exo died! Showing logs:"
+            cat exo.log
+            exit 1
+          fi
+
+          echo "✅ Worker ${{ matrix.worker_id }} joined cluster"
+          echo "📋 Exo logs:"
+          cat exo.log
+
+          # ── Keepalive loop ──
           while true; do
-            if ! pgrep -f exo > /dev/null; then
-              uv run exo &
+            if ! pgrep -f "python -m exo" > /dev/null; then
+              nohup python -m exo > exo.log 2>&1 &
             fi
             if ! sudo tailscale status > /dev/null; then
               sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
