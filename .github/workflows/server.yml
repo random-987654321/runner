@@ -148,18 +148,15 @@ jobs:
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
-
+      
           PORT=$((65430 + INSTANCE_ID))
-
-          # Start RPC server
+      
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
-
-          # Create bore tunnel
+      
           bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
           sleep 5
-
-          # Extract bore URL
+      
           BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
           if [ -z "$BORE_URL" ]; then
             echo "❌ Failed to get bore URL"
@@ -167,18 +164,39 @@ jobs:
             exit 1
           fi
           echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
-
-          # Write to workers/w<id>.json
+      
+          # ---------- Write to workers/w<id>.json with SHA handling ----------
           WORKER_FILE="workers/w${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
-
+      
+          # Check if file exists and get SHA
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+      
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha // ""')
+      
+          # Build payload with or without SHA
+          if [ -n "$SHA" ] && [ "$SHA" != "null" ]; then
+            PAYLOAD=$(jq -n \
+              --arg msg "register worker $INSTANCE_ID" \
+              --arg content "$ENCODED" \
+              --arg sha "$SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            PAYLOAD=$(jq -n \
+              --arg msg "register worker $INSTANCE_ID" \
+              --arg content "$ENCODED" \
+              '{message: $msg, content: $content}')
+          fi
+      
           RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            -d "{\"message\":\"register worker $INSTANCE_ID\",\"content\":\"${ENCODED}\"}" \
+            -d "$PAYLOAD" \
             "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
-
+      
           if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
             echo "✅ Worker $INSTANCE_ID registered successfully!"
           else
@@ -186,7 +204,7 @@ jobs:
             echo "Response: $RESPONSE"
             exit 1
           fi
-
+      
           # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
