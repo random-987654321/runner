@@ -1,4 +1,4 @@
-name: Ray‑vLLM with bore (5 Workers)
+name: Ray‑vLLM with Holesail (5 Workers)
 
 on:
   workflow_dispatch:
@@ -13,17 +13,15 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # ---------- DEPENDENCIES ----------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake python3-pip
+          sudo apt-get install -y jq curl build-essential cmake python3-pip nodejs npm
+          sudo npm install -g holesail
 
-      - name: Install Ray, vLLM, and bore
-        run: |
-          pip install ray[default] vllm
-          curl -Lo bore https://github.com/ekzhang/bore/releases/latest/download/bore-linux-amd64
-          chmod +x bore
-          sudo mv bore /usr/local/bin/
+      - name: Install Ray and vLLM
+        run: pip install ray[default] vllm
 
       # ---------- CLEANUP ----------
       - name: Clean workers directory
@@ -58,8 +56,8 @@ jobs:
             -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           echo "✅ workers directory ready."
 
-      # ---------- START RAY HEAD + BORE TUNNEL ----------
-      - name: Start Ray head and expose via bore
+      # ---------- START RAY HEAD + HOLESAIL TUNNEL ----------
+      - name: Start Ray head and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -67,31 +65,29 @@ jobs:
           echo "🚀 Starting Ray head node..."
           ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265
 
-          # Expose port 6379 via bore
-          echo "🔗 Exposing Ray head port via bore..."
-          bore local 6379 --to bore.pub > /tmp/bore_url.txt 2>&1 &
+          echo "🔗 Exposing Ray head port via Holesail..."
+          holesail --live 6379 > /tmp/holesail_output.txt 2>&1 &
           sleep 5
 
-          # Extract the bore public address (e.g., bore.pub:12345)
-          BORE_URL=$(grep -oP 'listening at \Kbore\.pub:\d+' /tmp/bore_url.txt | head -1)
-          if [ -z "$BORE_URL" ]; then
-            echo "❌ Failed to get bore URL"
-            cat /tmp/bore_url.txt
+          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
+          if [ -z "$CONNECTION_STRING" ]; then
+            echo "❌ Failed to get Holesail connection string"
+            cat /tmp/holesail_output.txt
             exit 1
           fi
-          echo "✅ Ray head reachable at: $BORE_URL"
+          echo "✅ Ray head reachable at: $CONNECTION_STRING"
 
-          # Write the bore URL to the repo so workers can find it
+          # Write the connection string to the repo
           WORKER_FILE="workers/ray_head.json"
           mkdir -p workers
-          echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
+          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
           curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
             -d "{\"message\":\"register ray head\",\"content\":\"${ENCODED}\"}"
 
-          echo "👑 Queen waiting for 5 workers..."
+          echo "👑 Queen waiting for 5 workers to join Ray..."
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -104,13 +100,13 @@ jobs:
             fi
             echo "  Attempt $attempt: $COUNT workers registered"
             if [ "$COUNT" -ge 5 ]; then
-              echo "✅ All 5 workers registered!"
+              echo "✅ All 5 workers have joined Ray!"
               break
             fi
             sleep 5
           done
           if [ "$COUNT" -lt 5 ]; then
-            echo "❌ Timeout waiting for workers"
+            echo "❌ Timeout waiting for workers to join Ray"
             exit 1
           fi
 
@@ -127,9 +123,9 @@ jobs:
           fi
 
       # ---------- START vLLM SERVER WITH RAY ----------
-      - name: Start vLLM server with Ray
+      - name: Start vLLM server with Ray (5 workers)
         run: |
-          echo "🌐 Starting vLLM server with Ray (5 workers)..."
+          echo "🌐 Starting vLLM server with Ray (tensor_parallel_size=5)..."
           python3 - <<'EOF'
           import ray
           from vllm import LLM, SamplingParams
@@ -169,6 +165,7 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 > tunnel.log 2>&1 &
+
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -182,6 +179,7 @@ jobs:
             tail -50 tunnel.log
             exit 1
           fi
+
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -212,12 +210,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl python3-pip
+          sudo apt-get install -y jq curl nodejs npm
+          sudo npm install -g holesail
 
       - name: Install Ray
         run: pip install ray[default]
 
-      - name: Connect to Ray head via bore URL
+      - name: Connect to Ray head via Holesail and join cluster
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -226,15 +225,15 @@ jobs:
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
 
-          # Fetch the bore URL from workers/ray_head.json
+          # Fetch the Ray head connection string
           for attempt in {1..30}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/workers/ray_head.json")
             if [ "$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)" != "null" ]; then
-              BORE_URL=$(echo "$RESPONSE" | jq -r '.content' | base64 -d | jq -r '.url')
-              if [ -n "$BORE_URL" ]; then
-                echo "✅ Found Ray head at: $BORE_URL"
+              CONN_STR=$(echo "$RESPONSE" | jq -r '.content' | base64 -d | jq -r '.url')
+              if [ -n "$CONN_STR" ]; then
+                echo "✅ Found Ray head at: $CONN_STR"
                 break
               fi
             fi
@@ -242,15 +241,19 @@ jobs:
             sleep 2
           done
 
-          if [ -z "$BORE_URL" ]; then
-            echo "❌ Failed to get Ray head URL"
+          if [ -z "$CONN_STR" ]; then
+            echo "❌ Failed to get Ray head connection string"
             exit 1
           fi
 
-          # Start Ray worker and connect to head via bore URL
-          ray start --address="$BORE_URL" --num-cpus=4
+          # Forward the Holesail tunnel to localhost:6379
+          holesail "$CONN_STR" --listen localhost:6379 &
+          sleep 5
 
-          # Register worker
+          # Join the Ray cluster
+          ray start --address='localhost:6379' --num-cpus=4
+
+          # Register this worker so the Queen knows it's ready
           WORKER_FILE="workers/ray_worker_${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"worker_id\": \"${INSTANCE_ID}\", \"status\": \"ready\"}" > ${WORKER_FILE}
@@ -292,10 +295,15 @@ jobs:
             exit 1
           done
 
+          # Keep the worker alive
           while true; do
             if ! pgrep -f "ray" > /dev/null; then
               echo "⚠️ Ray worker died, restarting..."
-              ray start --address="$BORE_URL" --num-cpus=4
+              ray start --address='localhost:6379' --num-cpus=4
+            fi
+            if ! pgrep -f "holesail" > /dev/null; then
+              echo "⚠️ Holesail client died, restarting..."
+              holesail "$CONN_STR" --listen localhost:6379 &
             fi
             sleep 30
           done
