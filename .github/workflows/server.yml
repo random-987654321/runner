@@ -13,17 +13,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ---------- DEPENDENCIES ----------
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake python3-pip nodejs npm
-          sudo npm install -g holesail
-
-      - name: Install Ray and vLLM
-        run: pip install ray[default] vllm
-
-      # ---------- CLEANUP ----------
+     # ---------- CLEANUP ----------
       - name: Clean workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -55,6 +45,16 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
             -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           echo "✅ workers directory ready."
+    
+      # ---------- DEPENDENCIES ----------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq curl build-essential cmake python3-pip nodejs npm
+          sudo npm install -g holesail
+
+      - name: Install Ray and vLLM
+        run: pip install ray[default] vllm
 
       # ---------- START RAY HEAD + HOLESAIL TUNNEL ----------
       - name: Start Ray head and expose via Holesail
