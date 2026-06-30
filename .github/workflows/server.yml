@@ -118,15 +118,15 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          # 1. Write the Ollama‑compatible API server (listens on port 8000)
+          # 1. Write the Ollama‑compatible API server
           cat > server.py << 'EOF'
           import subprocess
           import json
           import os
           from http.server import HTTPServer, BaseHTTPRequestHandler
-
+      
           RPC_ADDRS = os.environ.get('RPC_ADDRS', '')
-
+      
           class OllamaHandler(BaseHTTPRequestHandler):
               def do_GET(self):
                   if self.path == '/api/tags':
@@ -138,7 +138,7 @@ jobs:
                   else:
                       self.send_response(404)
                       self.end_headers()
-
+      
               def do_POST(self):
                   if self.path == '/api/generate':
                       content_length = int(self.headers.get('Content-Length', 0))
@@ -167,63 +167,108 @@ jobs:
                   else:
                       self.send_response(404)
                       self.end_headers()
-
+      
               def log_message(self, format, *args):
                   pass
-
-          server = HTTPServer(('0.0.0.0', 8000), OllamaHandler)
-          server.serve_forever()
+      
+          if __name__ == '__main__':
+              server = HTTPServer(('0.0.0.0', 8000), OllamaHandler)
+              print("✅ Ollama-compatible API server running on port 8000")
+              server.serve_forever()
           EOF
-
-          # 2. Start the API server
-          python3 server.py &
-          sleep 5
-
-          # 3. Install and run Open WebUI
-          pip install --quiet open-webui
+      
+          # 2. Start the API server with nohup (detached)
+          nohup python3 server.py > server.log 2>&1 &
+          echo "🔄 API server starting (nohup)..."
+      
+          # 3. Wait for server to be ready (health check)
+          for i in {1..20}; do
+            if curl -s http://localhost:8000/api/tags > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            echo "⏳ Waiting for API server... ($i/20)"
+            sleep 2
+          done
+          if ! curl -s http://localhost:8000/api/tags > /dev/null; then
+            echo "❌ API server failed to start"
+            echo "Server log:"
+            cat server.log
+            exit 1
+          fi
+      
+          # 4. Install Open WebUI
+          echo "📦 Installing Open WebUI..."
+          python3 -m pip install --quiet open-webui
+      
+          # 5. Start Open WebUI with nohup (detached)
           export OLLAMA_BASE_URL=http://localhost:8000
-          open-webui serve --host 0.0.0.0 --port 3000 &
-          sleep 10
-
-          # 4. Cloudflare tunnel to port 3000 (Open WebUI)
-          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-          ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
-
-          # 5. Extract tunnel URL
+          nohup open-webui serve --host 0.0.0.0 --port 3000 > openwebui.log 2>&1 &
+          echo "🔄 Open WebUI starting (nohup)..."
+      
+          # 6. Wait for Open WebUI to be ready
+          for i in {1..20}; do
+            if curl -s http://localhost:3000 > /dev/null; then
+              echo "✅ Open WebUI is ready"
+              break
+            fi
+            echo "⏳ Waiting for Open WebUI... ($i/20)"
+            sleep 3
+          done
+          if ! curl -s http://localhost:3000 > /dev/null; then
+            echo "❌ Open WebUI failed to start"
+            echo "Open WebUI log:"
+            cat openwebui.log
+            exit 1
+          fi
+      
+          # 7. Cloudflare tunnel to port 3000
+          echo "🌐 Starting Cloudflare tunnel..."
+          if [ ! -f ./cloudflared ]; then
+            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x cloudflared
+          fi
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:3000 > tunnel.log 2>&1 &
+      
+          # 8. Extract tunnel URL
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
               echo "✅ Tunnel URL: $TUNNEL_URL"
               break
             fi
-            sleep 2
+            echo "⏳ Waiting for tunnel... ($i/30)"
+            sleep 3
           done
-
-          # 6. Update config.json in the chat repo
-          if [ -n "$TUNNEL_URL" ]; then
-            CHAT_REPO="${{ github.repository_owner }}/chat"
-            NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
-            ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
-            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-            SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-            if [ "$SHA" != "null" ]; then
-              PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
-                '{message: $msg, content: $content, sha: $sha}')
-              curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-                -d "$PAYLOAD"
-            fi
-            echo "::notice::Frontend URL: https://$CHAT_REPO"
+      
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL"
+            echo "Tunnel log (last 50 lines):"
+            tail -50 tunnel.log
+            exit 1
           fi
-
-          # 7. Keep the runner alive
-          echo "🔄 Queen is serving Open WebUI. Keeping alive..."
-          sleep infinity
-
+      
+          # 9. Update config.json in the chat repo
+          CHAT_REPO="${{ github.repository_owner }}/chat"
+          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
+          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
+          if [ "$SHA" != "null" ]; then
+            PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+              -d "$PAYLOAD"
+          fi
+          echo "::notice::Frontend URL: https://$CHAT_REPO"
+      
+          # 10. Keep alive
+          echo "🔄 Queen is serving. Keeping alive..."
+          sleep infinity  
   # =====================================================================
   # WORKER JOBS – 10 instances with staggered start + SHA handling
   # =====================================================================
