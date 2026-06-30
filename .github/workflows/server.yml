@@ -9,18 +9,30 @@ permissions:
 
 jobs:
   # =====================================================================
-  # QUEEN JOB – Orchestrates everything
+  # QUEEN JOB – Orchestrates everything + serves Open WebUI
   # =====================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-  
+
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake
-  
+          sudo apt-get install -y jq curl build-essential cmake python3 python3-pip
+
+      - name: Clean workers directory (fresh start)
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🧹 Cleaning workers directory..."
+          # Delete workers directory recursively (ignore 404)
+          curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO}/contents/workers" \
+            -d '{"message":"cleanup","sha":""}' 2>/dev/null || true
+          echo "✅ Cleanup done."
+
       - name: Build llama-cli with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
@@ -32,14 +44,13 @@ jobs:
           cp bin/llama-cli ../../
           cd ../..
           chmod +x llama-cli
-          # Verify RPC support
           if ./llama-cli --help 2>&1 | grep -q rpc; then
             echo "✅ RPC support enabled"
           else
             echo "❌ RPC support missing"
             exit 1
           fi
-  
+
       - name: Download model (GGUF)
         run: |
           MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
@@ -49,16 +60,16 @@ jobs:
             echo "✅ Valid GGUF file downloaded"
             ls -lh model.gguf
           else
-            echo "❌ Invalid GGUF file – first 4 bytes: $(head -c 4 model.gguf)"
+            echo "❌ Invalid GGUF file"
             exit 1
           fi
-  
+
       - name: Wait for workers and collect URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "👑 Queen waiting for 5 workers..."
+          echo "👑 Queen waiting for 10 workers..."
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -70,13 +81,13 @@ jobs:
               WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
             fi
             echo "  Attempt $attempt: $WORKER_COUNT workers registered"
-            if [ "$WORKER_COUNT" -ge 5 ]; then
+            if [ "$WORKER_COUNT" -ge 10 ]; then
               echo "✅ All workers registered!"
               break
             fi
             sleep 5
           done
-          if [ "$WORKER_COUNT" -lt 5 ]; then
+          if [ "$WORKER_COUNT" -lt 10 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
@@ -93,34 +104,141 @@ jobs:
             fi
           done
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
-  
-      - name: Run distributed inference
+          echo "RPC_ADDRS=${RPC_ADDRS}"
+
+      - name: Start Ollama‑compatible API and Open WebUI
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          echo "🧠 Distributed inference with workers: ${RPC_ADDRS}"
-          ./llama-cli -m model.gguf \
-            --rpc ${RPC_ADDRS} \
-            --tensor-split 5 \
-            -p "What is the meaning of life?" \
-            -n 256
-  
-      - name: Keep queen alive
-        run: sleep infinity
+          # 1. Write the Ollama‑compatible API server (listens on port 8000)
+          cat > server.py << 'EOF'
+          import subprocess
+          import json
+          import os
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+
+          RPC_ADDRS = os.environ.get('RPC_ADDRS', '')
+
+          class OllamaHandler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == '/api/tags':
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'application/json')
+                      self.end_headers()
+                      response = {"models": [{"name": "distributed-model", "modified_at": "2026-01-01T00:00:00Z", "size": 0}]}
+                      self.wfile.write(json.dumps(response).encode())
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+
+              def do_POST(self):
+                  if self.path == '/api/generate':
+                      content_length = int(self.headers.get('Content-Length', 0))
+                      body = self.rfile.read(content_length)
+                      try:
+                          data = json.loads(body)
+                          prompt = data.get('prompt', '')
+                      except:
+                          prompt = ''
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'text/event-stream')
+                      self.send_header('Cache-Control', 'no-cache')
+                      self.end_headers()
+                      cmd = [
+                          './llama-cli', '-m', 'model.gguf',
+                          '--rpc', RPC_ADDRS,
+                          '--tensor-split', '10',
+                          '-p', prompt,
+                          '-n', '256',
+                          '--stream'
+                      ]
+                      process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                      for line in process.stdout:
+                          self.wfile.write(f"data: {json.dumps({'response': line.strip()})}\n\n".encode())
+                      self.wfile.write(b"data: [DONE]\n\n")
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+
+              def log_message(self, format, *args):
+                  pass
+
+          server = HTTPServer(('0.0.0.0', 8000), OllamaHandler)
+          server.serve_forever()
+          EOF
+
+          # 2. Start the API server
+          python3 server.py &
+          sleep 5
+
+          # 3. Install and run Open WebUI
+          pip install --quiet open-webui
+          export OLLAMA_BASE_URL=http://localhost:8000
+          open-webui serve --host 0.0.0.0 --port 3000 &
+          sleep 10
+
+          # 4. Cloudflare tunnel to port 3000 (Open WebUI)
+          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
+
+          # 5. Extract tunnel URL
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Tunnel URL: $TUNNEL_URL"
+              break
+            fi
+            sleep 2
+          done
+
+          # 6. Update config.json in the chat repo
+          if [ -n "$TUNNEL_URL" ]; then
+            CHAT_REPO="${{ github.repository_owner }}/chat"
+            NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
+            ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha')
+            if [ "$SHA" != "null" ]; then
+              PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+              curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+                -d "$PAYLOAD"
+            fi
+            echo "::notice::Frontend URL: https://$CHAT_REPO"
+          fi
+
+          # 7. Keep the runner alive
+          echo "🔄 Queen is serving Open WebUI. Keeping alive..."
+          sleep infinity
 
   # =====================================================================
-  # WORKER JOBS – 19 instances
+  # WORKER JOBS – 10 instances with staggered start
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5]
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake
+
+      - name: Stagger start (10s * instance)
+        run: |
+          DELAY=$(( ${{ matrix.instance }} * 10 ))
+          echo "⏳ Worker ${{ matrix.instance }} waiting ${DELAY}s before starting..."
+          sleep ${DELAY}
 
       - name: Install bore
         run: |
@@ -149,18 +267,14 @@ jobs:
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
-
           PORT=$((65430 + INSTANCE_ID))
 
-          # Start RPC server
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
-          # Create bore tunnel
           bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
           sleep 5
 
-          # Extract bore URL
           BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
           if [ -z "$BORE_URL" ]; then
             echo "❌ Failed to get bore URL"
@@ -169,7 +283,6 @@ jobs:
           fi
           echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
 
-          # Write to workers/w<id>.json
           WORKER_FILE="workers/w${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
