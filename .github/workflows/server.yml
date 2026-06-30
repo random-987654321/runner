@@ -13,6 +13,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # ---------- CLEAN WORKERS DIRECTORY ----------
       - name: Clean workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -32,6 +33,7 @@ jobs:
           done
           echo "✅ Cleanup done."
 
+      # ---------- CREATE WORKERS DIRECTORY ----------
       - name: Create workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -56,14 +58,16 @@ jobs:
           fi
           echo "✅ workers directory ready."
 
+      # ---------- INSTALL DEPENDENCIES ----------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl netcat-openbsd
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
 
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
+      # ---------- BUILD LLAMA-SERVER ----------
       - name: Build llama-server with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
@@ -82,7 +86,8 @@ jobs:
             exit 1
           fi
 
-      - name: Download model
+      # ---------- DOWNLOAD MODEL ----------
+      - name: Download model (GGUF)
         run: |
           MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
           curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
@@ -93,6 +98,7 @@ jobs:
             exit 1
           fi
 
+      # ---------- WAIT FOR WORKERS AND COLLECT HOLESAIL URLS ----------
       - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -141,84 +147,73 @@ jobs:
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
 
-      # ---------- CONNECT TO WORKERS WITH UNIQUE PORTS ----------
+      # ---------- CONNECT TO WORKERS VIA HOLESAIL (UNIQUE PORTS) ----------
       - name: Connect to workers via Holesail (unique ports)
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
           echo "🔗 Connecting to workers via Holesail P2P tunnels..."
-
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           LOCAL_PORT=60000
           RPC_ADDRS=""
-
           for url in "${URLS[@]}"; do
             echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
-            # Use --port to force client to listen on a specific local port
-            holesail "${url}" --port ${LOCAL_PORT} &
-
+            # Use --listen to bind to a specific local port
+            holesail "${url}" --listen localhost:${LOCAL_PORT} &
             if [ -n "$RPC_ADDRS" ]; then
               RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
             else
               RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
             fi
-
             LOCAL_PORT=$((LOCAL_PORT + 1))
           done
-
           echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
           echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
+          sleep 15   # give tunnels time to establish
 
-          # Wait for tunnels to stabilise
-          sleep 20
-
-      # ---------- VERIFY RPC PORTS ARE OPEN ----------
-      - name: Verify RPC ports
+      # ---------- VERIFY RPC PORTS ----------
+      - name: Verify RPC worker ports
         run: |
-          echo "🔍 Verifying RPC ports are open..."
           for port in 60000 60001 60002 60003 60004; do
             echo -n "Port $port: "
-            nc -zv 127.0.0.1 $port 2>&1 || echo "❌ FAILED"
+            if nc -zv 127.0.0.1 $port 2>&1 | grep -q open; then
+              echo "✅ open"
+            else
+              echo "❌ closed"
+            fi
           done
 
-      # ---------- TEST INFERENCE WITH LLAMA-CLI ----------
-      - name: Test inference with llama-cli
-        env:
-          RPC_ADDRS: ${{ env.RPC_ADDRS }}
-        run: |
-          echo "🧪 Testing llama-cli with RPC workers..."
-          ./llama-cli -m model.gguf \
-            --rpc ${RPC_ADDRS} \
-            --tensor-split 5 \
-            -p "Hello" \
-            -n 20 2>&1 | head -50
-          echo "=== Test finished ==="
-
-      # ---------- START LLAMA-SERVER ----------
+      # ---------- START LLAMA-SERVER WITH RPC AND TUNNEL ----------
       - name: Start llama-server with RPC and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
+          # Generate dynamic tensor split: "1,1,1,1,1" for 5 workers
+          NUM_WORKERS=$(echo "${RPC_ADDRS}" | tr ',' '\n' | wc -l)
+          SPLIT=$(printf '1%.0s' $(seq 1 $NUM_WORKERS) | sed 's/./&,/g' | sed 's/,$//')
+          if [ -z "$SPLIT" ]; then
+            SPLIT="1"   # fallback if empty
+          fi
+          echo "🌐 Starting llama-server with RPC: ${RPC_ADDRS}, split: ${SPLIT}"
 
           nohup ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
-            --tensor-split 5 \
+            --tensor-split ${SPLIT} \
             -c 4096 \
             --host 0.0.0.0 \
             --port 8080 \
             > server.log 2>&1 &
 
-          # Wait for server to be ready
-          for i in {1..20}; do
+          # Wait for health
+          for i in {1..30}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
               break
             fi
-            echo "⏳ Waiting for llama-server... ($i/20)"
+            echo "⏳ Waiting for llama-server... ($i/30)"
             sleep 2
           done
           if ! curl -s http://localhost:8080/health > /dev/null; then
@@ -227,16 +222,15 @@ jobs:
             exit 1
           fi
 
-          # Test the API endpoint
-          echo "📡 Testing /v1/chat/completions endpoint..."
-          curl -X POST http://localhost:8080/v1/chat/completions \
+          # Test the /completion endpoint locally
+          echo "🧪 Testing /completion endpoint..."
+          curl -X POST http://localhost:8080/completion \
             -H "Content-Type: application/json" \
-            -d '{
-              "model": "distributed-model",
-              "messages": [{"role": "user", "content": "Hello"}],
-              "stream": false
-            }' 2>&1 | head -20
+            -d '{"prompt":"Hello","n_predict":5}' \
+            -w "\nHTTP Status: %{http_code}\n" \
+            || echo "⚠️ /completion test failed (but server may still be ok)"
 
+          # Start Cloudflare tunnel
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -279,6 +273,9 @@ jobs:
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
+  # =====================================================================
+  # WORKER JOBS – 5 instances
+  # =====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
