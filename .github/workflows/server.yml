@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "HuggingFace model ID"
+        description: "HuggingFace model ID (not used yet, but for future)"
         required: false
         default: "ibm-granite/granite-4.0-h-tiny"
 
@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   # ════════════════════════════════════════════════════════════
-  #  COORDINATOR
+  #  JOB 0 – COORDINATOR
   # ════════════════════════════════════════════════════════════
   coordinator:
     name: "🧠 Coordinator"
@@ -24,11 +24,13 @@ jobs:
       tunnel_url: ${{ steps.tunnel.outputs.url }}
 
     steps:
+      # ---- 1. Install uv (package manager) ----
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           version: "latest"
 
+      # ---- 2. Cache cloudflared ----
       - uses: actions/cache@v4
         id: cf_cache
         with:
@@ -40,6 +42,7 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
+      # ---- 3. Install and connect Tailscale ----
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -49,24 +52,36 @@ jobs:
           echo "✅ Tailscale connected"
           echo "📡 IP: $(tailscale ip -4)"
 
-      - name: Setup Python and Exo
+      # ---- 4. Install Node.js, Python, and clone/build exo from source ----
+      - name: Setup Python and Exo (from source)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-pip python3-venv
+          sudo apt-get install -y python3-pip python3-venv nodejs npm
           python3 -m venv venv
           source venv/bin/activate
-          pip install --quiet exo
 
+          # Clone exo repository
+          git clone https://github.com/exo-explore/exo.git
+          cd exo
+
+          # Install uv and sync dependencies
+          pip install uv
+          uv sync --all-packages
+
+          # Build the dashboard
+          cd dashboard && npm install && npm run build && cd ..
+
+          echo "✅ exo installed from source"
+
+      # ---- 5. Start EXO coordinator (from source) ----
       - name: Start EXO coordinator
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
         run: |
           source venv/bin/activate
+          cd exo
 
-          echo "🔍 Verifying exo installation..."
-          uv run exo --help > /dev/null 2>&1 && echo "✅ exo installed"
-
-          echo "🚀 Starting exo coordinator (via uv run)..."
+          echo "🚀 Starting exo coordinator from source..."
           nohup uv run exo > exo.log 2>&1 &
           EXO_PID=$!
           echo "📡 Exo PID: $EXO_PID"
@@ -88,9 +103,9 @@ jobs:
           fi
 
           echo "✅ Exo is running"
-          echo "📋 Exo logs:"
           tail -20 exo.log
 
+      # ---- 6. Start Cloudflare tunnel to Exo dashboard ----
       - name: Start Cloudflare tunnel
         id: tunnel
         run: |
@@ -107,6 +122,7 @@ jobs:
           echo "::notice::EXO Dashboard: ${TUNNEL_URL}"
           echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
 
+      # ---- 7. Self‑replication keepalive (coordinator stays alive) ----
       - name: Self-replication keepalive
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -128,7 +144,7 @@ jobs:
             fi
 
             # Health checks
-            pgrep -f "uv run exo" > /dev/null || (source venv/bin/activate && nohup uv run exo > exo.log 2>&1 &)
+            pgrep -f "uv run exo" > /dev/null || (cd exo && source ../venv/bin/activate && nohup uv run exo > exo.log 2>&1 &)
             pgrep -f cloudflared > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
             sudo tailscale status > /dev/null || sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
               --hostname exo-coordinator-${{ github.run_id }}
@@ -138,7 +154,7 @@ jobs:
 
 
   # ════════════════════════════════════════════════════════════
-  #  WORKERS (start in parallel)
+  #  JOBS 1–19 – EXO WORKER NODES (start in parallel)
   # ════════════════════════════════════════════════════════════
   worker:
     name: "⚙️ Worker ${{ matrix.worker_id }}"
@@ -150,11 +166,13 @@ jobs:
         worker_id: [1, 2, 3, 4, 5]
 
     steps:
+      # ---- 1. Install uv ----
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           version: "latest"
 
+      # ---- 2. Install and connect Tailscale ----
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -164,24 +182,30 @@ jobs:
           echo "✅ Tailscale connected"
           echo "📡 IP: $(tailscale ip -4)"
 
-      - name: Setup Python and Exo
+      # ---- 3. Setup Python, Node.js, clone and build exo from source ----
+      - name: Setup Python and Exo (from source)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-pip python3-venv
+          sudo apt-get install -y python3-pip python3-venv nodejs npm
           python3 -m venv venv
           source venv/bin/activate
-          pip install --quiet exo
 
+          git clone https://github.com/exo-explore/exo.git
+          cd exo
+          pip install uv
+          uv sync --all-packages
+          cd dashboard && npm install && npm run build && cd ..
+          echo "✅ exo installed from source"
+
+      # ---- 4. Join EXO cluster as worker ----
       - name: Join EXO cluster
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
         run: |
           source venv/bin/activate
+          cd exo
 
-          echo "🔍 Verifying exo installation..."
-          uv run exo --help > /dev/null 2>&1 && echo "✅ exo installed"
-
-          echo "🚀 Starting exo worker (via uv run)..."
+          echo "🚀 Starting exo worker from source..."
           nohup uv run exo > exo.log 2>&1 &
           EXO_PID=$!
           echo "📡 Exo PID: $EXO_PID"
@@ -203,10 +227,9 @@ jobs:
           fi
 
           echo "✅ Worker ${{ matrix.worker_id }} joined cluster"
-          echo "📋 Exo logs:"
           tail -20 exo.log
 
-          # Keepalive loop
+          # ---- Keepalive loop ----
           while true; do
             if ! pgrep -f "uv run exo" > /dev/null; then
               nohup uv run exo > exo.log 2>&1 &
