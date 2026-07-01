@@ -38,11 +38,22 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           echo "📁 Creating fresh workers directory..."
-          echo "" | base64 -w0 > empty_keep
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-            -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
+            "https://api.github.com/repos/${REPO}/contents/workers/.keep" 2>/dev/null)
+          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
+          echo "" | base64 -w0 > empty_keep
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\",\"sha\":\"${SHA}\"}" || true
+          else
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
+          fi
           echo "✅ workers directory ready."
 
       - name: Install dependencies
@@ -130,27 +141,34 @@ jobs:
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
 
+      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
       - name: Connect to workers via Holesail (unique ports)
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
           echo "🔗 Connecting to workers via Holesail P2P tunnels..."
+
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           LOCAL_PORT=60000
           RPC_ADDRS=""
+
           for url in "${URLS[@]}"; do
             echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
+            # Use --port to force client to listen on a specific local port
             holesail "${url}" --port ${LOCAL_PORT} &
+
             if [ -n "$RPC_ADDRS" ]; then
               RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
             else
               RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
             fi
+
             LOCAL_PORT=$((LOCAL_PORT + 1))
           done
+
           echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
           echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
-          sleep 10
+          sleep 10   # give tunnels time to establish
 
       - name: Start llama-server with RPC and Cloudflare tunnel
         env:
@@ -159,9 +177,11 @@ jobs:
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
+
           nohup ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
+            --tensor-split 5 \
             -c 4096 \
             --host 0.0.0.0 \
             --port 8080 \
@@ -172,6 +192,7 @@ jobs:
               echo "✅ llama-server is ready"
               break
             fi
+            echo "⏳ Waiting for llama-server... ($i/20)"
             sleep 2
           done
           if ! curl -s http://localhost:8080/health > /dev/null; then
@@ -180,8 +201,11 @@ jobs:
             exit 1
           fi
 
-          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
+          echo "🌐 Starting Cloudflare tunnel..."
+          if [ ! -f ./cloudflared ]; then
+            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x cloudflared
+          fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
 
           for i in {1..30}; do
@@ -190,6 +214,7 @@ jobs:
               echo "✅ Tunnel URL: $TUNNEL_URL"
               break
             fi
+            echo "⏳ Waiting for tunnel... ($i/30)"
             sleep 3
           done
           if [ -z "$TUNNEL_URL" ]; then
