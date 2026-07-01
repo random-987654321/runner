@@ -262,7 +262,6 @@ jobs:
 
       - name: Build ggml-rpc-server
         run: |
-          ulimit -l unlimited
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
           cd llama.cpp-master
