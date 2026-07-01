@@ -134,11 +134,8 @@ jobs:
           import ray
           from vllm import LLM, SamplingParams
           import time
-
-          # Connect to the local Ray cluster
+      
           ray.init(address='auto', ignore_reinit_error=True)
-
-          # Load the model with tensor parallelism across 5 workers
           llm = LLM(
               model='./model.gguf',
               tensor_parallel_size=5,
@@ -149,9 +146,9 @@ jobs:
           print("✅ vLLM model loaded")
           while True:
               time.sleep(60)
-          EOF &
+          EOF
           sleep 15
-
+      
           for i in {1..20}; do
             if curl -s http://localhost:8000/health > /dev/null; then
               echo "✅ vLLM server is ready"
