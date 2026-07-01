@@ -336,7 +336,7 @@ jobs:
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
-              GGML_NUMA=distribute ./ggml-rpc-server -p ${PORT} &
+              ./ggml-rpc-server -p ${PORT} &
             fi
             if ! pgrep -f "holesail" > /dev/null; then
               echo "⚠️ Holesail server died, restarting..."
