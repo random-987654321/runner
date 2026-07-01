@@ -272,18 +272,18 @@ jobs:
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
-      # ---------- BUILD WORKER (rpc-server) ----------
-      - name: Build rpc-server with native optimizations
+      # ---------- BUILD WORKER (ggml-rpc-server) ----------
+      - name: Build ggml-rpc-server with native optimizations
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF ..
-          cmake --build . --config Release -j4 --target rpc-server
-          cp bin/rpc-server ../../
+          cmake --build . --config Release -j4 --target ggml-rpc-server
+          cp bin/ggml-rpc-server ../../
           cd ../..
-          chmod +x rpc-server
+          chmod +x ggml-rpc-server
 
       # ---------- START WORKER ----------
       - name: Start RPC server with NUMA optimization
@@ -294,8 +294,8 @@ jobs:
           echo "🐝 Worker ${{ matrix.instance }} starting..."
           PORT=50052
 
-          # ✅ Correct binary: rpc-server (not llama-rpc-server)
-          ./rpc-server -p ${PORT} &
+          # ✅ Correct binary: ggml-rpc-server
+          ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
           echo "Starting Holesail server on port ${PORT}..."
@@ -353,9 +353,9 @@ jobs:
           done
 
           while true; do
-            if ! pgrep -f "rpc-server" > /dev/null; then
+            if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
-              ./rpc-server -p ${PORT} &
+              ./ggml-rpc-server -p ${PORT} &
             fi
             if ! pgrep -f "holesail" > /dev/null; then
               echo "⚠️ Holesail server died, restarting..."
