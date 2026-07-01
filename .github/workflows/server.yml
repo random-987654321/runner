@@ -1,4 +1,4 @@
-name: Ray‑vLLM with Holesail (5 Workers)
+name: P2P Inference Mesh (Holesail)
 
 on:
   workflow_dispatch:
@@ -13,7 +13,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-
       - name: Clean workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -45,76 +44,33 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
             -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           echo "✅ workers directory ready."
-          
-      # ---------- DEPENDENCIES ----------
+
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake python3-pip nodejs npm
-          sudo npm install -g holesail
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
 
-      - name: Install Ray and vLLM
-        run: pip install ray[default] vllm
+      - name: Install Holesail (global)
+        run: sudo npm install -g holesail
 
-      # ---------- CLEANUP ----------
-      
-
-      # ---------- START RAY HEAD + HOLESAIL TUNNEL ----------
-      - name: Start Ray head and expose via Holesail
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
+      - name: Build llama-server with RPC support
         run: |
-          echo "🚀 Starting Ray head node..."
-          # Bind to all interfaces so the Holesail tunnel can forward
-          ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265
-
-          echo "🔗 Exposing Ray head port via Holesail..."
-          holesail --live 6379 > /tmp/holesail_output.txt 2>&1 &
-          sleep 5
-
-          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
-          if [ -z "$CONNECTION_STRING" ]; then
-            echo "❌ Failed to get Holesail connection string"
-            cat /tmp/holesail_output.txt
-            exit 1
-          fi
-          echo "✅ Ray head reachable at: $CONNECTION_STRING"
-
-          # Write the connection string to the repo
-          WORKER_FILE="workers/ray_head.json"
-          mkdir -p workers
-          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
-          ENCODED=$(base64 -w0 ${WORKER_FILE})
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
-            -d "{\"message\":\"register ray head\",\"content\":\"${ENCODED}\"}"
-
-          echo "👑 Queen waiting for 5 workers to join Ray..."
-          for attempt in {1..60}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
-              COUNT=0
-            else
-              FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
-              COUNT=$(echo "$FILES" | grep -c . || echo 0)
-            fi
-            echo "  Attempt $attempt: $COUNT workers registered"
-            if [ "$COUNT" -ge 5 ]; then
-              echo "✅ All 5 workers have joined Ray!"
-              break
-            fi
-            sleep 5
-          done
-          if [ "$COUNT" -lt 5 ]; then
-            echo "❌ Timeout waiting for workers to join Ray"
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-master
+          mkdir build && cd build
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target llama-server
+          cp bin/llama-server ../../
+          cd ../..
+          chmod +x llama-server
+          if ./llama-server --help 2>&1 | grep -q rpc; then
+            echo "✅ llama-server RPC support enabled"
+          else
+            echo "❌ llama-server RPC support missing"
             exit 1
           fi
 
-      # ---------- DOWNLOAD MODEL ----------
       - name: Download model
         run: |
           MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
@@ -126,49 +82,107 @@ jobs:
             exit 1
           fi
 
-      # ---------- START vLLM SERVER WITH RAY ----------
-      - name: Start vLLM server with Ray (5 workers)
+      - name: Wait for workers and collect Holesail URLs
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "🌐 Starting vLLM server with Ray (tensor_parallel_size=5)..."
-          python3 - <<'EOF'
-          import ray
-          from vllm import LLM, SamplingParams
-          import time
-      
-          ray.init(address='auto', ignore_reinit_error=True)
-          llm = LLM(
-              model='./model.gguf',
-              tensor_parallel_size=5,
-              distributed_executor_backend='ray',
-              enforce_eager=True,
-              trust_remote_code=True,
-          )
-          print("✅ vLLM model loaded")
-          while True:
-              time.sleep(60)
-          EOF
-          sleep 15
-      
-          for i in {1..20}; do
-            if curl -s http://localhost:8000/health > /dev/null; then
-              echo "✅ vLLM server is ready"
+          echo "👑 Queen waiting for 5 workers..."
+          for attempt in {1..60}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
+              WORKER_COUNT=0
+            else
+              WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
+              WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
+            fi
+            echo "  Attempt $attempt: $WORKER_COUNT workers registered"
+            if [ "$WORKER_COUNT" -ge 5 ]; then
+              echo "✅ All workers registered!"
               break
             fi
-            echo "⏳ Waiting for vLLM server... ($i/20)"
+            sleep 5
+          done
+          if [ "$WORKER_COUNT" -lt 5 ]; then
+            echo "❌ Timeout waiting for workers"
+            exit 1
+          fi
+          HOLESAIL_URLS=""
+          for file in $WORKER_FILES; do
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
+              > /tmp/worker.json
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+              echo "Found URL: $URL"
+              if [ -n "$HOLESAIL_URLS" ]; then
+                HOLESAIL_URLS="${HOLESAIL_URLS},${URL}"
+              else
+                HOLESAIL_URLS="${URL}"
+              fi
+            fi
+          done
+          if [ -z "$HOLESAIL_URLS" ]; then
+            echo "❌ No valid Holesail URLs found"
+            exit 1
+          fi
+          echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
+
+      - name: Connect to workers via Holesail (unique ports)
+        env:
+          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
+        run: |
+          echo "🔗 Connecting to workers via Holesail P2P tunnels..."
+          IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
+          LOCAL_PORT=60000
+          RPC_ADDRS=""
+          for url in "${URLS[@]}"; do
+            echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
+            holesail "${url}" --port ${LOCAL_PORT} &
+            if [ -n "$RPC_ADDRS" ]; then
+              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
+            else
+              RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
+            fi
+            LOCAL_PORT=$((LOCAL_PORT + 1))
+          done
+          echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
+          echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
+          sleep 10
+
+      - name: Start llama-server with RPC and Cloudflare tunnel
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          RPC_ADDRS: ${{ env.RPC_ADDRS }}
+        run: |
+          echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
+          nohup ./llama-server \
+            -m model.gguf \
+            --rpc ${RPC_ADDRS} \
+            -c 4096 \
+            --host 0.0.0.0 \
+            --port 8080 \
+            > server.log 2>&1 &
+
+          for i in {1..20}; do
+            if curl -s http://localhost:8080/health > /dev/null; then
+              echo "✅ llama-server is ready"
+              break
+            fi
             sleep 2
           done
-          if ! curl -s http://localhost:8000/health > /dev/null; then
-            echo "❌ vLLM server failed to start"
+          if ! curl -s http://localhost:8080/health > /dev/null; then
+            echo "❌ llama-server failed to start"
+            cat server.log
             exit 1
           fi
 
-      # ---------- CLOUDFLARE TUNNEL FOR FRONTEND ----------
-      - name: Start Cloudflare tunnel for frontend
-        run: |
-          echo "🌐 Starting Cloudflare tunnel..."
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
 
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
@@ -203,7 +217,6 @@ jobs:
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
-  # ---------- WORKER JOBS ----------
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -215,13 +228,24 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl nodejs npm
-          sudo npm install -g holesail
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
 
-      - name: Install Ray
-        run: pip install ray[default]
+      - name: Install Holesail (global)
+        run: sudo npm install -g holesail
 
-      - name: Connect to Ray head via Holesail and join cluster
+      - name: Build ggml-rpc-server
+        run: |
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-master
+          mkdir build && cd build
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target ggml-rpc-server
+          cp bin/ggml-rpc-server ../../
+          cd ../..
+          chmod +x ggml-rpc-server
+
+      - name: Start RPC server and create Holesail tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -229,43 +253,25 @@ jobs:
         run: |
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
-
-          # Poll until the Ray head connection string appears
-          for attempt in {1..120}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/ray_head.json")
-            if [ "$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)" != "null" ]; then
-              CONN_STR=$(echo "$RESPONSE" | jq -r '.content' | base64 -d | jq -r '.url')
-              if [ -n "$CONN_STR" ]; then
-                echo "✅ Found Ray head at: $CONN_STR"
-                break
-              fi
-            fi
-            echo "⏳ Waiting for ray_head.json... ($attempt/30)"
-            sleep 2
-          done
-
-          if [ -z "$CONN_STR" ]; then
-            echo "❌ Failed to get Ray head connection string"
+          PORT=50052
+          ./ggml-rpc-server -p ${PORT} &
+          sleep 5
+          echo "Starting Holesail server on port ${PORT}..."
+          holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
+          sleep 5
+          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
+          if [ -z "$CONNECTION_STRING" ]; then
+            echo "❌ Failed to get connection string from Holesail"
+            cat /tmp/holesail_output.txt
             exit 1
           fi
-
-          # Forward the Holesail tunnel to localhost:6379
-          holesail "$CONN_STR" --listen localhost:6379 &
-          sleep 5
-
-          # ✅ Force Ray to use the local tunnel (not the head's private IP)
-          export RAY_ADDRESS=localhost:6379
-          ray start --address='localhost:6379' --num-cpus=4 &
-
-          # Register this worker so the Queen knows it's ready
-          WORKER_FILE="workers/ray_worker_${INSTANCE_ID}.json"
+          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
+          WORKER_FILE="workers/hole${INSTANCE_ID}.json"
           mkdir -p workers
-          echo "{\"worker_id\": \"${INSTANCE_ID}\", \"status\": \"ready\"}" > ${WORKER_FILE}
+          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
-
           for attempt in {1..10}; do
+            echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
             FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
@@ -300,17 +306,14 @@ jobs:
             echo "Response: $RESPONSE"
             exit 1
           done
-
-          # Keep the worker alive
           while true; do
-            if ! pgrep -f "ray" > /dev/null; then
-              echo "⚠️ Ray worker died, restarting..."
-              export RAY_ADDRESS=localhost:6379
-              ray start --address='localhost:6379' --num-cpus=4 &
+            if ! pgrep -f "ggml-rpc-server" > /dev/null; then
+              echo "⚠️ RPC server died, restarting..."
+              ./ggml-rpc-server -p ${PORT} &
             fi
             if ! pgrep -f "holesail" > /dev/null; then
-              echo "⚠️ Holesail client died, restarting..."
-              holesail "$CONN_STR" --listen localhost:6379 &
+              echo "⚠️ Holesail server died, restarting..."
+              holesail --live ${PORT} &
             fi
             sleep 30
           done
