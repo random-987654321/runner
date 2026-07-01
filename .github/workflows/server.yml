@@ -181,6 +181,7 @@ jobs:
           nohup ./llama-server \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
+                --no-mmap
                 -fa on \
                 -ngl 0 \
                 -t 4 \
@@ -188,8 +189,6 @@ jobs:
                 -ctk q8_0 \
                 -ctv q8_0 \
                 -c 4096 \
-                --no-warmup 
-                -dio
                 --host 0.0.0.0 \
                 --port 8080 \
                 > server.log 2>&1 &
