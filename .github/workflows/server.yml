@@ -279,7 +279,7 @@ jobs:
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
           PORT=50052
-          ./ggml-rpc-server -p ${PORT} -c &
+          ./ggml-rpc-server -p ${PORT} &
           sleep 5
           echo "Starting Holesail server on port ${PORT}..."
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
