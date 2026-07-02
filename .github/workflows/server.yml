@@ -15,6 +15,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq build-essential nodejs npm netcat-openbsd
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          rustup toolchain install nightly
+          sudo npm install -g npm@latest
+          sudo npm install -g holesail
 
       - name: Clean up previous queen Zenoh URL file
         env:
@@ -35,17 +45,6 @@ jobs:
           else
             echo "ℹ️ No existing file to delete"
           fi
-          
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential nodejs npm netcat-openbsd
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source "$HOME/.cargo/env"
-          rustup toolchain install nightly
-          sudo npm install -g npm@latest
-          sudo npm install -g holesail
 
       - name: Install zenohd (router) via cargo
         run: |
@@ -82,7 +81,8 @@ jobs:
           fi
           echo "✅ Zenoh router URL: $ZENOH_URL"
 
-          echo "$ZENOH_URL" > queen_zenoh_url.txt
+          # Write URL cleanly (no extra spaces)
+          printf "%s" "$ZENOH_URL" > queen_zenoh_url.txt
           ENCODED=$(base64 -w0 queen_zenoh_url.txt)
 
           FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -110,7 +110,6 @@ jobs:
           cd exo
           export ZENOH_CONFIG='{"mode": "client", "connect": {"endpoints": ["tcp/localhost:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
           echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          # Use env to pass the variable to nohup
           nohup env ZENOH_CONFIG="$ZENOH_CONFIG" uv run exo --no-worker > exo_queen.log 2>&1 &
           sleep 10
           if pgrep -f "exo"; then
@@ -201,21 +200,26 @@ jobs:
         run: |
           echo "📡 Fetching Queen's Zenoh router URL..."
           ZENOH_URL=""
-          for attempt in {1..60}; do   # increased to 60 (5 minutes)
+          for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" 2>/dev/null)
-            URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null)
+            URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
             if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-              echo "Fetched URL: $URL"
-              ZENOH_URL="$URL"
-              break
+              # Validate the URL format
+              if [[ "$URL" == hs://* ]]; then
+                echo "Fetched valid URL: $URL"
+                ZENOH_URL="$URL"
+                break
+              else
+                echo "  Invalid URL format: $URL – retrying..."
+              fi
             fi
             echo "  Waiting for Queen to publish its Zenoh router URL... ($attempt/60)"
             sleep 5
           done
           if [ -z "$ZENOH_URL" ]; then
-            echo "❌ Failed to fetch Queen's Zenoh router URL"
+            echo "❌ Failed to fetch valid Queen's Zenoh router URL"
             exit 1
           fi
           echo "ZENOH_ROUTER_URL=$ZENOH_URL" >> $GITHUB_ENV
