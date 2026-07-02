@@ -168,7 +168,7 @@ jobs:
           ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
-            --tensor-split 1,1,1,1,1 \
+            --no-mmap \
             -fa on \
             -ngl 0 \
             -c 4096 \
@@ -176,7 +176,7 @@ jobs:
             --port 8080 \
             &
           
-          for i in {1..20}; do
+          for i in {1..600}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
               break
