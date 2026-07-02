@@ -20,7 +20,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y curl jq build-essential nodejs npm
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          # Install Rust (for cargo install)
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           source "$HOME/.cargo/env"
           rustup toolchain install nightly
@@ -62,11 +61,9 @@ jobs:
           fi
           echo "✅ Zenoh router URL: $ZENOH_URL"
 
-          # Write URL to a file and base64 encode
           echo "$ZENOH_URL" > queen_zenoh_url.txt
           ENCODED=$(base64 -w0 queen_zenoh_url.txt)
 
-          # Try to create/update the file in the repo
           FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt")
@@ -93,16 +90,13 @@ jobs:
       - name: Start exo queen (API only)
         run: |
           cd exo
-          # Run exo in no-worker mode, which starts the API server
           uv run exo --no-worker &
-          # Keep alive
           sleep infinity
 
   # ============================================================
-  #  WORKERS – each joins the cluster via the Queen's Zenoh router
+  #  WORKERS – start in parallel with queen
   # ============================================================
   worker:
-    needs: queen
     runs-on: ubuntu-latest
     strategy:
       matrix:
