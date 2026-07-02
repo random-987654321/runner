@@ -167,11 +167,13 @@ jobs:
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
           ./llama-server \
             -m model.gguf \
+            -t 4 \
+            -tb 4 \
             --rpc ${RPC_ADDRS} \
-            --tensor-split 1,1,1,1,1 \
             -fa on \
-            -ngl 0 \
+            -ngl -1 \
             -c 4096 \
+            --no-mmap \
             --host 0.0.0.0 \
             --port 8080 \
             &
