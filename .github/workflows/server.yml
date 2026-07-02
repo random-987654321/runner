@@ -168,7 +168,7 @@ jobs:
           ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
-            --no-mmap \
+            --tensor-split 1,1,1,1,1 \
             -fa on \
             -ngl 0 \
             -c 4096 \
