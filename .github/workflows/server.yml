@@ -1,4 +1,4 @@
-name: Exo Distributed Cluster (20 Nodes)
+name: Exo Distributed Cluster with Zenoh Test
 
 on:
   workflow_dispatch:
@@ -23,6 +23,13 @@ jobs:
           sudo npm install -g npm@latest
           sudo npm install -g holesail
 
+      - name: Install zenohd and zenoh client
+        run: |
+          source "$HOME/.cargo/env"
+          cargo install zenohd --locked
+          cargo install zenoh --locked   # client tool
+          zenohd --version
+
       - name: Clean up previous queen Zenoh URL file
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -43,12 +50,6 @@ jobs:
             echo "ℹ️ No existing file to delete"
           fi
 
-      - name: Install zenohd (router) via cargo
-        run: |
-          source "$HOME/.cargo/env"
-          cargo install zenohd --locked
-          zenohd --version
-
       - name: Clone exo and build dashboard
         run: |
           git clone https://github.com/exo-explore/exo.git
@@ -61,6 +62,23 @@ jobs:
         run: |
           cd exo
           uv sync
+
+      - name: Create Zenoh config file
+        run: |
+          cat > zenoh.json << 'EOF'
+          {
+            "mode": "client",
+            "connect": {
+              "endpoints": ["tcp/127.0.0.1:7447"]
+            },
+            "scouting": {
+              "multicast": {
+                "enabled": false
+              }
+            }
+          }
+          EOF
+          echo "✅ zenoh.json created"
 
       - name: Start Zenoh router and expose via Holesail
         env:
@@ -106,13 +124,13 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
             -d "$PAYLOAD"
 
-      - name: Start exo queen (API only) with correct Zenoh config
+      - name: Start exo queen with Zenoh config
         run: |
           cd exo
           export EXO_ZENOH_NAMESPACE="exo-cluster"
-          export ZENOH_CONFIG='{"mode": "client", "connect": {"endpoints": ["tcp/127.0.0.1:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
-          echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          nohup env EXO_ZENOH_NAMESPACE="$EXO_ZENOH_NAMESPACE" ZENOH_CONFIG="$ZENOH_CONFIG" uv run exo --no-worker > exo_queen.log 2>&1 &
+          export ZENOH_CONFIG="$HOME/zenoh.json"
+          export EXO_ZENOH_CONFIG="$HOME/zenoh.json"   # both
+          nohup env EXO_ZENOH_NAMESPACE="$EXO_ZENOH_NAMESPACE" ZENOH_CONFIG="$ZENOH_CONFIG" EXO_ZENOH_CONFIG="$EXO_ZENOH_CONFIG" uv run exo --no-worker > exo_queen.log 2>&1 &
           sleep 10
           if pgrep -f "uv run exo"; then
             echo "✅ exo process is running"
@@ -182,6 +200,11 @@ jobs:
           sudo npm install -g npm@latest
           sudo npm install -g holesail
 
+      - name: Install zenoh client
+        run: |
+          source "$HOME/.cargo/env"
+          cargo install zenoh --locked
+
       - name: Clone exo and build dashboard
         run: |
           git clone https://github.com/exo-explore/exo.git
@@ -194,6 +217,23 @@ jobs:
         run: |
           cd exo
           uv sync
+
+      - name: Create Zenoh config file
+        run: |
+          cat > zenoh.json << 'EOF'
+          {
+            "mode": "client",
+            "connect": {
+              "endpoints": ["tcp/127.0.0.1:7447"]
+            },
+            "scouting": {
+              "multicast": {
+                "enabled": false
+              }
+            }
+          }
+          EOF
+          echo "✅ zenoh.json created"
 
       - name: Fetch Queen's Zenoh router URL from repository
         env:
@@ -226,7 +266,6 @@ jobs:
           echo "🔗 Connecting to Queen's Zenoh router at $ZENOH_ROUTER_URL"
           holesail --connect "$ZENOH_ROUTER_URL" --port 7447 &
           sleep 10
-          # Test connectivity to 127.0.0.1:7447
           if nc -zv 127.0.0.1 7447 2>&1 | grep -q "succeeded"; then
             echo "✅ Tunnel to Zenoh router is open on 127.0.0.1:7447"
           else
@@ -234,15 +273,33 @@ jobs:
             exit 1
           fi
 
-      - name: Run exo worker
+      - name: Test Zenoh connectivity
+        run: |
+          echo "🧪 Testing Zenoh pub/sub over the tunnel..."
+          # Start a subscriber in the background
+          timeout 10 zenoh sub --config zenoh.json --key "test" --listen "tcp/127.0.0.1:7447" > /tmp/sub.log 2>&1 &
+          sleep 2
+          # Publish a message
+          echo "Hello from worker" | zenoh pub --config zenoh.json --key "test" --listen "tcp/127.0.0.1:7447" --value -
+          sleep 2
+          if grep -q "Hello from worker" /tmp/sub.log; then
+            echo "✅ Zenoh pub/sub over tunnel works!"
+          else
+            echo "❌ Zenoh pub/sub failed – check connectivity"
+            cat /tmp/sub.log
+            exit 1
+          fi
+
+      - name: Run exo worker with Zenoh config file
         env:
           EXO_ZENOH_NAMESPACE: "exo-cluster"
-          ZENOH_CONFIG: '{"mode": "client", "connect": {"endpoints": ["tcp/127.0.0.1:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
+          ZENOH_CONFIG: "$HOME/zenoh.json"
+          EXO_ZENOH_CONFIG: "$HOME/zenoh.json"
         run: |
           cd exo
           echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          nohup env EXO_ZENOH_NAMESPACE="$EXO_ZENOH_NAMESPACE" ZENOH_CONFIG="$ZENOH_CONFIG" uv run exo > exo_worker.log 2>&1 &
-          sleep 15
+          nohup env EXO_ZENOH_NAMESPACE="$EXO_ZENOH_NAMESPACE" ZENOH_CONFIG="$ZENOH_CONFIG" EXO_ZENOH_CONFIG="$EXO_ZENOH_CONFIG" uv run exo > exo_worker.log 2>&1 &
+          sleep 20
           echo "📄 exo_worker.log (first 50 lines):"
           head -50 exo_worker.log || true
           pgrep -f "exo" && echo "✅ Worker exo is running" || echo "⚠️ Worker exo not found"
