@@ -168,7 +168,8 @@ jobs:
           nohup ./llama-server \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
-                -ts 1,1,1,1,1 \ 
+                --tensor-split 1,1,1,1,1 \
+                --numa distribute \
                 -fa on \
                 -ngl 0 \
                 -t 4 \
