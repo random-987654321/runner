@@ -1,4 +1,4 @@
-name: Exo Distributed Cluster (20 Nodes)
+name: Exo Distributed Cluster (5 Workers + Queen)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   # ============================================================
-  #  QUEEN – starts Zenoh router and API server (no worker)
+  #  QUEEN – Zenoh router + API server + Cloudflare tunnel
   # ============================================================
   queen:
     runs-on: ubuntu-latest
@@ -93,22 +93,54 @@ jobs:
         run: |
           cd exo
           uv run exo --no-worker &
+          # Give exo a moment to start
+          sleep 10
+
+      - name: Start Cloudflare Tunnel and print public URL
+        run: |
+          echo "🌐 Starting Cloudflare tunnel..."
+          if [ ! -f ./cloudflared ]; then
+            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x cloudflared
+          fi
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:52415 > tunnel.log 2>&1 &
+
+          # Wait for the tunnel URL to appear in logs
+          TUNNEL_URL=""
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Cloudflare Tunnel URL: $TUNNEL_URL"
+              echo "::notice title=Public UI URL::Click here to open the exo dashboard: $TUNNEL_URL"
+              break
+            fi
+            echo "⏳ Waiting for tunnel... ($i/30)"
+            sleep 3
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL – tailing logs:"
+            tail -50 tunnel.log
+            exit 1
+          fi
+
+          # Keep the runner alive
           sleep infinity
 
   # ============================================================
-  #  WORKERS – 19 nodes, start in parallel with queen
+  #  WORKERS – 5 nodes, start in parallel with queen
   # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        worker_id: [1, 2, 3, 4, 5]
+        worker_id: [1, 2, 3, 4, 5]   # Change to 19 for full deployment
     timeout-minutes: 360
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential nodejs npm
+          sudo apt-get install -y curl jq build-essential nodejs npm netcat-openbsd
           curl -LsSf https://astral.sh/uv/install.sh | sh
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           source "$HOME/.cargo/env"
@@ -150,16 +182,23 @@ jobs:
           fi
           echo "ZENOH_ROUTER_URL=$ZENOH_URL" >> $GITHUB_ENV
 
-      - name: Connect to Queen's Zenoh router via Holesail
+      - name: Connect to Queen's Zenoh router via Holesail and verify
         run: |
           echo "🔗 Connecting to Queen's Zenoh router at $ZENOH_ROUTER_URL"
           holesail --connect "$ZENOH_ROUTER_URL" --port 7447 &
-          sleep 5
+          sleep 10
+          if nc -zv localhost 7447 2>&1 | grep -q "succeeded"; then
+            echo "✅ Tunnel to Zenoh router is open on localhost:7447"
+          else
+            echo "❌ Tunnel failed – cannot connect to localhost:7447"
+            exit 1
+          fi
 
       - name: Run exo worker
         env:
-          ZENOH_CONFIG: '{"connect": {"endpoints": ["tcp/localhost:7447"]}}'
+          ZENOH_CONFIG: '{"mode": "client", "connect": {"endpoints": ["tcp/localhost:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
         run: |
           cd exo
+          echo "ZENOH_CONFIG=$ZENOH_CONFIG"
           uv run exo &
           sleep infinity
