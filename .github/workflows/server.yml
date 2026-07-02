@@ -1,4 +1,4 @@
-name: P2P Inference Mesh – Adaptive Speculative RPC
+name: P2P Inference Mesh – Parallel Speculative RPC
 
 on:
   workflow_dispatch:
@@ -8,15 +8,15 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 19               # change to 5 for testing
-  DRAFT_MODEL_URL: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+  WORKER_COUNT: 19   # change to 5 for testing
   MAIN_MODEL_URL: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
+  DRAFT_MODEL_URL: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
 
 jobs:
   # ---------------------------------------------
   # 19 Workers – run rpc-server and register
   # ---------------------------------------------
-  workers:
+  worker:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -107,10 +107,10 @@ jobs:
           done
 
   # ---------------------------------------------
-  # Queen – coordinator with adaptive RPC + speculation
+  # Queen – coordinator (runs in parallel with workers)
   # ---------------------------------------------
   queen:
-    needs: workers
+    # No 'needs' – starts immediately
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -133,20 +133,20 @@ jobs:
           cd ../..
           chmod +x llama-server
 
-      - name: Download main model (the large one)
+      - name: Download main model
         run: |
           curl -L -o main.gguf "$MAIN_MODEL_URL" -f --retry 3
 
-      - name: Download draft model (smaller, for speculation)
+      - name: Download draft model (for speculation)
         run: |
           curl -L -o draft.gguf "$DRAFT_MODEL_URL" -f --retry 3
 
-      - name: Clean and wait for workers
+      - name: Clean workers directory and wait for registrations
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          # Clean old worker files
+          # Clean any stale worker files from previous runs
           echo "🧹 Cleaning workers/ directory..."
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -160,7 +160,7 @@ jobs:
             fi
           done
 
-          echo "👑 Waiting for $WORKER_COUNT workers..."
+          echo "👑 Queen waiting for $WORKER_COUNT workers..."
           for attempt in {1..90}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -209,11 +209,11 @@ jobs:
           echo "✅ All workers connected. RPC list: $RPC_ADDRS"
           sleep 10  # let tunnels stabilise
 
-      - name: Start llama-server with adaptive speculation and micro‑batching
+      - name: Start llama-server with speculation + Cloudflare tunnel
         env:
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          echo "🚀 Starting llama-server with adaptive RPC + speculation..."
+          echo "🚀 Starting llama-server with RPC + speculative decoding..."
           nohup ./llama-server \
             -m main.gguf \
             -md draft.gguf \
@@ -227,7 +227,6 @@ jobs:
             --no-mmap \
             > server.log 2>&1 &
 
-          # Health check with retry
           for i in {1..120}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server ready"
