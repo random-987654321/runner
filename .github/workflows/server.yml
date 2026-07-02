@@ -8,9 +8,6 @@ permissions:
   contents: write
 
 jobs:
-  # ============================================================
-  #  QUEEN – starts Zenoh router and API server (no worker)
-  # ============================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -70,7 +67,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "🕸️ Starting Zenoh router on port 7447..."
+          echo "🕸️ Starting Zenoh router on port 7447 (listening on 0.0.0.0)..."
           zenohd --listen tcp/0.0.0.0:7447 &
           sleep 3
 
@@ -109,35 +106,27 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
             -d "$PAYLOAD"
 
-      - name: Start exo queen (API only) with Zenoh config
+      - name: Start exo queen (API only) with correct Zenoh config
         run: |
           cd exo
-          export ZENOH_CONFIG='{"mode": "client", "connect": {"endpoints": ["tcp/localhost:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
+          export EXO_ZENOH_NAMESPACE="exo-cluster"
+          export ZENOH_CONFIG='{"mode": "client", "connect": {"endpoints": ["tcp/127.0.0.1:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
           echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          # Run exo in the background and capture logs
-          uv run exo --no-worker > exo_queen.log 2>&1 &
-          EXO_PID=$!
-          echo "exo PID: $EXO_PID"
-          sleep 5
-
-          # Check if process is running
-          if kill -0 $EXO_PID 2>/dev/null; then
-            echo "✅ exo process is running (PID $EXO_PID)"
+          nohup env EXO_ZENOH_NAMESPACE="$EXO_ZENOH_NAMESPACE" ZENOH_CONFIG="$ZENOH_CONFIG" uv run exo --no-worker > exo_queen.log 2>&1 &
+          sleep 10
+          if pgrep -f "uv run exo"; then
+            echo "✅ exo process is running"
           else
-            echo "❌ exo process died immediately – showing log:"
+            echo "❌ exo process not found – showing log:"
             cat exo_queen.log
             exit 1
           fi
 
-      - name: Wait for exo API and start Cloudflare tunnel
+      - name: Start Cloudflare tunnel for exo API
         run: |
           echo "🌐 Waiting for exo API to be ready..."
           for i in {1..60}; do
-            if netstat -tlnp 2>/dev/null | grep -q ':52415.*LISTEN'; then
-              echo "✅ Port 52415 is listening"
-              break
-            fi
-            if curl -s http://localhost:52415/health > /dev/null 2>&1; then
+            if curl -s http://localhost:52415/health > /dev/null; then
               echo "✅ exo API is ready"
               break
             fi
@@ -146,19 +135,13 @@ jobs:
             if [ $i -eq 15 ]; then
               echo "📄 exo_queen.log (last 30 lines):"
               tail -30 exo_queen.log || true
-              echo "Process list:"
-              ps aux | grep exo || true
-              echo "Listening ports:"
-              netstat -tlnp 2>/dev/null || true
             fi
           done
 
-          if ! netstat -tlnp 2>/dev/null | grep -q ':52415.*LISTEN'; then
-            if ! curl -s http://localhost:52415/health > /dev/null 2>&1; then
-              echo "❌ exo API failed to start – showing full log:"
-              cat exo_queen.log
-              exit 1
-            fi
+          if ! curl -s http://localhost:52415/health > /dev/null; then
+            echo "❌ exo API failed to start – showing full log:"
+            cat exo_queen.log
+            exit 1
           fi
 
           echo "🌐 Starting Cloudflare tunnel for exo API..."
@@ -179,17 +162,12 @@ jobs:
             tail -20 tunnel.log
           fi
 
-          # Keep runner alive
           sleep infinity
 
-  # ============================================================
-  #  WORKERS – join the cluster via the Zenoh router
-  # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # Change to [1..19] for full cluster
         worker_id: [1, 2, 3, 4, 5]
     timeout-minutes: 360
     steps:
@@ -248,20 +226,24 @@ jobs:
           echo "🔗 Connecting to Queen's Zenoh router at $ZENOH_ROUTER_URL"
           holesail --connect "$ZENOH_ROUTER_URL" --port 7447 &
           sleep 10
-          if nc -zv localhost 7447 2>&1 | grep -q "succeeded"; then
-            echo "✅ Tunnel to Zenoh router is open on localhost:7447"
+          # Test connectivity to 127.0.0.1:7447
+          if nc -zv 127.0.0.1 7447 2>&1 | grep -q "succeeded"; then
+            echo "✅ Tunnel to Zenoh router is open on 127.0.0.1:7447"
           else
-            echo "❌ Tunnel failed – cannot connect to localhost:7447"
+            echo "❌ Tunnel failed – cannot connect to 127.0.0.1:7447"
             exit 1
           fi
 
       - name: Run exo worker
         env:
-          ZENOH_CONFIG: '{"mode": "client", "connect": {"endpoints": ["tcp/localhost:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
+          EXO_ZENOH_NAMESPACE: "exo-cluster"
+          ZENOH_CONFIG: '{"mode": "client", "connect": {"endpoints": ["tcp/127.0.0.1:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
         run: |
           cd exo
           echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          uv run exo > exo_worker.log 2>&1 &
-          sleep 10
+          nohup env EXO_ZENOH_NAMESPACE="$EXO_ZENOH_NAMESPACE" ZENOH_CONFIG="$ZENOH_CONFIG" uv run exo > exo_worker.log 2>&1 &
+          sleep 15
+          echo "📄 exo_worker.log (first 50 lines):"
+          head -50 exo_worker.log || true
           pgrep -f "exo" && echo "✅ Worker exo is running" || echo "⚠️ Worker exo not found"
           sleep infinity
