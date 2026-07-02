@@ -1,4 +1,4 @@
-name: Exo Distributed Cluster with Zenoh Test
+name: P2P Inference Mesh (Holesail)
 
 on:
   workflow_dispatch:
@@ -11,296 +11,315 @@ jobs:
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     steps:
+      - name: Clean workers directory
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🧹 Cleaning workers directory..."
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
+            if [ -n "$name" ] && [ -n "$sha" ]; then
+              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
+                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
+            fi
+          done
+          echo "✅ Cleanup done."
+      - name: Create workers directory
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "📁 Creating fresh workers directory..."
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers/.keep" 2>/dev/null)
+          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
+          echo "" | base64 -w0 > empty_keep
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\",\"sha\":\"${SHA}\"}" || true
+          else
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
+          fi
+          echo "✅ workers directory ready."
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential nodejs npm netcat-openbsd net-tools
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source "$HOME/.cargo/env"
-          rustup toolchain install nightly
-          sudo npm install -g npm@latest
-          sudo npm install -g holesail
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
+      - name: Install Holesail (global)
+        run: sudo npm install -g holesail
 
-      - name: Install zenohd and zenoh client
+      - name: Build llama-server with RPC support
         run: |
-          source "$HOME/.cargo/env"
-          cargo install zenohd --locked
-          cargo install zenoh --locked   # client tool
-          zenohd --version
-
-      - name: Clean up previous queen Zenoh URL file
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "🧹 Deleting previous queen_zenoh_url.txt..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" 2>/dev/null)
-          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
-              -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}"
-            echo "✅ Deleted old file"
-          else
-            echo "ℹ️ No existing file to delete"
-          fi
-
-      - name: Clone exo and build dashboard
-        run: |
-          git clone https://github.com/exo-explore/exo.git
-          cd exo/dashboard
-          npm install
-          npm run build
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-b8487
+          mkdir build && cd build
+          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target llama-server
+          cp bin/llama-server ../../
           cd ../..
-
-      - name: Install exo Python dependencies
+          chmod +x llama-server
+          if ./llama-server --help 2>&1 | grep -q rpc; then
+            echo "✅ llama-server RPC support enabled"
+          else
+            echo "❌ llama-server RPC support missing"
+            exit 1
+          fi
+      - name: Download model
         run: |
-          cd exo
-          uv sync
-
-      - name: Create Zenoh config file
-        run: |
-          cat > zenoh.json << 'EOF'
-          {
-            "mode": "client",
-            "connect": {
-              "endpoints": ["tcp/127.0.0.1:7447"]
-            },
-            "scouting": {
-              "multicast": {
-                "enabled": false
-              }
-            }
-          }
-          EOF
-          echo "✅ zenoh.json created"
-
-      - name: Start Zenoh router and expose via Holesail
+          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
+          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
+          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
+            echo "✅ Valid GGUF file downloaded"
+          else
+            echo "❌ Invalid GGUF file"
+            exit 1
+          fi
+      - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "🕸️ Starting Zenoh router on port 7447 (listening on 0.0.0.0)..."
-          zenohd --listen tcp/0.0.0.0:7447 &
-          sleep 3
-
-          echo "🔗 Exposing Zenoh router via Holesail..."
-          holesail --live 7447 > /tmp/holesail_zenoh.txt 2>&1 &
-          sleep 5
-
-          ZENOH_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_zenoh.txt | head -1)
-          if [ -z "$ZENOH_URL" ]; then
-            echo "❌ Failed to get Holesail URL"
-            cat /tmp/holesail_zenoh.txt
-            exit 1
-          fi
-          echo "✅ Zenoh router URL: $ZENOH_URL"
-
-          printf "%s" "$ZENOH_URL" > queen_zenoh_url.txt
-          ENCODED=$(base64 -w0 queen_zenoh_url.txt)
-
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n --arg msg "publish zenoh router url" \
-              --arg content "$ENCODED" --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-          else
-            PAYLOAD=$(jq -n --arg msg "publish zenoh router url" \
-              --arg content "$ENCODED" \
-              '{message: $msg, content: $content}')
-          fi
-
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
-            -d "$PAYLOAD"
-
-      - name: Start exo queen with Zenoh config
-        run: |
-          cd exo
-          export EXO_ZENOH_NAMESPACE="exo-cluster"
-          export ZENOH_CONFIG="$HOME/zenoh.json"
-          export EXO_ZENOH_CONFIG="$HOME/zenoh.json"   # both
-          nohup env EXO_ZENOH_NAMESPACE="$EXO_ZENOH_NAMESPACE" ZENOH_CONFIG="$ZENOH_CONFIG" EXO_ZENOH_CONFIG="$EXO_ZENOH_CONFIG" uv run exo --no-worker > exo_queen.log 2>&1 &
-          sleep 10
-          if pgrep -f "uv run exo"; then
-            echo "✅ exo process is running"
-          else
-            echo "❌ exo process not found – showing log:"
-            cat exo_queen.log
-            exit 1
-          fi
-
-      - name: Start Cloudflare tunnel for exo API
-        run: |
-          echo "🌐 Waiting for exo API to be ready..."
-          for i in {1..60}; do
-            if curl -s http://localhost:52415/health > /dev/null; then
-              echo "✅ exo API is ready"
+          echo "👑 Queen waiting for 5 workers..."
+          for attempt in {1..60}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
+              WORKER_COUNT=0
+            else
+              WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
+              WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
+            fi
+            echo "  Attempt $attempt: $WORKER_COUNT workers registered"
+            if [ "$WORKER_COUNT" -ge 5 ]; then
+              echo "✅ All workers registered!"
               break
             fi
-            echo "⏳ Waiting... ($i/60)"
-            sleep 2
-            if [ $i -eq 15 ]; then
-              echo "📄 exo_queen.log (last 30 lines):"
-              tail -30 exo_queen.log || true
-            fi
+            sleep 5
           done
-
-          if ! curl -s http://localhost:52415/health > /dev/null; then
-            echo "❌ exo API failed to start – showing full log:"
-            cat exo_queen.log
+          if [ "$WORKER_COUNT" -lt 5 ]; then
+            echo "❌ Timeout waiting for workers"
             exit 1
           fi
-
-          echo "🌐 Starting Cloudflare tunnel for exo API..."
+          HOLESAIL_URLS=""
+          for file in $WORKER_FILES; do
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
+              > /tmp/worker.json
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+              echo "Found URL: $URL"
+              if [ -n "$HOLESAIL_URLS" ]; then
+                HOLESAIL_URLS="${HOLESAIL_URLS},${URL}"
+              else
+                HOLESAIL_URLS="${URL}"
+              fi
+            fi
+          done
+          if [ -z "$HOLESAIL_URLS" ]; then
+            echo "❌ No valid Holesail URLs found"
+            exit 1
+          fi
+          echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
+      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
+      - name: Connect to workers via Holesail (unique ports)
+        env:
+          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
+        run: |
+          echo "🔗 Connecting to workers via Holesail P2P tunnels..."
+          IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
+          LOCAL_PORT=60000
+          RPC_ADDRS=""
+          for url in "${URLS[@]}"; do
+            echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
+            # Use --port to force client to listen on a specific local port
+            holesail "${url}" --port ${LOCAL_PORT} &
+            if [ -n "$RPC_ADDRS" ]; then
+              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
+            else
+              RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
+            fi
+            LOCAL_PORT=$((LOCAL_PORT + 1))
+          done
+          echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
+          echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
+          sleep 10   # give tunnels time to establish
+      - name: Start llama-server with RPC and Cloudflare tunnel
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          RPC_ADDRS: ${{ env.RPC_ADDRS }}
+        run: |
+          echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
+          ./llama-server \
+            -m model.gguf \
+            -t 3 \
+            -tb 4 \
+            --rpc ${RPC_ADDRS} \
+            -fa on \
+            -c 4096 \
+            &
+          
+          for i in {1..600}; do
+            if curl -s http://localhost:8080/health > /dev/null; then
+              echo "✅ llama-server is ready"
+              break
+            fi
+            echo "⏳ Waiting for llama-server... ($i/600)"
+            sleep 2
+          done
+          if ! curl -s http://localhost:8080/health > /dev/null; then
+            echo "❌ llama-server failed to start"
+            cat server.log
+            exit 1
+          fi
+          echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
-
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:52415 > tunnel.log 2>&1 &
-          sleep 5
-
-          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-          if [ -n "$TUNNEL_URL" ]; then
-            echo "✅ API Tunnel URL: $TUNNEL_URL"
-            echo "::notice::exo API available at $TUNNEL_URL"
-          else
-            echo "⏳ Tunnel still starting – check tunnel.log"
-            tail -20 tunnel.log
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Tunnel URL: $TUNNEL_URL"
+              break
+            fi
+            echo "⏳ Waiting for tunnel... ($i/30)"
+            sleep 3
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL"
+            tail -50 tunnel.log
+            exit 1
           fi
-
+          CHAT_REPO="${{ github.repository_owner }}/chat"
+          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
+          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
+          if [ "$SHA" != "null" ]; then
+            PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+              -d "$PAYLOAD"
+          fi
+          echo "::notice::Frontend URL: https://$CHAT_REPO"
+          echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
-
   worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     strategy:
       matrix:
-        worker_id: [1, 2, 3, 4, 5]
-    timeout-minutes: 360
+        instance: [1, 2, 3, 4, 5]
+
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential nodejs npm netcat-openbsd
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source "$HOME/.cargo/env"
-          rustup toolchain install nightly
-          sudo npm install -g npm@latest
-          sudo npm install -g holesail
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
+      - name: Install Holesail (global)
+        run: sudo npm install -g holesail
 
-      - name: Install zenoh client
+      - name: Build rpc-server
         run: |
-          source "$HOME/.cargo/env"
-          cargo install zenoh --locked
-
-      - name: Clone exo and build dashboard
-        run: |
-          git clone https://github.com/exo-explore/exo.git
-          cd exo/dashboard
-          npm install
-          npm run build
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-b8487
+          mkdir build && cd build
+          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target rpc-server
+          cp bin/rpc-server ../../
           cd ../..
-
-      - name: Install exo Python dependencies
-        run: |
-          cd exo
-          uv sync
-
-      - name: Create Zenoh config file
-        run: |
-          cat > zenoh.json << 'EOF'
-          {
-            "mode": "client",
-            "connect": {
-              "endpoints": ["tcp/127.0.0.1:7447"]
-            },
-            "scouting": {
-              "multicast": {
-                "enabled": false
-              }
-            }
-          }
-          EOF
-          echo "✅ zenoh.json created"
-
-      - name: Fetch Queen's Zenoh router URL from repository
+          chmod +x rpc-server
+      - name: Start RPC server and create Holesail tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
+          INSTANCE_ID: ${{ matrix.instance }}
         run: |
-          echo "📡 Fetching Queen's Zenoh router URL..."
-          ZENOH_URL=""
-          for attempt in {1..60}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+          set -e
+          echo "🐝 Worker $INSTANCE_ID starting..."
+          PORT=50052
+          ./rpc-server -H 0.0.0.0 -p ${PORT} -c &
+          sleep 5
+          echo "Starting Holesail server on port ${PORT}..."
+          holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
+          sleep 5
+          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
+          if [ -z "$CONNECTION_STRING" ]; then
+            echo "❌ Failed to get connection string from Holesail"
+            cat /tmp/holesail_output.txt
+            exit 1
+          fi
+          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
+          WORKER_FILE="workers/hole${INSTANCE_ID}.json"
+          mkdir -p workers
+          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
+          ENCODED=$(base64 -w0 ${WORKER_FILE})
+          for attempt in {1..10}; do
+            echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" 2>/dev/null)
-            URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
-            if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
-              echo "Fetched valid URL: $URL"
-              ZENOH_URL="$URL"
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
+                --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
+                '{message: $msg, content: $content}')
+            fi
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
+              -d "$PAYLOAD")
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+              echo "✅ Worker $INSTANCE_ID registered successfully!"
               break
             fi
-            echo "  Waiting for Queen to publish its Zenoh router URL... ($attempt/60)"
-            sleep 5
+            STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
+            if [ "$STATUS" = "409" ]; then
+              echo "⚠️ Conflict detected – retrying in 3 seconds..."
+              sleep 3
+              continue
+            fi
+            echo "❌ Failed to register worker $INSTANCE_ID"
+            echo "Response: $RESPONSE"
+            exit 1
           done
-          if [ -z "$ZENOH_URL" ]; then
-            echo "❌ Failed to fetch valid Queen's Zenoh router URL"
-            exit 1
-          fi
-          echo "ZENOH_ROUTER_URL=$ZENOH_URL" >> $GITHUB_ENV
-
-      - name: Connect to Queen's Zenoh router via Holesail
-        run: |
-          echo "🔗 Connecting to Queen's Zenoh router at $ZENOH_ROUTER_URL"
-          holesail --connect "$ZENOH_ROUTER_URL" --port 7447 &
-          sleep 10
-          if nc -zv 127.0.0.1 7447 2>&1 | grep -q "succeeded"; then
-            echo "✅ Tunnel to Zenoh router is open on 127.0.0.1:7447"
-          else
-            echo "❌ Tunnel failed – cannot connect to 127.0.0.1:7447"
-            exit 1
-          fi
-
-      - name: Test Zenoh connectivity
-        run: |
-          echo "🧪 Testing Zenoh pub/sub over the tunnel..."
-          # Start a subscriber in the background
-          timeout 10 zenoh sub --config zenoh.json --key "test" --listen "tcp/127.0.0.1:7447" > /tmp/sub.log 2>&1 &
-          sleep 2
-          # Publish a message
-          echo "Hello from worker" | zenoh pub --config zenoh.json --key "test" --listen "tcp/127.0.0.1:7447" --value -
-          sleep 2
-          if grep -q "Hello from worker" /tmp/sub.log; then
-            echo "✅ Zenoh pub/sub over tunnel works!"
-          else
-            echo "❌ Zenoh pub/sub failed – check connectivity"
-            cat /tmp/sub.log
-            exit 1
-          fi
-
-      - name: Run exo worker with Zenoh config file
-        env:
-          EXO_ZENOH_NAMESPACE: "exo-cluster"
-          ZENOH_CONFIG: "$HOME/zenoh.json"
-          EXO_ZENOH_CONFIG: "$HOME/zenoh.json"
-        run: |
-          cd exo
-          echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          nohup env EXO_ZENOH_NAMESPACE="$EXO_ZENOH_NAMESPACE" ZENOH_CONFIG="$ZENOH_CONFIG" EXO_ZENOH_CONFIG="$EXO_ZENOH_CONFIG" uv run exo > exo_worker.log 2>&1 &
-          sleep 20
-          echo "📄 exo_worker.log (first 50 lines):"
-          head -50 exo_worker.log || true
-          pgrep -f "exo" && echo "✅ Worker exo is running" || echo "⚠️ Worker exo not found"
-          sleep infinity
+          while true; do
+            if ! pgrep -f "rpc-server" > /dev/null; then
+              echo "⚠️ RPC server died, restarting..."
+              ./rpc-server -H 0.0.0.0 -p ${PORT} -c &
+            fi
+            if ! pgrep -f "holesail" > /dev/null; then
+              echo "⚠️ Holesail server died, restarting..."
+              holesail --live ${PORT} &
+            fi
+            sleep 30
+          done
