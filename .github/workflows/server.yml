@@ -19,26 +19,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl jq build-essential nodejs npm
-          # Install uv (Python package manager)
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          # Install Rust (for zenohd)
+          # Install Rust (for cargo install)
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           source "$HOME/.cargo/env"
           rustup toolchain install nightly
-          # Install Node.js dependencies for dashboard build
           sudo npm install -g npm@latest
-          # Install Holesail globally
           sudo npm install -g holesail
 
-      - name: Install zenohd (router)
+      - name: Install zenohd (router) via cargo
         run: |
-          # Download the latest standalone Linux binary from Eclipse's official repo
-          curl -L "https://download.eclipse.org/zenoh/zenoh/latest/zenoh-1.9.0-x86_64-unknown-linux-gnu-standalone.zip" -o zenohd.zip
-          unzip zenohd.zip
-          chmod +x zenohd
-          sudo mv zenohd /usr/local/bin/
+          source "$HOME/.cargo/env"
+          cargo install zenohd --locked
+          zenohd --version
 
-      - name: Clone exo (for dashboard and API)
+      - name: Clone exo and build dashboard
         run: |
           git clone https://github.com/exo-explore/exo.git
           cd exo/dashboard
@@ -107,7 +102,7 @@ jobs:
   #  WORKERS – each joins the cluster via the Queen's Zenoh router
   # ============================================================
   worker:
-    needs: queen   # Queen must publish its URL first
+    needs: queen
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -161,16 +156,12 @@ jobs:
         run: |
           echo "🔗 Connecting to Queen's Zenoh router at $ZENOH_ROUTER_URL"
           holesail --connect "$ZENOH_ROUTER_URL" --port 7447 &
-          # Give the tunnel time to establish
           sleep 5
 
       - name: Run exo worker
         env:
-          # Tell exo to use the local forwarded router
           ZENOH_CONFIG: '{"connect": {"endpoints": ["tcp/localhost:7447"]}}'
         run: |
           cd exo
-          # Start exo – it will auto‑discover other workers via Zenoh
           uv run exo &
-          # Keep the job alive
           sleep infinity
