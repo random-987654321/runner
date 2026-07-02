@@ -99,7 +99,7 @@ jobs:
               break
             fi
             echo "⏳ Waiting... ($i/30)"
-            sleep 2
+            sleep 5
           done
 
           if ! curl -s http://localhost:52415/health > /dev/null; then
