@@ -61,9 +61,11 @@ jobs:
           fi
           echo "✅ Zenoh router URL: $ZENOH_URL"
 
+          # Write URL to a file and base64 encode
           echo "$ZENOH_URL" > queen_zenoh_url.txt
           ENCODED=$(base64 -w0 queen_zenoh_url.txt)
 
+          # Try to create/update the file in the repo
           FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt")
@@ -94,13 +96,13 @@ jobs:
           sleep infinity
 
   # ============================================================
-  #  WORKERS – start in parallel with queen
+  #  WORKERS – 19 nodes, start in parallel with queen
   # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        worker_id: [1, 2, 3, 4, 5]
     timeout-minutes: 360
     steps:
       - name: Install dependencies
@@ -128,6 +130,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           echo "📡 Fetching Queen's Zenoh router URL..."
+          ZENOH_URL=""
           for attempt in {1..30}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -135,16 +138,17 @@ jobs:
             URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null)
             if [ -n "$URL" ] && [ "$URL" != "null" ]; then
               echo "Fetched URL: $URL"
-              echo "ZENOH_ROUTER_URL=$URL" >> $GITHUB_ENV
+              ZENOH_URL="$URL"
               break
             fi
             echo "  Waiting for Queen to publish its Zenoh router URL... ($attempt/30)"
             sleep 5
           done
-          if [ -z "$ZENOH_ROUTER_URL" ]; then
+          if [ -z "$ZENOH_URL" ]; then
             echo "❌ Failed to fetch Queen's Zenoh router URL"
             exit 1
           fi
+          echo "ZENOH_ROUTER_URL=$ZENOH_URL" >> $GITHUB_ENV
 
       - name: Connect to Queen's Zenoh router via Holesail
         run: |
