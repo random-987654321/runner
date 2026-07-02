@@ -189,11 +189,9 @@ jobs:
                 -t 4 \
                 -tb 4 \
                 -c 4096 \
-                --host 0.0.0.0 \
-                --port 8080 \
                 > server.log 2>&1 &
 
-          for i in {1..20}; do
+          for i in {1..600}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
               break
