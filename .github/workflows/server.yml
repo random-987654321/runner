@@ -1,4 +1,4 @@
-name: Exo Distributed Cluster (5 Workers + Queen)
+name: Exo Distributed Cluster (20 Nodes)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   # ============================================================
-  #  QUEEN – Zenoh router + API server + Cloudflare tunnel
+  #  QUEEN – starts Zenoh router and API server (no worker)
   # ============================================================
   queen:
     runs-on: ubuntu-latest
@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential nodejs npm
+          sudo apt-get install -y curl jq build-essential nodejs npm netcat-openbsd
           curl -LsSf https://astral.sh/uv/install.sh | sh
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           source "$HOME/.cargo/env"
@@ -55,31 +55,26 @@ jobs:
 
           ZENOH_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_zenoh.txt | head -1)
           if [ -z "$ZENOH_URL" ]; then
-            echo "❌ Failed to get Holesail URL for Zenoh router"
+            echo "❌ Failed to get Holesail URL"
             cat /tmp/holesail_zenoh.txt
             exit 1
           fi
           echo "✅ Zenoh router URL: $ZENOH_URL"
 
-          # Write URL to a file and base64 encode
           echo "$ZENOH_URL" > queen_zenoh_url.txt
           ENCODED=$(base64 -w0 queen_zenoh_url.txt)
 
-          # Try to create/update the file in the repo
           FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt")
           SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
 
           if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n \
-              --arg msg "publish zenoh router url" \
-              --arg content "$ENCODED" \
-              --arg sha "$SHA" \
+            PAYLOAD=$(jq -n --arg msg "publish zenoh router url" \
+              --arg content "$ENCODED" --arg sha "$SHA" \
               '{message: $msg, content: $content, sha: $sha}')
           else
-            PAYLOAD=$(jq -n \
-              --arg msg "publish zenoh router url" \
+            PAYLOAD=$(jq -n --arg msg "publish zenoh router url" \
               --arg content "$ENCODED" \
               '{message: $msg, content: $content}')
           fi
@@ -93,48 +88,55 @@ jobs:
         run: |
           cd exo
           uv run exo --no-worker &
-          # Give exo a moment to start
-          sleep 10
+          sleep 10   # give it a moment to bind
 
-      - name: Start Cloudflare Tunnel and print public URL
+      - name: Start Cloudflare tunnel for exo API
         run: |
-          echo "🌐 Starting Cloudflare tunnel..."
+          echo "🌐 Waiting for exo API to be ready..."
+          for i in {1..30}; do
+            if curl -s http://localhost:52415/health > /dev/null; then
+              echo "✅ exo API is ready"
+              break
+            fi
+            echo "⏳ Waiting... ($i/30)"
+            sleep 2
+          done
+
+          if ! curl -s http://localhost:52415/health > /dev/null; then
+            echo "❌ exo API failed to start"
+            exit 1
+          fi
+
+          echo "🌐 Starting Cloudflare tunnel for exo API..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
+
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:52415 > tunnel.log 2>&1 &
+          sleep 5
 
-          # Wait for the tunnel URL to appear in logs
-          TUNNEL_URL=""
-          for i in {1..30}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "✅ Cloudflare Tunnel URL: $TUNNEL_URL"
-              echo "::notice title=Public UI URL::Click here to open the exo dashboard: $TUNNEL_URL"
-              break
-            fi
-            echo "⏳ Waiting for tunnel... ($i/30)"
-            sleep 3
-          done
-
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get tunnel URL – tailing logs:"
-            tail -50 tunnel.log
-            exit 1
+          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "✅ API Tunnel URL: $TUNNEL_URL"
+            echo "::notice::exo API available at $TUNNEL_URL"
+          else
+            echo "⏳ Tunnel still starting – check tunnel.log"
+            tail -20 tunnel.log
           fi
 
-          # Keep the runner alive
+          # Keep runner alive
           sleep infinity
 
   # ============================================================
-  #  WORKERS – 5 nodes, start in parallel with queen
+  #  WORKERS – join the cluster via the Zenoh router
   # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        worker_id: [1, 2, 3, 4, 5]   # Change to 19 for full deployment
+        # For production: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+        worker_id: [1, 2, 3, 4, 5]   # change to 19 for full cluster
     timeout-minutes: 360
     steps:
       - name: Install dependencies
@@ -182,7 +184,7 @@ jobs:
           fi
           echo "ZENOH_ROUTER_URL=$ZENOH_URL" >> $GITHUB_ENV
 
-      - name: Connect to Queen's Zenoh router via Holesail and verify
+      - name: Connect to Queen's Zenoh router via Holesail
         run: |
           echo "🔗 Connecting to Queen's Zenoh router at $ZENOH_ROUTER_URL"
           holesail --connect "$ZENOH_ROUTER_URL" --port 7447 &
