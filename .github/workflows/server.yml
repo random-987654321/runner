@@ -168,7 +168,7 @@ jobs:
           nohup ./llama-server \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
-                -ts 1,1,1,1,1 / 
+                -ts 1,1,1,1,1 \ 
                 --numa distribute \
                 -fa on \
                 -ngl 0 \
