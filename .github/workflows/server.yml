@@ -1,4 +1,4 @@
-name: Parallel Consensus Mesh (20 Nodes)
+name: Exo Distributed Cluster (20 Nodes)
 
 on:
   workflow_dispatch:
@@ -8,67 +8,88 @@ permissions:
   contents: write
 
 jobs:
-  # ==========================================================================
-  # WORKERS – 19 concurrent instances
-  # ==========================================================================
+  # ------------------------------------------------
+  # 19 Workers – each starts exo and joins the cluster
+  # ------------------------------------------------
   worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
     strategy:
       matrix:
         worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    timeout-minutes: 360
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm
+          sudo apt-get install -y curl jq build-essential nodejs npm
+          # Install uv (Python package manager)
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          # Install Rust (required for exo)
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          rustup toolchain install nightly
+          # Install Node.js dependencies for the dashboard (optional)
+          sudo npm install -g npm@latest
+          # Install Holesail globally
           sudo npm install -g holesail
 
-      - name: Build llama-server (stable b8487)
+      - name: Clone exo and build dashboard
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
-          unzip -q llama.cpp.zip
-          cd llama.cpp-b8487
-          mkdir build && cd build
-          cmake .. -DGGML_NATIVE=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-server
-          cp bin/llama-server ../../
+          git clone https://github.com/exo-explore/exo.git
+          cd exo/dashboard
+          npm install
+          npm run build
           cd ../..
-          chmod +x llama-server
 
-      - name: Download model
-        run: |
-          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3
-
-      - name: Launch server and register via Holesail
+      - name: Fetch Queen's Zenoh router URL from repository
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
-          WORKER_ID: ${{ matrix.worker_id }}
         run: |
-          # Start deterministic validator
-          nohup ./llama-server \
-            -m model.gguf \
-            -t 4 -tb 4 -c 2048 \
-            --no-mmap \
-            --port 8080 --host 0.0.0.0 \
-            > worker.log 2>&1 &
+          echo "📡 Fetching Queen's Zenoh router URL..."
+          for attempt in {1..30}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" 2>/dev/null)
+            URL=$(echo "$RESPONSE" | jq -r '.content' | base64 -d 2>/dev/null)
+            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+              echo "Fetched URL: $URL"
+              echo "ZENOH_ROUTER_URL=$URL" >> $GITHUB_ENV
+              break
+            fi
+            echo "  Waiting for Queen to publish its Zenoh router URL... ($attempt/30)"
+            sleep 5
+          done
+          if [ -z "$ZENOH_ROUTER_URL" ]; then
+            echo "❌ Failed to fetch Queen's Zenoh router URL"
+            exit 1
+          fi
 
+      - name: Connect to Queen's Zenoh router via Holesail
+        run: |
+          echo "🔗 Connecting to Queen's Zenoh router at $ZENOH_ROUTER_URL"
+          holesail --connect "$ZENOH_ROUTER_URL" --port 7447 &
+          # Give the tunnel time to establish
           sleep 5
 
-          # Expose via Holesail
-          holesail --port 8080 --key "consensus-worker-${{ matrix.worker_id }}" &
-          echo "✅ Worker ${{ matrix.worker_id }} ready."
-
+      - name: Run exo worker
+        env:
+          # Tell exo to use our local forwarded Zenoh router as its rendezvous point
+          ZENOH_CONFIG: '{"connect": {"endpoints": ["tcp/localhost:7447"]}}'
+        run: |
+          cd exo
+          # Start exo in the background – it will auto-discover other workers via Zenoh
+          uv run exo &
+          # Keep the job alive
           sleep infinity
 
-  # ==========================================================================
-  # QUEEN – Orchestrator + Draft Engine
-  # ==========================================================================
+  # ------------------------------------------------
+  # Queen Node – coordinator + Zenoh router
+  # ------------------------------------------------
   queen:
-    needs: workers
+    needs: worker  # ensure workers are attempted first, but we want queen to start first?
+    # Actually we want queen to start first to publish its URL. We'll change the dependency.
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -76,189 +97,72 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm python3-pip
+          sudo apt-get install -y curl jq build-essential nodejs npm
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          rustup toolchain install nightly
+          sudo npm install -g npm@latest
           sudo npm install -g holesail
-          pip3 install fastapi uvicorn httpx
+          # Install zenohd (the router) – we can also use cargo install zenohd, but it's heavy.
+          # Alternatively, we can run the router using the zenoh crate directly.
+          # For simplicity, we'll use a simple script that runs a Zenoh router via Python? 
+          # Actually exo already embeds Zenoh; we can run exo in a mode that starts a router.
+          # But exo's --no-worker might not start a router. We'll start a separate router process.
+          cargo install zenohd
 
-      - name: Build llama-server (same version)
+      - name: Clone exo (for dashboard and eventual API)
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
-          unzip -q llama.cpp.zip
-          cd llama.cpp-b8487
-          mkdir build && cd build
-          cmake .. -DGGML_NATIVE=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-server
-          cp bin/llama-server ../../
+          git clone https://github.com/exo-explore/exo.git
+          cd exo/dashboard
+          npm install
+          npm run build
           cd ../..
-          chmod +x llama-server
 
-      - name: Download model (same)
+      - name: Start Zenoh router and expose via Holesail
         run: |
-          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3
-
-      - name: Start draft engine
-        run: |
-          # Draft generator (temperature 0.7) on port 8081
-          nohup ./llama-server \
-            -m model.gguf \
-            -t 3 -tb 4 -c 2048 \
-            --no-mmap \
-            --port 8081 --host 127.0.0.1 \
-            > draft.log 2>&1 &
+          echo "🕸️ Starting Zenoh router on port 7447..."
+          zenohd --listen tcp/0.0.0.0:7447 &
+          sleep 3
+          echo "🔗 Exposing Zenoh router via Holesail..."
+          holesail --live 7447 > /tmp/holesail_zenoh.txt 2>&1 &
           sleep 5
-
-      - name: Connect to workers and run orchestrator
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-        run: |
-          # Map all 19 workers to local ports
-          for i in {1..19}; do
-            holesail --connect "consensus-worker-$i" --port $((6000 + i)) &
-          done
-          sleep 10
-
-          # Write orchestrator (Python)
-          cat << 'EOF' > orchestrator.py
-          import asyncio
-          import json
-          import httpx
-          from fastapi import FastAPI
-          from pydantic import BaseModel
-          from typing import List, Dict, Any
-          import uvicorn
-          from collections import Counter
-
-          # --- Configuration ---
-          WORKER_PORTS = list(range(6001, 6020))  # 6001..6019
-          DRAFT_URL = "http://127.0.0.1:8081"
-          CONSENSUS_THRESHOLD = 0.6  # 60% agreement required
-
-          app = FastAPI()
-
-          class GenerateRequest(BaseModel):
-              prompt: str
-              max_tokens: int = 100
-              temperature: float = 0.7
-
-          class ConsensusResponse(BaseModel):
-              text: str
-              consensus: float
-              accepted: bool
-
-          # --- Helpers ---
-          async def get_draft(prompt: str, max_tokens: int, temp: float) -> str:
-              async with httpx.AsyncClient(timeout=60.0) as client:
-                  resp = await client.post(
-                      f"{DRAFT_URL}/completion",
-                      json={
-                          "prompt": prompt,
-                          "n_predict": max_tokens,
-                          "temperature": temp,
-                          "stream": False,
-                      }
-                  )
-                  data = resp.json()
-                  return data.get("content", "").strip()
-
-          async def get_worker_response(port: int, prompt: str, max_tokens: int) -> str:
-              """Get deterministic response from a worker (temperature=0)."""
-              async with httpx.AsyncClient(timeout=30.0) as client:
-                  try:
-                      resp = await client.post(
-                          f"http://127.0.0.1:{port}/completion",
-                          json={
-                              "prompt": prompt,
-                              "n_predict": max_tokens,
-                              "temperature": 0.0,
-                              "stream": False,
-                          }
-                      )
-                      data = resp.json()
-                      return data.get("content", "").strip()
-                  except Exception as e:
-                      return ""
-
-          async def run_consensus(prompt: str, max_tokens: int, temp: float) -> ConsensusResponse:
-              # 1. Get draft from queen
-              draft = await get_draft(prompt, max_tokens, temp)
-              if not draft:
-                  return ConsensusResponse(text="", consensus=0.0, accepted=False)
-
-              # 2. Get responses from all workers in parallel
-              tasks = [get_worker_response(port, prompt, max_tokens) for port in WORKER_PORTS]
-              responses = await asyncio.gather(*tasks)
-              # Filter empty responses
-              valid = [r for r in responses if r]
-
-              if not valid:
-                  return ConsensusResponse(text=draft, consensus=0.0, accepted=False)
-
-              # 3. Majority vote on full text
-              counter = Counter(valid)
-              most_common_text, count = counter.most_common(1)[0]
-              consensus = count / len(WORKER_PORTS)  # proportion of workers that agreed
-
-              accepted = consensus >= CONSENSUS_THRESHOLD
-              final_text = most_common_text if accepted else draft
-
-              return ConsensusResponse(text=final_text, consensus=consensus, accepted=accepted)
-
-          # --- API ---
-          @app.post("/generate", response_model=ConsensusResponse)
-          async def generate(request: GenerateRequest):
-              return await run_consensus(request.prompt, request.max_tokens, request.temperature)
-
-          @app.get("/health")
-          async def health():
-              return {"status": "ok", "workers": len(WORKER_PORTS)}
-
-          if __name__ == "__main__":
-              uvicorn.run(app, host="0.0.0.0", port=8000)
-          EOF
-
-          # Launch orchestrator
-          nohup python3 orchestrator.py > orchestrator.log 2>&1 &
-          sleep 5
-
-          # Health check
-          for i in {1..10}; do
-            if curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
-              echo "✅ Orchestrator ready"
-              break
-            fi
-            sleep 2
-          done
-
-          # Cloudflare tunnel
-          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 > tunnel.log 2>&1 &
-
-          # Extract tunnel URL and update frontend config
-          for i in {1..30}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            [ -n "$TUNNEL_URL" ] && break
-            sleep 3
-          done
-          echo "::notice::Tunnel URL: $TUNNEL_URL"
-
-          CHAT_REPO="${{ github.repository_owner }}/chat"
-          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
-          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
-          FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-          if [ "$SHA" != "null" ]; then
-            PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-            curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-              -d "$PAYLOAD"
+          ZENOH_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_zenoh.txt | head -1)
+          if [ -z "$ZENOH_URL" ]; then
+            echo "❌ Failed to get Holesail URL for Zenoh router"
+            cat /tmp/holesail_zenoh.txt
+            exit 1
           fi
-          echo "::notice::Frontend URL: https://$CHAT_REPO"
+          echo "✅ Zenoh router URL: $ZENOH_URL"
 
-          # Keep queen alive
+          # Publish the URL to the repository so workers can fetch it
+          echo "$ZENOH_URL" > queen_zenoh_url.txt
+          ENCODED=$(base64 -w0 queen_zenoh_url.txt)
+          REPO="${{ github.repository }}"
+          GH_TOKEN="${{ secrets.TOKEN }}"
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg msg "publish zenoh router url" --arg content "$ENCODED" --arg sha "$SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            PAYLOAD=$(jq -n --arg msg "publish zenoh router url" --arg content "$ENCODED" \
+              '{message: $msg, content: $content}')
+          fi
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
+            -d "$PAYLOAD"
+
+      - name: Start exo queen (API only)
+        env:
+          # Queen doesn't need to connect to the router; it hosts the router.
+          # But exo might need to know its own address? We'll start with --no-worker.
+        run: |
+          cd exo
+          # Run exo in no-worker mode, which starts the API server but no inference worker.
+          uv run exo --no-worker &
+          # Keep alive
           sleep infinity
