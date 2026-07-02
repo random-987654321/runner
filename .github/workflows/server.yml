@@ -1,4 +1,4 @@
-name: P2P Inference Mesh (Holesail)
+name: P2P Inference Mesh – Adaptive Speculative RPC
 
 on:
   workflow_dispatch:
@@ -7,238 +7,28 @@ permissions:
   actions: write
   contents: write
 
+env:
+  WORKER_COUNT: 19               # change to 5 for testing
+  DRAFT_MODEL_URL: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+  MAIN_MODEL_URL: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
+
 jobs:
-  queen:
+  # ---------------------------------------------
+  # 19 Workers – run rpc-server and register
+  # ---------------------------------------------
+  workers:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Clean workers directory
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "🧹 Cleaning workers directory..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
-            if [ -n "$name" ] && [ -n "$sha" ]; then
-              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
-                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
-            fi
-          done
-          echo "✅ Cleanup done."
-      - name: Create workers directory
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "📁 Creating fresh workers directory..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/.keep" 2>/dev/null)
-          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
-          echo "" | base64 -w0 > empty_keep
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\",\"sha\":\"${SHA}\"}" || true
-          else
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
-          fi
-          echo "✅ workers directory ready."
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
-      - name: Install Holesail (global)
-        run: sudo npm install -g holesail
-
-      - name: Build llama-server with RPC support
-        run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
-          unzip -q llama.cpp.zip
-          cd llama.cpp-b8487
-          mkdir build && cd build
-          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-server
-          cp bin/llama-server ../../
-          cd ../..
-          chmod +x llama-server
-          if ./llama-server --help 2>&1 | grep -q rpc; then
-            echo "✅ llama-server RPC support enabled"
-          else
-            echo "❌ llama-server RPC support missing"
-            exit 1
-          fi
-      - name: Download model
-        run: |
-          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
-          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
-            echo "✅ Valid GGUF file downloaded"
-          else
-            echo "❌ Invalid GGUF file"
-            exit 1
-          fi
-      - name: Wait for workers and collect Holesail URLs
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "👑 Queen waiting for 5 workers..."
-          for attempt in {1..60}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
-              WORKER_COUNT=0
-            else
-              WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
-              WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
-            fi
-            echo "  Attempt $attempt: $WORKER_COUNT workers registered"
-            if [ "$WORKER_COUNT" -ge 5 ]; then
-              echo "✅ All workers registered!"
-              break
-            fi
-            sleep 5
-          done
-          if [ "$WORKER_COUNT" -lt 5 ]; then
-            echo "❌ Timeout waiting for workers"
-            exit 1
-          fi
-          HOLESAIL_URLS=""
-          for file in $WORKER_FILES; do
-            curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
-              > /tmp/worker.json
-            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
-            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-              echo "Found URL: $URL"
-              if [ -n "$HOLESAIL_URLS" ]; then
-                HOLESAIL_URLS="${HOLESAIL_URLS},${URL}"
-              else
-                HOLESAIL_URLS="${URL}"
-              fi
-            fi
-          done
-          if [ -z "$HOLESAIL_URLS" ]; then
-            echo "❌ No valid Holesail URLs found"
-            exit 1
-          fi
-          echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
-      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
-      - name: Connect to workers via Holesail (unique ports)
-        env:
-          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
-        run: |
-          echo "🔗 Connecting to workers via Holesail P2P tunnels..."
-          IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
-          LOCAL_PORT=60000
-          RPC_ADDRS=""
-          for url in "${URLS[@]}"; do
-            echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
-            # Use --port to force client to listen on a specific local port
-            holesail "${url}" --port ${LOCAL_PORT} &
-            if [ -n "$RPC_ADDRS" ]; then
-              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
-            else
-              RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
-            fi
-            LOCAL_PORT=$((LOCAL_PORT + 1))
-          done
-          echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
-          echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
-          sleep 10   # give tunnels time to establish
-      - name: Start llama-server with RPC and Cloudflare tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          RPC_ADDRS: ${{ env.RPC_ADDRS }}
-        run: |
-          echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
-          ./llama-server \
-            -m model.gguf \
-            -t 3 \
-            -tb 4 \
-            --rpc ${RPC_ADDRS} \
-            -fa on \
-            -c 4096 \
-            &
-          
-          for i in {1..600}; do
-            if curl -s http://localhost:8080/health > /dev/null; then
-              echo "✅ llama-server is ready"
-              break
-            fi
-            echo "⏳ Waiting for llama-server... ($i/600)"
-            sleep 2
-          done
-          if ! curl -s http://localhost:8080/health > /dev/null; then
-            echo "❌ llama-server failed to start"
-            cat server.log
-            exit 1
-          fi
-          echo "🌐 Starting Cloudflare tunnel..."
-          if [ ! -f ./cloudflared ]; then
-            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x cloudflared
-          fi
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
-          for i in {1..30}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "✅ Tunnel URL: $TUNNEL_URL"
-              break
-            fi
-            echo "⏳ Waiting for tunnel... ($i/30)"
-            sleep 3
-          done
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get tunnel URL"
-            tail -50 tunnel.log
-            exit 1
-          fi
-          CHAT_REPO="${{ github.repository_owner }}/chat"
-          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
-          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-          if [ "$SHA" != "null" ]; then
-            PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-              -d "$PAYLOAD"
-          fi
-          echo "::notice::Frontend URL: https://$CHAT_REPO"
-          echo "🔄 Queen is serving. Keeping alive..."
-          sleep infinity
-  worker:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5]
+        worker_id: [1, 2, 3, 4, 5]
+    timeout-minutes: 360
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
-      - name: Install Holesail (global)
-        run: sudo npm install -g holesail
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm
+          sudo npm install -g holesail
 
       - name: Build rpc-server
         run: |
@@ -251,75 +41,221 @@ jobs:
           cp bin/rpc-server ../../
           cd ../..
           chmod +x rpc-server
-      - name: Start RPC server and create Holesail tunnel
+
+      - name: Start rpc-server and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
-          INSTANCE_ID: ${{ matrix.instance }}
+          WORKER_ID: ${{ matrix.worker_id }}
         run: |
           set -e
-          echo "🐝 Worker $INSTANCE_ID starting..."
           PORT=50052
-          ./rpc-server -H 0.0.0.0 -p ${PORT} -c &
-          sleep 5
-          echo "Starting Holesail server on port ${PORT}..."
+          # Use all 4 vCPUs for the RPC server
+          nohup ./rpc-server -H 0.0.0.0 -p ${PORT} -t 4 -c > rpc.log 2>&1 &
+          sleep 3
+
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
           sleep 5
           CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
           if [ -z "$CONNECTION_STRING" ]; then
-            echo "❌ Failed to get connection string from Holesail"
+            echo "❌ Failed to get Holesail URL"
             cat /tmp/holesail_output.txt
             exit 1
           fi
-          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
-          WORKER_FILE="workers/hole${INSTANCE_ID}.json"
+
+          echo "✅ Worker $WORKER_ID: ${CONNECTION_STRING}"
           mkdir -p workers
-          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
-          ENCODED=$(base64 -w0 ${WORKER_FILE})
+          echo "{\"url\": \"${CONNECTION_STRING}\"}" > workers/worker${WORKER_ID}.json
+          ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
+
           for attempt in {1..10}; do
-            echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
             FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+              "https://api.github.com/repos/${REPO}/contents/workers/worker${WORKER_ID}.json")
             SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
             if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-              PAYLOAD=$(jq -n \
-                --arg msg "register worker $INSTANCE_ID" \
-                --arg content "$ENCODED" \
-                --arg sha "$SHA" \
+              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" \
+                --arg content "$ENCODED" --arg sha "$SHA" \
                 '{message: $msg, content: $content, sha: $sha}')
             else
-              PAYLOAD=$(jq -n \
-                --arg msg "register worker $INSTANCE_ID" \
+              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" \
                 --arg content "$ENCODED" \
                 '{message: $msg, content: $content}')
             fi
             RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
+              "https://api.github.com/repos/${REPO}/contents/workers/worker${WORKER_ID}.json" \
               -d "$PAYLOAD")
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker $INSTANCE_ID registered successfully!"
+              echo "✅ Worker $WORKER_ID registered"
               break
             fi
-            STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
-            if [ "$STATUS" = "409" ]; then
-              echo "⚠️ Conflict detected – retrying in 3 seconds..."
-              sleep 3
-              continue
-            fi
-            echo "❌ Failed to register worker $INSTANCE_ID"
-            echo "Response: $RESPONSE"
-            exit 1
+            sleep 3
           done
+
+          # Keep alive with restart logic
           while true; do
             if ! pgrep -f "rpc-server" > /dev/null; then
-              echo "⚠️ RPC server died, restarting..."
-              ./rpc-server -H 0.0.0.0 -p ${PORT} -c &
+              echo "⚠️ rpc-server died, restarting..."
+              nohup ./rpc-server -H 0.0.0.0 -p ${PORT} -t 4 -c > rpc.log 2>&1 &
             fi
             if ! pgrep -f "holesail" > /dev/null; then
-              echo "⚠️ Holesail server died, restarting..."
-              holesail --live ${PORT} &
+              echo "⚠️ Holesail died, restarting..."
+              holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
             fi
             sleep 30
           done
+
+  # ---------------------------------------------
+  # Queen – coordinator with adaptive RPC + speculation
+  # ---------------------------------------------
+  queen:
+    needs: workers
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm netcat-openbsd
+          sudo npm install -g holesail
+
+      - name: Build llama-server (with RPC)
+        run: |
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-b8487
+          mkdir build && cd build
+          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target llama-server
+          cp bin/llama-server ../../
+          cd ../..
+          chmod +x llama-server
+
+      - name: Download main model (the large one)
+        run: |
+          curl -L -o main.gguf "$MAIN_MODEL_URL" -f --retry 3
+
+      - name: Download draft model (smaller, for speculation)
+        run: |
+          curl -L -o draft.gguf "$DRAFT_MODEL_URL" -f --retry 3
+
+      - name: Clean and wait for workers
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Clean old worker files
+          echo "🧹 Cleaning workers/ directory..."
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
+            if [ -n "$name" ] && [ -n "$sha" ]; then
+              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
+                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
+            fi
+          done
+
+          echo "👑 Waiting for $WORKER_COUNT workers..."
+          for attempt in {1..90}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
+              COUNT=0
+            else
+              FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
+              COUNT=$(echo "$FILES" | grep -c . || echo 0)
+            fi
+            echo "  Attempt $attempt: $COUNT/$WORKER_COUNT registered"
+            if [ "$COUNT" -ge $WORKER_COUNT ]; then break; fi
+            sleep 5
+          done
+          if [ "$COUNT" -lt $WORKER_COUNT ]; then
+            echo "❌ Timeout waiting for workers"
+            exit 1
+          fi
+
+      - name: Connect to workers and build adaptive RPC list
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🔗 Connecting to $WORKER_COUNT workers..."
+          BASE_PORT=60000
+          RPC_ADDRS=""
+          for i in $(seq 1 $WORKER_COUNT); do
+            file="worker${i}.json"
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/workers/${file}" > /tmp/worker.json
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+              echo "❌ Worker $i URL missing"
+              exit 1
+            fi
+            PORT=$((BASE_PORT + i - 1))
+            holesail --connect "$URL" --port $PORT &
+            if [ -z "$RPC_ADDRS" ]; then
+              RPC_ADDRS="127.0.0.1:${PORT}"
+            else
+              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${PORT}"
+            fi
+          done
+          echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
+          echo "✅ All workers connected. RPC list: $RPC_ADDRS"
+          sleep 10  # let tunnels stabilise
+
+      - name: Start llama-server with adaptive speculation and micro‑batching
+        env:
+          RPC_ADDRS: ${{ env.RPC_ADDRS }}
+        run: |
+          echo "🚀 Starting llama-server with adaptive RPC + speculation..."
+          nohup ./llama-server \
+            -m main.gguf \
+            -md draft.gguf \
+            --draft 8 \
+            -t 2 \
+            -tb 4 \
+            --rpc ${RPC_ADDRS} \
+            -fa on \
+            -ngl 0 \
+            -c 2048 \
+            --no-mmap \
+            > server.log 2>&1 &
+
+          # Health check with retry
+          for i in {1..120}; do
+            if curl -s http://localhost:8080/health > /dev/null; then
+              echo "✅ llama-server ready"
+              break
+            fi
+            echo "⏳ Waiting for server... ($i/120)"
+            sleep 2
+          done
+          if ! curl -s http://localhost:8080/health > /dev/null; then
+            echo "❌ llama-server failed – showing log:"
+            cat server.log
+            exit 1
+          fi
+
+          # Cloudflare tunnel
+          if [ ! -f ./cloudflared ]; then
+            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x cloudflared
+          fi
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
+          sleep 5
+          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "✅ Public API: $TUNNEL_URL"
+            echo "::notice::API available at $TUNNEL_URL"
+          else
+            echo "⚠️ Tunnel not ready – check tunnel.log"
+          fi
+
+          # Keep alive
+          sleep infinity
