@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential nodejs npm netcat-openbsd
+          sudo apt-get install -y curl jq build-essential nodejs npm netcat-openbsd net-tools
           curl -LsSf https://astral.sh/uv/install.sh | sh
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           source "$HOME/.cargo/env"
@@ -60,6 +60,11 @@ jobs:
           npm run build
           cd ../..
 
+      - name: Install exo Python dependencies
+        run: |
+          cd exo
+          uv sync
+
       - name: Start Zenoh router and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -81,7 +86,6 @@ jobs:
           fi
           echo "✅ Zenoh router URL: $ZENOH_URL"
 
-          # Write URL cleanly (no extra spaces)
           printf "%s" "$ZENOH_URL" > queen_zenoh_url.txt
           ENCODED=$(base64 -w0 queen_zenoh_url.txt)
 
@@ -105,41 +109,56 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
             -d "$PAYLOAD"
 
-      - name: Start exo queen (API only) with correct Zenoh config
+      - name: Start exo queen (API only) with Zenoh config
         run: |
           cd exo
           export ZENOH_CONFIG='{"mode": "client", "connect": {"endpoints": ["tcp/localhost:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
           echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          nohup env ZENOH_CONFIG="$ZENOH_CONFIG" uv run exo --no-worker > exo_queen.log 2>&1 &
-          sleep 10
-          if pgrep -f "exo"; then
-            echo "✅ exo process is running"
+          # Run exo in the background and capture logs
+          uv run exo --no-worker > exo_queen.log 2>&1 &
+          EXO_PID=$!
+          echo "exo PID: $EXO_PID"
+          sleep 5
+
+          # Check if process is running
+          if kill -0 $EXO_PID 2>/dev/null; then
+            echo "✅ exo process is running (PID $EXO_PID)"
           else
-            echo "❌ exo process not found – showing log:"
+            echo "❌ exo process died immediately – showing log:"
             cat exo_queen.log
             exit 1
           fi
 
-      - name: Start Cloudflare tunnel for exo API
+      - name: Wait for exo API and start Cloudflare tunnel
         run: |
           echo "🌐 Waiting for exo API to be ready..."
           for i in {1..60}; do
-            if curl -s http://localhost:52415/health > /dev/null; then
+            if netstat -tlnp 2>/dev/null | grep -q ':52415.*LISTEN'; then
+              echo "✅ Port 52415 is listening"
+              break
+            fi
+            if curl -s http://localhost:52415/health > /dev/null 2>&1; then
               echo "✅ exo API is ready"
               break
             fi
             echo "⏳ Waiting... ($i/60)"
             sleep 2
-            if [ $i -eq 30 ]; then
-              echo "📄 exo_queen.log (first 50 lines):"
-              head -50 exo_queen.log || true
+            if [ $i -eq 15 ]; then
+              echo "📄 exo_queen.log (last 30 lines):"
+              tail -30 exo_queen.log || true
+              echo "Process list:"
+              ps aux | grep exo || true
+              echo "Listening ports:"
+              netstat -tlnp 2>/dev/null || true
             fi
           done
 
-          if ! curl -s http://localhost:52415/health > /dev/null; then
-            echo "❌ exo API failed to start – showing full log:"
-            cat exo_queen.log
-            exit 1
+          if ! netstat -tlnp 2>/dev/null | grep -q ':52415.*LISTEN'; then
+            if ! curl -s http://localhost:52415/health > /dev/null 2>&1; then
+              echo "❌ exo API failed to start – showing full log:"
+              cat exo_queen.log
+              exit 1
+            fi
           fi
 
           echo "🌐 Starting Cloudflare tunnel for exo API..."
@@ -170,8 +189,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # For production: [1..19]
-        worker_id: [1, 2, 3, 4, 5]   # change to 19 for full cluster
+        # Change to [1..19] for full cluster
+        worker_id: [1, 2, 3, 4, 5]
     timeout-minutes: 360
     steps:
       - name: Install dependencies
@@ -193,6 +212,11 @@ jobs:
           npm run build
           cd ../..
 
+      - name: Install exo Python dependencies
+        run: |
+          cd exo
+          uv sync
+
       - name: Fetch Queen's Zenoh router URL from repository
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -205,15 +229,10 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" 2>/dev/null)
             URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
-            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-              # Validate the URL format
-              if [[ "$URL" == hs://* ]]; then
-                echo "Fetched valid URL: $URL"
-                ZENOH_URL="$URL"
-                break
-              else
-                echo "  Invalid URL format: $URL – retrying..."
-              fi
+            if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
+              echo "Fetched valid URL: $URL"
+              ZENOH_URL="$URL"
+              break
             fi
             echo "  Waiting for Queen to publish its Zenoh router URL... ($attempt/60)"
             sleep 5
@@ -242,7 +261,7 @@ jobs:
         run: |
           cd exo
           echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          nohup env ZENOH_CONFIG="$ZENOH_CONFIG" uv run exo > exo_worker.log 2>&1 &
+          uv run exo > exo_worker.log 2>&1 &
           sleep 10
           pgrep -f "exo" && echo "✅ Worker exo is running" || echo "⚠️ Worker exo not found"
           sleep infinity
