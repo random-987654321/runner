@@ -40,18 +40,15 @@ jobs:
           else
             echo "ℹ️ No existing file to delete"
           fi
-
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl jq
           sudo npm install -g holesail
-
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
       - name: Install vLLM + Ray (CPU)
         run: |
           uv venv
@@ -61,7 +58,6 @@ jobs:
             --index-strategy first-index \
             --torch-backend cpu
           ray --version
-
       - name: Start Ray Head and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -81,7 +77,6 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
             -d "{\"message\":\"publish head url\",\"content\":\"$ENCODED\"}" || true
-
       - name: Wait for workers to join the Ray cluster
         env:
           WORKER_COUNT: ${{ env.WORKER_COUNT }}
@@ -101,7 +96,6 @@ jobs:
             echo "❌ Not all workers joined within timeout"
             exit 1
           fi
-
       - name: Start vLLM API Server with Ray backend
         run: |
           source .venv/bin/activate
@@ -113,7 +107,6 @@ jobs:
             --distributed-executor-backend ray \
             --port 8080 &
           sleep 15
-
       - name: Expose API via Cloudflare Tunnel
         run: |
           if [ ! -f ./cloudflared ]; then
@@ -135,7 +128,6 @@ jobs:
           if [ -z "$TUNNEL_URL" ]; then
             echo "❌ Tunnel failed – API is local only."
           fi
-
       - name: Keep alive
         run: sleep infinity
 
@@ -155,12 +147,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y curl jq
           sudo npm install -g holesail
-
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
       - name: Install vLLM + Ray (CPU)
         run: |
           uv venv
@@ -170,7 +160,6 @@ jobs:
             --index-strategy first-index \
             --torch-backend cpu
           ray --version
-
       - name: Fetch Head Node URL from repository
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -201,7 +190,6 @@ jobs:
             exit 1
           fi
           echo "HEAD_NODE_URL=$HEAD_URL" >> $GITHUB_ENV
-
       - name: Connect to Ray Head via Holesail and start worker
         run: |
           source .venv/bin/activate
