@@ -232,7 +232,7 @@ jobs:
           nohup ./llama-server \
             -m ../models/model.gguf \
             -c 2048 \
-            --world $((WORKER_COUNT + 1)) \
+            --world 5 \
             --rank 0 \
             --master 127.0.0.1:6000 \
             --next 127.0.0.1:7001 \
