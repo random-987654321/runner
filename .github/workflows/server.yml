@@ -1,4 +1,4 @@
-name: vLLM Metal Cluster (mp backend + workers)
+name: vLLM Metal Cluster (vllm serve)
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ env:
 
 jobs:
   # ============================================================
-  # HEAD – vLLM API Server (local multiprocessing)
+  # HEAD – vLLM API Server via vllm serve (Metal)
   # ============================================================
   head:
     runs-on: macos-26
@@ -54,25 +54,17 @@ jobs:
           brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal from direct wheel (fast, no compilation)
+      - name: Install vLLM Metal via official install script
         run: |
-          python3.12 -m venv ~/.venv-vllm-metal
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+          # Verify the CLI works
           source ~/.venv-vllm-metal/bin/activate
-          pip install --upgrade pip
-          # Direct wheel for Python 3.12 arm64 – installs in ~2 minutes
-          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
-          # Verify installation
-          python -c "import vllm; print(vllm.__version__)"
+          vllm --help || true
 
-      - name: Start vLLM API Server (mp backend)
+      - name: Start vLLM API Server via vllm serve
         run: |
           source ~/.venv-vllm-metal/bin/activate
-          python -m vllm.entrypoints.openai.api_server \
-            --model $MODEL_ID \
-            --tensor-parallel-size 1 \
-            --distributed-executor-backend mp \
-            --host 0.0.0.0 \
-            --port 8080 &
+          vllm serve --model $MODEL_ID --host 0.0.0.0 --port 8080 &
           
           echo "⏳ Waiting for vLLM server to be ready..."
           for i in {1..30}; do
@@ -94,7 +86,6 @@ jobs:
           echo "⏳ Waiting for Cloudflare tunnel..."
           TUNNEL_URL=""
           for i in {1..30}; do
-            # macOS grep uses -E for extended regex, not -P
             TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
               echo "✅ Public API URL: $TUNNEL_URL"
@@ -111,7 +102,7 @@ jobs:
         run: sleep infinity
 
   # ============================================================
-  # WORKERS – Data parallelism (each runs its own vLLM)
+  # WORKERS – Data parallelism (each runs its own vLLM via CLI)
   # ============================================================
   worker:
     runs-on: macos-26
@@ -126,13 +117,11 @@ jobs:
           brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal from direct wheel (fast, no compilation)
+      - name: Install vLLM Metal via official install script
         run: |
-          python3.12 -m venv ~/.venv-vllm-metal
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
           source ~/.venv-vllm-metal/bin/activate
-          pip install --upgrade pip
-          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
-          python -c "import vllm; print(vllm.__version__)"
+          vllm --help || true
 
       - name: Start vLLM API Server and expose via Holesail
         env:
@@ -142,12 +131,7 @@ jobs:
         run: |
           source ~/.venv-vllm-metal/bin/activate
           PORT=8080
-          python -m vllm.entrypoints.openai.api_server \
-            --model $MODEL_ID \
-            --tensor-parallel-size 1 \
-            --distributed-executor-backend mp \
-            --host 0.0.0.0 \
-            --port ${PORT} &
+          vllm serve --model $MODEL_ID --host 0.0.0.0 --port ${PORT} &
           
           for i in {1..30}; do
             if curl -s http://localhost:${PORT}/health > /dev/null; then
@@ -164,7 +148,6 @@ jobs:
 
           mkdir -p workers
           echo "{\"url\": \"${WORKER_URL}\"}" > workers/worker${WORKER_ID}.json
-          # macOS base64 uses -b 0 for no line breaks
           ENCODED=$(base64 -b 0 workers/worker${WORKER_ID}.json)
 
           for attempt in {1..10}; do
