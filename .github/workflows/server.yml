@@ -1,4 +1,4 @@
-name: vLLM-Holesail Distributed CPU Mesh (Pre-built Wheels)
+name: vLLM-Holesail Ray Mesh (P2P Pattern)
 
 on:
   workflow_dispatch:
@@ -119,7 +119,7 @@ jobs:
         run: sleep infinity
 
   # ============================================================
-  # WORKER NODES – Connect via Holesail with RAY_GCS_ADDRESS
+  # WORKER NODES – Connect to Head via Holesail and join Ray
   # ============================================================
   worker:
     runs-on: ubuntu-latest
@@ -186,9 +186,12 @@ jobs:
           source .venv/bin/activate
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
+
+          # Force Ray to use the tunnel (localhost) only
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
-          ray start --address="127.0.0.1:6379" \
-            --node-ip-address=127.0.0.1 \
+          export RAY_ADDRESS=127.0.0.1:6379
+
+          ray start --node-ip-address=127.0.0.1 \
             --disable-usage-stats
           sleep infinity
