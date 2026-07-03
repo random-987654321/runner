@@ -102,16 +102,25 @@ jobs:
             chmod +x cloudflared
           fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
-          sleep 5
-          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-          if [ -n "$TUNNEL_URL" ]; then
-            echo "✅ Public API URL: $TUNNEL_URL"
-            echo "::notice::API available at $TUNNEL_URL"
-          else
-            echo "⚠️ Tunnel not ready – check tunnel.log"
+          echo "⏳ Waiting for Cloudflare tunnel to be ready..."
+          TUNNEL_URL=""
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Public API URL: $TUNNEL_URL"
+              echo "::notice::API available at $TUNNEL_URL"
+              break
+            fi
+            echo "  Attempt $i/30 – tunnel not ready yet, waiting..."
+            sleep 3
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get Cloudflare tunnel URL after 30 attempts."
+            echo "Last 20 lines of tunnel.log:"
             tail -20 tunnel.log
+            # Don't exit – the API might still be accessible locally, but the tunnel isn't public.
           fi
-
+          
       - name: Keep alive
         run: sleep infinity
 
