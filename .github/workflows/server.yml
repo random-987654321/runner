@@ -13,9 +13,6 @@ env:
   HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
-  # ============================================================
-  # HEAD NODE – API Server, Ray Head, Cloudflare Tunnel
-  # ============================================================
   head:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -47,7 +44,7 @@ jobs:
           sudo apt-get install -y curl jq
           sudo npm install -g holesail
 
-      - name: Install uv (fast Python package manager)
+      - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
@@ -68,12 +65,10 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           source .venv/bin/activate
-          # Force head to advertise only loopback
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
           ray start --head --port=6379 \
-            --node-ip-address=127.0.0.1 \
             --dashboard-host=127.0.0.1 \
             --disable-usage-stats
 
@@ -121,9 +116,6 @@ jobs:
       - name: Keep alive
         run: sleep infinity
 
-  # ============================================================
-  # WORKER NODES – Connect to Head via Holesail and join Ray
-  # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
@@ -138,7 +130,7 @@ jobs:
           sudo apt-get install -y curl jq
           sudo npm install -g holesail
 
-      - name: Install uv (fast Python package manager)
+      - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
@@ -190,13 +182,5 @@ jobs:
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
 
-          # Force worker to use only the tunnel (localhost)
-          export RAY_NODE_IP=127.0.0.1
-          export RAY_GCS_ADDRESS=127.0.0.1:6379
-          export RAY_ADDRESS=127.0.0.1:6379
-
-          # --address is required; point it to the tunnel endpoint
-          ray start --address=0.0.0.0:6379 \
-            --node-ip-address=127.0.0.1 \
-            --disable-usage-stats
+          ray start --address=0.0.0.0:6379 --disable-usage-stats
           sleep infinity
