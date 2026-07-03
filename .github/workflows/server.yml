@@ -51,33 +51,34 @@ jobs:
       - name: Install system dependencies
         run: |
           brew install curl jq
-          # Install Python 3.13 (compatible with vLLM)
-          brew install python@3.13
           sudo npm install -g holesail
 
-      - name: Create virtual environment with Python 3.13
+      - name: Install uv (Python package manager)
         run: |
-          python3.13 -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Install vLLM Metal and Ray
+      - name: Install vLLM Metal via official install script
         run: |
-          source .venv/bin/activate
-          # Install vllm-metal (includes MLX backend and Ray)
-          pip install vllm-metal
-          # Ray is a dependency of vllm-metal, but ensure it's installed
-          pip install ray[default]
+          # The install script creates ~/.venv-vllm-metal with vllm-metal and vLLM core
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 
-      - name: Start Ray Head (bind to localhost) and expose via Holesail
+      - name: Activate vLLM Metal environment and verify
+        run: |
+          source ~/.venv-vllm-metal/bin/activate
+          python -c "import vllm; print(f'vLLM version: {vllm.__version__}')"
+
+      - name: Start Ray Head and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          source .venv/bin/activate
+          source ~/.venv-vllm-metal/bin/activate
+          # Force Ray to use loopback only
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
+          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1  # Required for macOS multi-node[reference:2]
           ray start --head --port=6379 \
             --node-ip-address=127.0.0.1 \
             --dashboard-host=127.0.0.1 \
@@ -125,10 +126,10 @@ jobs:
 
       - name: Start vLLM API Server with Metal backend
         run: |
-          source .venv/bin/activate
+          source ~/.venv-vllm-metal/bin/activate
           export RAY_ADDRESS=127.0.0.1:6379
           export RAY_GCS_ADDRESS=127.0.0.1:6379
-          export VLLM_USE_MLX=1   # Force MLX backend
+          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
           python -m vllm.entrypoints.openai.api_server \
             --model $MODEL_ID \
             --tensor-parallel-size 1 \
@@ -184,20 +185,16 @@ jobs:
       - name: Install system dependencies
         run: |
           brew install curl jq
-          brew install python@3.13
           sudo npm install -g holesail
 
-      - name: Create virtual environment with Python 3.13
+      - name: Install uv
         run: |
-          python3.13 -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Install vLLM Metal and Ray
+      - name: Install vLLM Metal via official install script
         run: |
-          source .venv/bin/activate
-          pip install vllm-metal
-          pip install ray[default]
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 
       - name: Fetch Head Node URL from repository
         env:
@@ -236,13 +233,14 @@ jobs:
           REPO: ${{ github.repository }}
           WORKER_ID: ${{ matrix.worker_id }}
         run: |
-          source .venv/bin/activate
+          source ~/.venv-vllm-metal/bin/activate
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
 
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
+          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1  # Required for macOS multi-node[reference:3]
 
           ray start --address=127.0.0.1:6379 --disable-usage-stats
 
