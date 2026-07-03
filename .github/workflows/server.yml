@@ -10,7 +10,7 @@ permissions:
 env:
   WORKER_COUNT: 4
   # Use a supported model – Qwen2.5-7B Q8_0 GGUF (compatible with llama.cpp / prima.cpp)
-  MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q8_0.gguf"
+  MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q8_0-00001-of-00003.gguf"
 
 jobs:
   queen:
