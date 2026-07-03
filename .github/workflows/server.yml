@@ -65,9 +65,9 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           source .venv/bin/activate
-          export RAY_NODE_IP=127.0.0.1
-          export RAY_GCS_ADDRESS=127.0.0.1:6379
-          export RAY_ADDRESS=127.0.0.1:6379
+          export RAY_NODE_IP=0.0.0.0
+          export RAY_GCS_ADDRESS=0.0.0.0:6379
+          export RAY_ADDRESS=0.0.0.0:6379
           ray start --head --port=6379 \
             --dashboard-host=127.0.0.1 \
             --disable-usage-stats
@@ -87,7 +87,6 @@ jobs:
       - name: Start vLLM API Server
         run: |
           source .venv/bin/activate
-          export VLLM_USE_RAY=1
           python -m vllm.entrypoints.openai.api_server \
             --model $MODEL_ID \
             --dtype float16 \
