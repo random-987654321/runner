@@ -192,6 +192,7 @@ jobs:
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
 
+          # No --address needed; environment variables tell Ray where the GCS is.
           ray start --node-ip-address=127.0.0.1 \
             --disable-usage-stats
           sleep infinity
