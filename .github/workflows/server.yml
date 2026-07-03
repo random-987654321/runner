@@ -9,7 +9,7 @@ permissions:
 
 env:
   WORKER_COUNT: 4                      # number of workers (total nodes = WORKER_COUNT + 1)
-  MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q8_0.gguf"
+  MODEL_URL: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
   # For 70B, use: https://huggingface.co/Qwen/Qwen2.5-72B-GGUF/resolve/main/qwen2.5-72b-instruct-q6_k.gguf
 
 jobs:
