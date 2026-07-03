@@ -19,7 +19,7 @@ jobs:
   head:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
+  
     steps:
       - name: Clean up previous head_url.txt
         env:
@@ -40,15 +40,18 @@ jobs:
           else
             echo "ℹ️ No existing file to delete"
           fi
+  
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl jq
           sudo npm install -g holesail
+  
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+  
       - name: Install vLLM + Ray (CPU)
         run: |
           uv venv
@@ -58,6 +61,7 @@ jobs:
             --index-strategy first-index \
             --torch-backend cpu
           ray --version
+  
       - name: Start Ray Head and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -77,6 +81,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
             -d "{\"message\":\"publish head url\",\"content\":\"$ENCODED\"}" || true
+  
       - name: Wait for workers to join the Ray cluster
         env:
           WORKER_COUNT: ${{ env.WORKER_COUNT }}
@@ -96,17 +101,23 @@ jobs:
             echo "❌ Not all workers joined within timeout"
             exit 1
           fi
-      - name: Start vLLM API Server with Ray backend
+  
+      - name: Start vLLM API Server with low memory settings
         run: |
           source .venv/bin/activate
-          # Use Ray for distributed execution (data parallelism across nodes)
+          # Reduce memory usage
+          export VLLM_CPU_KVCACHE_SPACE=4    # 4 GiB KV cache
+          # Start vLLM with low memory utilization and smaller context
           python -m vllm.entrypoints.openai.api_server \
             --model $MODEL_ID \
             --dtype float16 \
-            --tensor-parallel-size 1 \           # No model splitting – use data parallelism
+            --tensor-parallel-size 1 \
             --distributed-executor-backend ray \
+            --gpu-memory-utilization 0.5 \   # controls CPU memory fraction
+            --max-model-len 4096 \            # reduce context size to save memory
             --port 8080 &
           sleep 15
+  
       - name: Expose API via Cloudflare Tunnel
         run: |
           if [ ! -f ./cloudflared ]; then
@@ -128,9 +139,9 @@ jobs:
           if [ -z "$TUNNEL_URL" ]; then
             echo "❌ Tunnel failed – API is local only."
           fi
+  
       - name: Keep alive
         run: sleep infinity
-
   # ============================================================
   # WORKER NODES – join the Ray cluster
   # ============================================================
