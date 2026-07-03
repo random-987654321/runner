@@ -1,4 +1,4 @@
-name: vLLM Metal Distributed Cluster (macOS)
+name: vLLM Metal Cluster (mp backend + optional workers)
 
 on:
   workflow_dispatch:
@@ -8,25 +8,25 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 3                       # change to 19 for full cluster
+  WORKER_COUNT: 3
   MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
   HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
   # ============================================================
-  # HEAD NODE – Ray Head + vLLM API Server + Cloudflare Tunnel
+  # HEAD – vLLM API Server (local multiprocessing, no Ray)
   # ============================================================
   head:
-    runs-on: macos-26                     # macOS ARM runner with Metal
+    runs-on: macos-26
     timeout-minutes: 360
 
     steps:
-      - name: Clean previous head_url.txt and workers
+      - name: Clean previous files
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "🧹 Cleaning workers/ directory..."
+          echo "🧹 Cleaning workers/ and head_url.txt..."
           curl -s -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null | \
             jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | \
@@ -38,7 +38,6 @@ jobs:
                   -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
               fi
             done
-          echo "🧹 Deleting previous head_url.txt..."
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" 2>/dev/null)
@@ -48,7 +47,6 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
               -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}"
-            echo "✅ Deleted old head_url.txt"
           fi
 
       - name: Install system dependencies and Python 3.12
@@ -56,80 +54,21 @@ jobs:
           brew install curl jq python@3.12
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal from direct wheel URL
+      - name: Install vLLM Metal (direct wheel)
         run: |
           python3.12 -m venv ~/.venv-vllm-metal
           source ~/.venv-vllm-metal/bin/activate
           pip install --upgrade pip
-          # Direct wheel for Python 3.12 arm64
           pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
-          pip install ray[default]
+          # No Ray needed – just vLLM
 
-      - name: Start Ray Head and expose via Holesail
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
+      - name: Start vLLM API Server (mp backend)
         run: |
           source ~/.venv-vllm-metal/bin/activate
-          export RAY_NODE_IP=127.0.0.1
-          export RAY_GCS_ADDRESS=127.0.0.1:6379
-          export RAY_ADDRESS=127.0.0.1:6379
-          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
-          ray start --head --port=6379 \
-            --node-ip-address=127.0.0.1 \
-            --dashboard-host=127.0.0.1 \
-            --disable-usage-stats
-
-          holesail --live 6379 > /tmp/holesail_head.txt 2>&1 &
-          sleep 5
-          HEAD_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_head.txt | head -1)
-          echo "HEAD_NODE_URL=$HEAD_URL" >> $GITHUB_ENV
-          echo "$HEAD_URL" > head_url.txt
-          ENCODED=$(base64 -w0 head_url.txt)
-
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
-            -d "{\"message\":\"publish head url\",\"content\":\"$ENCODED\"}" || true
-
-      - name: Wait for workers to register
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "👑 Head waiting for $WORKER_COUNT workers..."
-          for attempt in {1..60}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
-              COUNT=0
-            else
-              FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
-              COUNT=$(echo "$FILES" | grep -c . || echo 0)
-            fi
-            echo "  Attempt $attempt: $COUNT/$WORKER_COUNT workers registered"
-            if [ "$COUNT" -ge $WORKER_COUNT ]; then
-              echo "✅ All workers registered!"
-              break
-            fi
-            sleep 5
-          done
-          if [ "$COUNT" -lt $WORKER_COUNT ]; then
-            echo "❌ Timeout waiting for workers"
-            exit 1
-          fi
-
-      - name: Start vLLM API Server with Metal backend
-        run: |
-          source ~/.venv-vllm-metal/bin/activate
-          export RAY_ADDRESS=127.0.0.1:6379
-          export RAY_GCS_ADDRESS=127.0.0.1:6379
-          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
           python -m vllm.entrypoints.openai.api_server \
             --model $MODEL_ID \
             --tensor-parallel-size 1 \
-            --distributed-executor-backend ray \
+            --distributed-executor-backend mp \
             --host 0.0.0.0 \
             --port 8080 &
           
@@ -139,18 +78,18 @@ jobs:
               echo "✅ vLLM server is ready"
               break
             fi
-            echo "  Attempt $i/30 – waiting for vLLM..."
+            echo "  Attempt $i/30 – waiting..."
             sleep 5
           done
 
-      - name: Expose vLLM API via Cloudflare Tunnel
+      - name: Expose API via Cloudflare Tunnel
         run: |
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64
             chmod +x cloudflared
           fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
-          echo "⏳ Waiting for Cloudflare tunnel to be ready..."
+          echo "⏳ Waiting for Cloudflare tunnel..."
           TUNNEL_URL=""
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
@@ -159,11 +98,9 @@ jobs:
               echo "::notice::API available at $TUNNEL_URL"
               break
             fi
-            echo "  Attempt $i/30 – tunnel not ready yet, waiting..."
             sleep 3
           done
           if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get Cloudflare tunnel URL."
             tail -20 tunnel.log
           fi
 
@@ -171,13 +108,13 @@ jobs:
         run: sleep infinity
 
   # ============================================================
-  # WORKER NODES – Connect to Ray Head and start Ray workers
+  # OPTIONAL WORKERS – Data parallelism (each runs its own vLLM)
   # ============================================================
   worker:
     runs-on: macos-26
     strategy:
       matrix:
-        worker_id: [1, 2, 3]   # change to 19 for full cluster
+        worker_id: [1, 2, 3]
     timeout-minutes: 360
 
     steps:
@@ -186,65 +123,43 @@ jobs:
           brew install curl jq python@3.12
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal from direct wheel URL
+      - name: Install vLLM Metal (direct wheel)
         run: |
           python3.12 -m venv ~/.venv-vllm-metal
           source ~/.venv-vllm-metal/bin/activate
           pip install --upgrade pip
           pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
-          pip install ray[default]
 
-      - name: Fetch Head Node URL from repository
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "📡 Fetching Head Node URL..."
-          HEAD_URL=""
-          for attempt in {1..30}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" 2>/dev/null)
-            if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
-              echo "  File not yet published, retrying..."
-              sleep 5
-              continue
-            fi
-            URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
-            if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
-              echo "Fetched valid URL: $URL"
-              HEAD_URL="$URL"
-              break
-            fi
-            echo "  Waiting for Head to publish URL... ($attempt/30)"
-            sleep 5
-          done
-          if [ -z "$HEAD_URL" ]; then
-            echo "❌ Failed to fetch Head Node URL"
-            exit 1
-          fi
-          echo "HEAD_NODE_URL=$HEAD_URL" >> $GITHUB_ENV
-
-      - name: Connect to Ray Head via Holesail and start Ray worker
+      - name: Start vLLM API Server and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           WORKER_ID: ${{ matrix.worker_id }}
         run: |
           source ~/.venv-vllm-metal/bin/activate
-          holesail --connect "$HEAD_NODE_URL" --port 6379 &
-          sleep 10
+          PORT=8080
+          python -m vllm.entrypoints.openai.api_server \
+            --model $MODEL_ID \
+            --tensor-parallel-size 1 \
+            --distributed-executor-backend mp \
+            --host 0.0.0.0 \
+            --port ${PORT} &
+          
+          for i in {1..30}; do
+            if curl -s http://localhost:${PORT}/health > /dev/null; then
+              echo "✅ Worker $WORKER_ID ready"
+              break
+            fi
+            sleep 5
+          done
 
-          export RAY_NODE_IP=127.0.0.1
-          export RAY_GCS_ADDRESS=127.0.0.1:6379
-          export RAY_ADDRESS=127.0.0.1:6379
-          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
+          holesail --live ${PORT} > /tmp/holesail_worker.txt 2>&1 &
+          sleep 5
+          WORKER_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_worker.txt | head -1)
+          echo "✅ Worker $WORKER_ID Holesail URL: $WORKER_URL"
 
-          ray start --address=127.0.0.1:6379 --disable-usage-stats
-
-          # Register worker as ready
           mkdir -p workers
-          echo "{\"status\": \"ready\", \"worker_id\": $WORKER_ID}" > workers/worker${WORKER_ID}.json
+          echo "{\"url\": \"${WORKER_URL}\"}" > workers/worker${WORKER_ID}.json
           ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
 
           for attempt in {1..10}; do
@@ -266,7 +181,7 @@ jobs:
               "https://api.github.com/repos/${REPO}/contents/workers/worker${WORKER_ID}.json" \
               -d "$PAYLOAD")
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker $WORKER_ID registered successfully!"
+              echo "✅ Worker $WORKER_ID registered"
               break
             fi
             sleep 3
