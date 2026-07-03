@@ -90,11 +90,12 @@ jobs:
       - name: Start vLLM API Server
         run: |
           source .venv/bin/activate
+          export VLLM_USE_RAY=1
           python -m vllm.entrypoints.openai.api_server \
             --model $MODEL_ID \
             --dtype float16 \
             --tensor-parallel-size 1 \
-            --worker-use-ray \
+            --distributed-executor-backend ray \
             --port 8080 &
           sleep 15
 
