@@ -1,4 +1,4 @@
-name: vLLM P2P Ray Mesh (with Worker Registration)
+name: vLLM P2P Ray Mesh (GPU Required)
 
 on:
   workflow_dispatch:
@@ -11,10 +11,11 @@ env:
   WORKER_COUNT: 3                       # change to 19 for full cluster
   MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
   HEAD_REPO_FILE: "head_url.txt"
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}     # optional, for faster downloads
 
 jobs:
   queen:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gpu]         # requires GPU runner
     timeout-minutes: 360
 
     steps:
@@ -123,11 +124,12 @@ jobs:
             exit 1
           fi
 
-      - name: Start vLLM API Server (with explicit Ray env vars)
+      - name: Start vLLM API Server (with Ray backend)
         run: |
           source .venv/bin/activate
-          RAY_ADDRESS=127.0.0.1:6379 \
-          RAY_GCS_ADDRESS=127.0.0.1:6379 \
+          # These env vars force vLLM's engine to use the tunnel
+          export RAY_ADDRESS=127.0.0.1:6379
+          export RAY_GCS_ADDRESS=127.0.0.1:6379
           python -m vllm.entrypoints.openai.api_server \
             --model $MODEL_ID \
             --dtype float16 \
@@ -146,7 +148,7 @@ jobs:
             sleep 5
           done
 
-      - name: Expose API via Cloudflare Tunnel (port 8080)
+      - name: Expose API via Cloudflare Tunnel
         run: |
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -174,10 +176,10 @@ jobs:
         run: sleep infinity
 
   worker:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gpu]         # requires GPU runner
     strategy:
       matrix:
-        worker_id: [1, 2, 3]   # change to 19 for full cluster
+        worker_id: [1, 2, 3]           # change to 19 for full cluster
     timeout-minutes: 360
 
     steps:
@@ -247,7 +249,7 @@ jobs:
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
-          ray start --address=0.0.0.0:6379 --disable-usage-stats
+          ray start --address=127.0.0.1:6379 --disable-usage-stats
 
           # Register worker as ready
           mkdir -p workers
