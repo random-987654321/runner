@@ -1,4 +1,4 @@
-name: vLLM Metal Cluster (vllm serve)
+name: vLLM Metal Cluster (vllm serve - direct wheel)
 
 on:
   workflow_dispatch:
@@ -9,13 +9,10 @@ permissions:
 
 env:
   WORKER_COUNT: 3
-  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
+  MODEL_ID: "mlx-community/Qwen2.5-7B-Instruct-4bit"   # use MLX-optimized model
   HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
-  # ============================================================
-  # HEAD – vLLM API Server via vllm serve (Metal)
-  # ============================================================
   head:
     runs-on: macos-26
     timeout-minutes: 360
@@ -54,12 +51,16 @@ jobs:
           brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal via official install script
+      - name: Install Python 3.12 and create venv
         run: |
-          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
-          # Verify the CLI works
+          python3.12 -m venv ~/.venv-vllm-metal
           source ~/.venv-vllm-metal/bin/activate
-          vllm --help || true
+          pip install --upgrade pip
+
+      - name: Install vLLM Metal from direct wheel
+        run: |
+          source ~/.venv-vllm-metal/bin/activate
+          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
 
       - name: Start vLLM API Server via vllm serve
         run: |
@@ -101,9 +102,6 @@ jobs:
       - name: Keep alive
         run: sleep infinity
 
-  # ============================================================
-  # WORKERS – Data parallelism (each runs its own vLLM via CLI)
-  # ============================================================
   worker:
     runs-on: macos-26
     strategy:
@@ -117,11 +115,16 @@ jobs:
           brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal via official install script
+      - name: Install Python 3.12 and create venv
         run: |
-          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+          python3.12 -m venv ~/.venv-vllm-metal
           source ~/.venv-vllm-metal/bin/activate
-          vllm --help || true
+          pip install --upgrade pip
+
+      - name: Install vLLM Metal from direct wheel
+        run: |
+          source ~/.venv-vllm-metal/bin/activate
+          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
 
       - name: Start vLLM API Server and expose via Holesail
         env:
