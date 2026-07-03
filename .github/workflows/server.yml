@@ -1,4 +1,4 @@
-name: vLLM P2P Ray Mesh (GPU Required)
+name: vLLM Metal Distributed Cluster (macOS)
 
 on:
   workflow_dispatch:
@@ -9,13 +9,15 @@ permissions:
 
 env:
   WORKER_COUNT: 3                       # change to 19 for full cluster
-  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
-  HEAD_REPO_FILE: "head_url.txt"
-  HF_TOKEN: ${{ secrets.HF_TOKEN }}     # optional, for faster downloads
+  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"  # can use any HF model
+  HEAD_REPO_FILE: "head_url.txt"        # file to share head's Holesail URL
 
 jobs:
-  queen:
-    runs-on: [self-hosted, gpu]         # requires GPU runner
+  # ============================================================
+  # HEAD NODE – Ray Head + vLLM API Server + Cloudflare Tunnel
+  # ============================================================
+  head:
+    runs-on: macos-26                     # macOS ARM runner with Metal
     timeout-minutes: 360
 
     steps:
@@ -25,17 +27,17 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           echo "🧹 Cleaning workers/ directory..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
-            if [ -n "$name" ] && [ -n "$sha" ]; then
-              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
-                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
-            fi
-          done
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null | \
+            jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | \
+            while IFS=':' read -r name sha; do
+              if [ -n "$name" ] && [ -n "$sha" ]; then
+                curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
+                  -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
+              fi
+            done
           echo "🧹 Deleting previous head_url.txt..."
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -51,24 +53,16 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl jq
+          brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install uv
+      - name: Install Python and vLLM with Metal support
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Create virtual environment and install vLLM + Ray
-        run: |
-          uv venv
+          python3 -m venv .venv
           source .venv/bin/activate
-          uv pip install vllm ray[default] \
-            --extra-index-url https://wheels.vllm.ai/nightly/cpu \
-            --index-strategy first-index \
-            --torch-backend cpu
-          ray --version
+          pip install --upgrade pip
+          # Install vLLM with Metal plugin (this includes Ray dependencies)
+          pip install vllm vllm-metal
 
       - name: Start Ray Head (bind to localhost) and expose via Holesail
         env:
@@ -76,6 +70,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           source .venv/bin/activate
+          # Force Ray to use loopback only (workers connect via Holesail tunnel)
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
@@ -84,6 +79,7 @@ jobs:
             --dashboard-host=127.0.0.1 \
             --disable-usage-stats
 
+          # Expose Ray GCS via Holesail
           holesail --live 6379 > /tmp/holesail_head.txt 2>&1 &
           sleep 5
           HEAD_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_head.txt | head -1)
@@ -101,7 +97,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "👑 Queen waiting for $WORKER_COUNT workers..."
+          echo "👑 Head waiting for $WORKER_COUNT workers..."
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -124,15 +120,14 @@ jobs:
             exit 1
           fi
 
-      - name: Start vLLM API Server (with Ray backend)
+      - name: Start vLLM API Server (with Ray backend and Metal)
         run: |
           source .venv/bin/activate
-          # These env vars force vLLM's engine to use the tunnel
+          # Ensure Ray uses the tunnel
           export RAY_ADDRESS=127.0.0.1:6379
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           python -m vllm.entrypoints.openai.api_server \
             --model $MODEL_ID \
-            --dtype float16 \
             --tensor-parallel-size 1 \
             --distributed-executor-backend ray \
             --host 0.0.0.0 \
@@ -148,10 +143,10 @@ jobs:
             sleep 5
           done
 
-      - name: Expose API via Cloudflare Tunnel
+      - name: Expose vLLM API via Cloudflare Tunnel
         run: |
           if [ ! -f ./cloudflared ]; then
-            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64
             chmod +x cloudflared
           fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
@@ -175,41 +170,35 @@ jobs:
       - name: Keep alive
         run: sleep infinity
 
+  # ============================================================
+  # WORKER NODES – Connect to Ray Head, start Ray workers
+  # ============================================================
   worker:
-    runs-on: [self-hosted, gpu]         # requires GPU runner
+    runs-on: macos-26
     strategy:
       matrix:
-        worker_id: [1, 2, 3]           # change to 19 for full cluster
+        worker_id: [1, 2, 3]   # change to 19 for full cluster
     timeout-minutes: 360
 
     steps:
       - name: Install system dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl jq
+          brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install uv
+      - name: Install Python and vLLM with Metal
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Create virtual environment and install vLLM + Ray
-        run: |
-          uv venv
+          python3 -m venv .venv
           source .venv/bin/activate
-          uv pip install vllm ray[default] \
-            --extra-index-url https://wheels.vllm.ai/nightly/cpu \
-            --index-strategy first-index \
-            --torch-backend cpu
-          ray --version
+          pip install --upgrade pip
+          pip install vllm vllm-metal
 
-      - name: Fetch Queen's Head URL from repository
+      - name: Fetch Head Node URL from repository
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "📡 Fetching Queen's Head URL..."
+          echo "📡 Fetching Head Node URL..."
           HEAD_URL=""
           for attempt in {1..30}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -226,32 +215,34 @@ jobs:
               HEAD_URL="$URL"
               break
             fi
-            echo "  Waiting for Queen to publish URL... ($attempt/30)"
+            echo "  Waiting for Head to publish URL... ($attempt/30)"
             sleep 5
           done
           if [ -z "$HEAD_URL" ]; then
-            echo "❌ Failed to fetch Queen's Head URL"
+            echo "❌ Failed to fetch Head Node URL"
             exit 1
           fi
           echo "HEAD_NODE_URL=$HEAD_URL" >> $GITHUB_ENV
 
-      - name: Connect to Ray Head via Holesail and start worker
+      - name: Connect to Ray Head via Holesail and start Ray worker
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           WORKER_ID: ${{ matrix.worker_id }}
         run: |
           source .venv/bin/activate
-
+          # Connect to head's Ray GCS via Holesail
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
 
+          # Force Ray to use loopback (tunnel)
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
+
           ray start --address=0.0.0.0:6379 --disable-usage-stats
 
-          # Register worker as ready
+          # Register this worker as ready (optional)
           mkdir -p workers
           echo "{\"status\": \"ready\", \"worker_id\": $WORKER_ID}" > workers/worker${WORKER_ID}.json
           ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
@@ -281,4 +272,5 @@ jobs:
             sleep 3
           done
 
+          # Keep alive
           sleep infinity
