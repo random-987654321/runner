@@ -196,7 +196,7 @@ jobs:
           export RAY_ADDRESS=127.0.0.1:6379
 
           # --address is required; point it to the tunnel endpoint
-          ray start --address=127.0.0.1:6379 \
+          ray start --address=0.0.0.0:6379 \
             --node-ip-address=127.0.0.1 \
             --disable-usage-stats
           sleep infinity
