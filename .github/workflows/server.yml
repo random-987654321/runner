@@ -21,6 +21,26 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Clean up previous head_url.txt
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🧹 Deleting previous head_url.txt..."
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" 2>/dev/null)
+          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
+              -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}"
+            echo "✅ Deleted old file"
+          else
+            echo "ℹ️ No existing file to delete"
+          fi
+    
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
