@@ -1,4 +1,4 @@
-name: vLLM Metal Cluster (vllm serve - direct wheel)
+name: vLLM Metal Cluster (official install script)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 env:
   WORKER_COUNT: 3
-  MODEL_ID: "mlx-community/Qwen2.5-7B-Instruct-4bit"   # use MLX-optimized model
+  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
   HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
@@ -51,16 +51,11 @@ jobs:
           brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install Python 3.12 and create venv
+      - name: Install vLLM Metal via official install script
         run: |
-          python3.12 -m venv ~/.venv-vllm-metal
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
           source ~/.venv-vllm-metal/bin/activate
-          pip install --upgrade pip
-
-      - name: Install vLLM Metal from direct wheel
-        run: |
-          source ~/.venv-vllm-metal/bin/activate
-          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
+          vllm --help || true
 
       - name: Start vLLM API Server via vllm serve
         run: |
@@ -115,16 +110,11 @@ jobs:
           brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install Python 3.12 and create venv
+      - name: Install vLLM Metal via official install script
         run: |
-          python3.12 -m venv ~/.venv-vllm-metal
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
           source ~/.venv-vllm-metal/bin/activate
-          pip install --upgrade pip
-
-      - name: Install vLLM Metal from direct wheel
-        run: |
-          source ~/.venv-vllm-metal/bin/activate
-          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
+          vllm --help || true
 
       - name: Start vLLM API Server and expose via Holesail
         env:
