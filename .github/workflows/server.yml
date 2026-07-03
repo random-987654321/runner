@@ -13,9 +13,6 @@ env:
   HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
-  # ============================================================
-  # QUEEN (Head) – Ray Head, vLLM API, Cloudflare
-  # ============================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -98,7 +95,6 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
             -d "{\"message\":\"publish head url\",\"content\":\"$ENCODED\"}" || true
 
-      # ---------- NEW: Wait for workers to register (like original pattern) ----------
       - name: Wait for workers to register
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -126,11 +122,12 @@ jobs:
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
-          # Note: We do NOT connect to workers; they will connect to us via Ray GCS.
 
-      - name: Start vLLM API Server (with health check)
+      - name: Start vLLM API Server (with explicit Ray env vars)
         run: |
           source .venv/bin/activate
+          RAY_ADDRESS=127.0.0.1:6379 \
+          RAY_GCS_ADDRESS=127.0.0.1:6379 \
           python -m vllm.entrypoints.openai.api_server \
             --model $MODEL_ID \
             --dtype float16 \
@@ -176,9 +173,6 @@ jobs:
       - name: Keep alive
         run: sleep infinity
 
-  # ============================================================
-  # WORKERS – Fetch head URL, connect to Ray, and register own URL
-  # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
@@ -247,20 +241,15 @@ jobs:
         run: |
           source .venv/bin/activate
 
-          # Connect to head's Ray GCS
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
 
-          # Start Ray worker with environment to force loopback
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
           ray start --address=0.0.0.0:6379 --disable-usage-stats
 
-          # ---- Register this worker's own URL (so queen knows it's alive) ----
-          # We need to expose something? But we don't have a service to expose.
-          # Instead, we can just create a dummy file in workers/ with the worker ID.
-          # This signals to the queen that this worker is ready.
+          # Register worker as ready
           mkdir -p workers
           echo "{\"status\": \"ready\", \"worker_id\": $WORKER_ID}" > workers/worker${WORKER_ID}.json
           ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
@@ -290,5 +279,4 @@ jobs:
             sleep 3
           done
 
-          # Keep alive
           sleep infinity
