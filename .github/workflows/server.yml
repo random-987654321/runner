@@ -93,6 +93,18 @@ jobs:
           git clone https://github.com/OpenCPIL/prima.cpp.git
           cd prima.cpp
           make USE_HIGHS=1 -j$(nproc)
+          # Ensure llama-server is built
+          if [ ! -f ./llama-server ]; then
+            echo "⚠️ llama-server missing, building it explicitly"
+            make llama-server
+          fi
+          if [ -f ./llama-server ]; then
+            echo "✅ llama-server built successfully"
+          else
+            echo "❌ llama-server not found!"
+            ls -la
+            exit 1
+          fi
           ./llama-cli --help | head -5
 
       - name: Download model and validate
@@ -235,8 +247,14 @@ jobs:
         run: |
           cd prima.cpp
           export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+          if [ ! -f ./llama-server ]; then
+            echo "❌ llama-server binary not found!"
+            ls -la
+            exit 1
+          fi
+          chmod +x ./llama-server
           WORLD=$((WORKER_COUNT + 1))
-          ./llama-server \
+          nohup ./llama-server \
             -m ../models/model.gguf \
             -c 2048 \
             --world $WORLD \
@@ -245,7 +263,16 @@ jobs:
             --next 127.0.0.1:7001 \
             --host 0.0.0.0 \
             --port 8080 \
-            &
+            > master.log 2>&1 &
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
+          sleep 3
+          if ! ps -p $SERVER_PID > /dev/null; then
+            echo "❌ llama-server died immediately. Log:"
+            cat master.log
+            exit 1
+          fi
+          echo "✅ llama-server process is running (PID $SERVER_PID)"
 
       - name: Wait for master to be truly ready (200 OK)
         run: |
@@ -257,11 +284,13 @@ jobs:
               READY=true
               break
             fi
-            echo "⏳ Waiting... ($i/20)"
+            echo "⏳ Waiting... ($i/150)"
             sleep 2
-            if [ $i -eq 30 ]; then
+            if [ $i -eq 10 ]; then
               echo "📄 master.log (last 20 lines):"
               tail -20 master.log || true
+              echo "Processes:"
+              ps aux | grep llama-server || true
             fi
           done
           if [ "$READY" != "true" ]; then
@@ -452,11 +481,15 @@ jobs:
           holesail --connect "$NEXT_HOLESAIL_URL" --port $NEXT_PORT &
           sleep 5
 
-      - name: Start prima.cpp worker (llama-cli)
+      - name: Start prima.cpp worker (llama-cli) with delay
         env:
           WORKER_ID: ${{ matrix.worker_id }}
           WORKER_COUNT: ${{ env.WORKER_COUNT }}
         run: |
+          # Wait for the master to be ready (sleep 60 seconds to allow master to start)
+          echo "⏳ Waiting 60 seconds for master to be ready..."
+          sleep 60
+
           cd prima.cpp
           export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
           RANK=$WORKER_ID
@@ -476,6 +509,8 @@ jobs:
             --next "$NEXT" \
             --prefetch \
             > worker.log 2>&1 &
+
+          # Print worker log after a short delay
           sleep 10
           echo "📄 worker.log (first 20 lines):"
           head -20 worker.log || true
