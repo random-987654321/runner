@@ -9,8 +9,8 @@ permissions:
 
 env:
   WORKER_COUNT: 4
-  # Use a supported model – Qwen2.5-7B Q8_0 GGUF (compatible with llama.cpp / prima.cpp)
-  MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q8_0-00001-of-00003.gguf"
+  # Use a single-file GGUF model (small, fast download, verified)
+  MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 
 jobs:
   queen:
@@ -96,10 +96,17 @@ jobs:
           make USE_HIGHS=1 -j$(nproc)
           ./llama-cli --help | head -5
 
-      - name: Download model
+      - name: Download model and validate
         run: |
           mkdir -p models
           curl -L -o models/model.gguf "$MODEL_URL" -f --retry 3
+          if [ "$(head -c 4 models/model.gguf)" = "GGUF" ]; then
+            echo "✅ Valid GGUF file downloaded"
+          else
+            echo "❌ Invalid GGUF file – showing first 20 bytes:"
+            head -c 20 models/model.gguf | xxd
+            exit 1
+          fi
 
       - name: Start Holesail tunnel for master port (6000)
         env:
@@ -229,10 +236,11 @@ jobs:
         run: |
           cd prima.cpp
           export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+          WORLD=$((WORKER_COUNT + 1))
           nohup ./llama-server \
             -m ../models/model.gguf \
             -c 2048 \
-            --world 5 \
+            --world $WORLD \
             --rank 0 \
             --master 127.0.0.1:6000 \
             --next 127.0.0.1:7001 \
@@ -316,6 +324,10 @@ jobs:
         run: |
           mkdir -p models
           curl -L -o models/model.gguf "$MODEL_URL" -f --retry 3
+          if [ "$(head -c 4 models/model.gguf)" != "GGUF" ]; then
+            echo "❌ Invalid GGUF file on worker – aborting"
+            exit 1
+          fi
 
       - name: Fetch master URL
         env:
@@ -438,10 +450,11 @@ jobs:
             NEXT_PORT=$((7000 + WORKER_ID))
             NEXT="127.0.0.1:$NEXT_PORT"
           fi
+          WORLD=$((WORKER_COUNT + 1))
           nohup ./llama-cli \
             -m ../models/model.gguf \
             -c 2048 \
-            --world $((WORKER_COUNT + 1)) \
+            --world $WORLD \
             --rank $RANK \
             --master 127.0.0.1:6000 \
             --next "$NEXT" \
