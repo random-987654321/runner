@@ -14,7 +14,7 @@ env:
 
 jobs:
   # ============================================================
-  # HEAD NODE (Node 0) – API Server, Ray Head, Cloudflare Tunnel
+  # HEAD NODE – API Server, Ray Head, Cloudflare Tunnel
   # ============================================================
   head:
     runs-on: ubuntu-latest
@@ -40,7 +40,7 @@ jobs:
           else
             echo "ℹ️ No existing file to delete"
           fi
-    
+
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -60,7 +60,6 @@ jobs:
             --extra-index-url https://wheels.vllm.ai/nightly/cpu \
             --index-strategy first-index \
             --torch-backend cpu
-          # Verify installation
           ray --version
 
       - name: Start Ray Head (bind to localhost) and expose via Holesail
@@ -69,7 +68,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           source .venv/bin/activate
-          # Bind head to loopback so all traffic goes through Holesail tunnel
+          export RAY_NODE_IP=127.0.0.1
           ray start --head --port=6379 \
             --node-ip-address=127.0.0.1 \
             --dashboard-host=127.0.0.1 \
@@ -120,7 +119,7 @@ jobs:
         run: sleep infinity
 
   # ============================================================
-  # WORKER NODES – Connect to Ray Head via Holesail and join
+  # WORKER NODES – Connect to GCS via Holesail using --gcs-address
   # ============================================================
   worker:
     runs-on: ubuntu-latest
@@ -162,9 +161,14 @@ jobs:
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" 2>/dev/null)
+            if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
+              echo "  File not yet published, retrying..."
+              sleep 5
+              continue
+            fi
             URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
             if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
-              echo "Fetched URL: $URL"
+              echo "Fetched valid URL: $URL"
               HEAD_URL="$URL"
               break
             fi
@@ -183,7 +187,8 @@ jobs:
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
           export RAY_NODE_IP=127.0.0.1
-          ray start --address="127.0.0.1:6379" \
+          # CRITICAL: Use --gcs-address to explicitly connect via tunnel
+          ray start --gcs-address="127.0.0.1:6379" \
             --node-ip-address=127.0.0.1 \
             --disable-usage-stats
           sleep infinity
