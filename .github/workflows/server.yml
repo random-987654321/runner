@@ -8,13 +8,16 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 3
+  WORKER_COUNT: 3                       # change to 19 for full cluster
   MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
   HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
+  # ============================================================
+  # HEAD NODE – Ray Head + vLLM API Server + Cloudflare Tunnel
+  # ============================================================
   head:
-    runs-on: macos-26
+    runs-on: macos-26                     # macOS ARM runner with Metal
     timeout-minutes: 360
 
     steps:
@@ -53,13 +56,13 @@ jobs:
           brew install curl jq python@3.12
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal from nightly wheels (Python 3.12)
+      - name: Install vLLM Metal from direct wheel URL
         run: |
           python3.12 -m venv ~/.venv-vllm-metal
           source ~/.venv-vllm-metal/bin/activate
           pip install --upgrade pip
-          # Use --index-url to only look at the nightly Metal index
-          pip install vllm --index-url https://wheels.vllm.ai/nightly/metal
+          # Direct wheel for Python 3.12 arm64
+          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
           pip install ray[default]
 
       - name: Start Ray Head and expose via Holesail
@@ -167,11 +170,14 @@ jobs:
       - name: Keep alive
         run: sleep infinity
 
+  # ============================================================
+  # WORKER NODES – Connect to Ray Head and start Ray workers
+  # ============================================================
   worker:
     runs-on: macos-26
     strategy:
       matrix:
-        worker_id: [1, 2, 3]
+        worker_id: [1, 2, 3]   # change to 19 for full cluster
     timeout-minutes: 360
 
     steps:
@@ -180,12 +186,12 @@ jobs:
           brew install curl jq python@3.12
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal from nightly wheels (Python 3.12)
+      - name: Install vLLM Metal from direct wheel URL
         run: |
           python3.12 -m venv ~/.venv-vllm-metal
           source ~/.venv-vllm-metal/bin/activate
           pip install --upgrade pip
-          pip install vllm --index-url https://wheels.vllm.ai/nightly/metal
+          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
           pip install ray[default]
 
       - name: Fetch Head Node URL from repository
