@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Clean workers directory
+      - name: Clean all state files
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -40,6 +40,11 @@ jobs:
               "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
               -d "{\"message\":\"cleanup\"}" || true
           done
+          # Also clean master_url.txt
+          curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
+            -d "{\"message\":\"cleanup\"}" || true
           echo "✅ Cleanup done."
 
       - name: Install system dependencies
@@ -93,17 +98,29 @@ jobs:
           echo "MASTER_HOLESAIL_URL=$MASTER_URL" >> $GITHUB_ENV
           echo "$MASTER_URL" > master_url.txt
           ENCODED=$(base64 -w0 master_url.txt)
+          # Check if file exists to get SHA
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/master_url.txt")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg msg "publish master url" --arg content "$ENCODED" --arg sha "$SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            PAYLOAD=$(jq -n --arg msg "publish master url" --arg content "$ENCODED" \
+              '{message: $msg, content: $content}')
+          fi
           curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
-            -d "{\"message\":\"publish master url\",\"content\":\"$ENCODED\"}" || true
+            -d "$PAYLOAD" || true
 
-      - name: Wait for workers and build ring
+      - name: Wait for workers to register and publish their URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           WORKER_COUNT: ${{ env.WORKER_COUNT }}
-          MASTER_URL: ${{ env.MASTER_HOLESAIL_URL }}   # <-- FIX: Pass the master URL
+          MASTER_URL: ${{ env.MASTER_HOLESAIL_URL }}
         run: |
           echo "👑 Queen waiting for $WORKER_COUNT workers..."
           for attempt in {1..60}; do
@@ -133,10 +150,8 @@ jobs:
           for i in $(seq 1 $WORKER_COUNT); do
             NEXT_INDEX=$((i + 1))
             if [ $NEXT_INDEX -gt $WORKER_COUNT ]; then
-              # Last worker points to master
               NEXT_URL="$MASTER_URL"
             else
-              # Fetch the next worker's URL directly
               RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${REPO}/contents/workers/worker_${NEXT_INDEX}.txt" 2>/dev/null)
@@ -148,10 +163,22 @@ jobs:
             fi
             echo "$NEXT_URL" > next_url_${i}.txt
             ENCODED_NEXT=$(base64 -w0 next_url_${i}.txt)
+            # Check if file exists
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n --arg msg "publish next url for worker $i" --arg content "$ENCODED_NEXT" --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              PAYLOAD=$(jq -n --arg msg "publish next url for worker $i" --arg content "$ENCODED_NEXT" \
+                '{message: $msg, content: $content}')
+            fi
             curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
-              -d "{\"message\":\"publish next url for worker $i\",\"content\":\"$ENCODED_NEXT\"}" || true
+              -d "$PAYLOAD" || true
           done
           echo "✅ Published next URLs for all workers."
 
@@ -174,6 +201,7 @@ jobs:
       - name: Start prima.cpp master (rank 0)
         run: |
           cd prima.cpp
+          export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
           nohup ./llama-cli \
             -m ../models/model.gguf \
             -c 2048 \
@@ -310,10 +338,22 @@ jobs:
           mkdir -p workers
           echo "$WORKER_URL" > workers/worker_${WORKER_ID}.txt
           ENCODED=$(base64 -w0 workers/worker_${WORKER_ID}.txt)
+          # Check if file exists
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers/worker_${WORKER_ID}.txt")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" --arg content "$ENCODED" --arg sha "$SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" --arg content "$ENCODED" \
+              '{message: $msg, content: $content}')
+          fi
           curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/workers/worker_${WORKER_ID}.txt" \
-            -d "{\"message\":\"register worker $WORKER_ID\",\"content\":\"$ENCODED\"}" || true
+            -d "$PAYLOAD" || true
 
       - name: Fetch next URL and connect
         env:
@@ -356,6 +396,7 @@ jobs:
           WORKER_COUNT: ${{ env.WORKER_COUNT }}
         run: |
           cd prima.cpp
+          export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
           RANK=$WORKER_ID
           if [ $WORKER_ID -eq $WORKER_COUNT ]; then
             NEXT="127.0.0.1:6000"
