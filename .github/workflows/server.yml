@@ -53,20 +53,14 @@ jobs:
           brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install uv (Python package manager)
+      - name: Install vLLM Metal from nightly wheels
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Install vLLM Metal via official install script
-        run: |
-          # The install script creates ~/.venv-vllm-metal with vllm-metal and vLLM core
-          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
-
-      - name: Activate vLLM Metal environment and verify
-        run: |
+          python3 -m venv ~/.venv-vllm-metal
           source ~/.venv-vllm-metal/bin/activate
-          python -c "import vllm; print(f'vLLM version: {vllm.__version__}')"
+          pip install --upgrade pip
+          # Pre-built nightly wheel for Metal (fast, no compilation)
+          pip install vllm --extra-index-url https://wheels.vllm.ai/nightly/metal
+          pip install ray[default]
 
       - name: Start Ray Head and expose via Holesail
         env:
@@ -74,11 +68,10 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           source ~/.venv-vllm-metal/bin/activate
-          # Force Ray to use loopback only
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
-          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1  # Required for macOS multi-node[reference:2]
+          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
           ray start --head --port=6379 \
             --node-ip-address=127.0.0.1 \
             --dashboard-host=127.0.0.1 \
@@ -187,14 +180,13 @@ jobs:
           brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install uv
+      - name: Install vLLM Metal from nightly wheels
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Install vLLM Metal via official install script
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+          python3 -m venv ~/.venv-vllm-metal
+          source ~/.venv-vllm-metal/bin/activate
+          pip install --upgrade pip
+          pip install vllm --extra-index-url https://wheels.vllm.ai/nightly/metal
+          pip install ray[default]
 
       - name: Fetch Head Node URL from repository
         env:
@@ -240,7 +232,7 @@ jobs:
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
-          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1  # Required for macOS multi-node[reference:3]
+          export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
 
           ray start --address=127.0.0.1:6379 --disable-usage-stats
 
