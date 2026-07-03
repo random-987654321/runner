@@ -1,4 +1,4 @@
-name: P2P Inference Mesh – Parallel Speculative RPC
+name: vLLM-Holesail Distributed CPU Mesh with Cloudflare
 
 on:
   workflow_dispatch:
@@ -8,240 +8,70 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 19   # change to 5 for testing
-  MAIN_MODEL_URL: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
-  DRAFT_MODEL_URL: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+  WORKER_COUNT: 3                       # number of worker nodes (adjust as needed)
+  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"  # Hugging Face model ID
+  HEAD_REPO_FILE: "head_url.txt"        # file to share head's Holesail URL
 
 jobs:
-  # ---------------------------------------------
-  # 19 Workers – run rpc-server and register
-  # ---------------------------------------------
-  worker:
+  # ============================================================
+  # HEAD NODE (Node 0) – API Server, Ray Head, Cloudflare Tunnel
+  # ============================================================
+  head:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        worker_id: [1, 2, 3, 4, 5]
     timeout-minutes: 360
 
     steps:
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm
+          sudo apt-get install -y gcc-12 g++-12 libnuma-dev curl jq
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-12
           sudo npm install -g holesail
 
-      - name: Build rpc-server
+      - name: Install Python and build tools
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
-          unzip -q llama.cpp.zip
-          cd llama.cpp-b8487
-          mkdir build && cd build
-          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target rpc-server
-          cp bin/rpc-server ../../
-          cd ../..
-          chmod +x rpc-server
+          pip install --upgrade pip
+          pip install cmake>=3.26 wheel packaging ninja "setuptools-scm>=8" numpy
 
-      - name: Start rpc-server and expose via Holesail
+      - name: Build vLLM CPU backend
+        run: |
+          git clone https://github.com/vllm-project/vllm.git
+          cd vllm
+          pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+          VLLM_TARGET_DEVICE=cpu python setup.py install
+
+      - name: Start Ray Head and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
-          WORKER_ID: ${{ matrix.worker_id }}
         run: |
-          set -e
-          PORT=50052
-          # Use all 4 vCPUs for the RPC server
-          nohup ./rpc-server -H 0.0.0.0 -p ${PORT} -t 4 -c > rpc.log 2>&1 &
-          sleep 3
-
-          holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
+          ray start --head --port=6379 --dashboard-host=0.0.0.0
+          holesail --live 6379 > /tmp/holesail_head.txt 2>&1 &
           sleep 5
-          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
-          if [ -z "$CONNECTION_STRING" ]; then
-            echo "❌ Failed to get Holesail URL"
-            cat /tmp/holesail_output.txt
-            exit 1
-          fi
+          HEAD_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_head.txt | head -1)
+          echo "HEAD_NODE_URL=$HEAD_URL" >> $GITHUB_ENV
+          echo "$HEAD_URL" > head_url.txt
+          ENCODED=$(base64 -w0 head_url.txt)
 
-          echo "✅ Worker $WORKER_ID: ${CONNECTION_STRING}"
-          mkdir -p workers
-          echo "{\"url\": \"${CONNECTION_STRING}\"}" > workers/worker${WORKER_ID}.json
-          ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
-
-          for attempt in {1..10}; do
-            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/worker${WORKER_ID}.json")
-            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" \
-                --arg content "$ENCODED" --arg sha "$SHA" \
-                '{message: $msg, content: $content, sha: $sha}')
-            else
-              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" \
-                --arg content "$ENCODED" \
-                '{message: $msg, content: $content}')
-            fi
-            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/worker${WORKER_ID}.json" \
-              -d "$PAYLOAD")
-            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker $WORKER_ID registered"
-              break
-            fi
-            sleep 3
-          done
-
-          # Keep alive with restart logic
-          while true; do
-            if ! pgrep -f "rpc-server" > /dev/null; then
-              echo "⚠️ rpc-server died, restarting..."
-              nohup ./rpc-server -H 0.0.0.0 -p ${PORT} -t 4 -c > rpc.log 2>&1 &
-            fi
-            if ! pgrep -f "holesail" > /dev/null; then
-              echo "⚠️ Holesail died, restarting..."
-              holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
-            fi
-            sleep 30
-          done
-
-  # ---------------------------------------------
-  # Queen – coordinator (runs in parallel with workers)
-  # ---------------------------------------------
-  queen:
-    # No 'needs' – starts immediately
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm netcat-openbsd
-          sudo npm install -g holesail
-
-      - name: Build llama-server (with RPC)
-        run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
-          unzip -q llama.cpp.zip
-          cd llama.cpp-b8487
-          mkdir build && cd build
-          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-server
-          cp bin/llama-server ../../
-          cd ../..
-          chmod +x llama-server
-
-      - name: Download main model
-        run: |
-          curl -L -o main.gguf "$MAIN_MODEL_URL" -f --retry 3
-
-      - name: Download draft model (for speculation)
-        run: |
-          curl -L -o draft.gguf "$DRAFT_MODEL_URL" -f --retry 3
-
-      - name: Clean workers directory and wait for registrations
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          # Clean any stale worker files from previous runs
-          echo "🧹 Cleaning workers/ directory..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+          # Publish URL to repo so workers can fetch it
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
-            if [ -n "$name" ] && [ -n "$sha" ]; then
-              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
-                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
-            fi
-          done
+            "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
+            -d "{\"message\":\"publish head url\",\"content\":\"$ENCODED\"}" || true
 
-          echo "👑 Queen waiting for $WORKER_COUNT workers..."
-          for attempt in {1..20}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
-              COUNT=0
-            else
-              FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
-              COUNT=$(echo "$FILES" | grep -c . || echo 0)
-            fi
-            echo "  Attempt $attempt: $COUNT/$WORKER_COUNT registered"
-            if [ "$COUNT" -ge $WORKER_COUNT ]; then break; fi
-            sleep 5
-          done
-          if [ "$COUNT" -lt $WORKER_COUNT ]; then
-            echo "❌ Timeout waiting for workers"
-            exit 1
-          fi
-
-      - name: Connect to workers and build adaptive RPC list
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
+      - name: Start vLLM API Server
         run: |
-          echo "🔗 Connecting to $WORKER_COUNT workers..."
-          BASE_PORT=60000
-          RPC_ADDRS=""
-          for i in $(seq 1 $WORKER_COUNT); do
-            file="worker${i}.json"
-            curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${REPO}/contents/workers/${file}" > /tmp/worker.json
-            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
-            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-              echo "❌ Worker $i URL missing"
-              exit 1
-            fi
-            PORT=$((BASE_PORT + i - 1))
-            holesail --connect "$URL" --port $PORT &
-            if [ -z "$RPC_ADDRS" ]; then
-              RPC_ADDRS="127.0.0.1:${PORT}"
-            else
-              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${PORT}"
-            fi
-          done
-          echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
-          echo "✅ All workers connected. RPC list: $RPC_ADDRS"
-          sleep 10  # let tunnels stabilise
+          python -m vllm.entrypoints.openai.api_server \
+            --model $MODEL_ID \
+            --dtype float16 \
+            --tensor-parallel-size 1 \
+            --worker-use-ray \
+            --port 8080 &
+          sleep 15
 
-      - name: Start llama-server with speculation + Cloudflare tunnel
-        env:
-          RPC_ADDRS: ${{ env.RPC_ADDRS }}
+      - name: Expose API via Cloudflare Tunnel
         run: |
-          echo "🚀 Starting llama-server with RPC + speculative decoding..."
-          nohup ./llama-server \
-            -m main.gguf \
-            -md draft.gguf \
-            --draft 8 \
-            -t 2 \
-            -tb 4 \
-            --rpc ${RPC_ADDRS} \
-            -fa on \
-            -ngl 0 \
-            -c 2048 \
-            --no-mmap \
-            > server.log 2>&1 &
-
-          for i in {1..120}; do
-            if curl -s http://localhost:8080/health > /dev/null; then
-              echo "✅ llama-server ready"
-              break
-            fi
-            echo "⏳ Waiting for server... ($i/120)"
-            sleep 2
-          done
-          if ! curl -s http://localhost:8080/health > /dev/null; then
-            echo "❌ llama-server failed – showing log:"
-            cat server.log
-            exit 1
-          fi
-
-          # Cloudflare tunnel
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
@@ -250,11 +80,76 @@ jobs:
           sleep 5
           TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
           if [ -n "$TUNNEL_URL" ]; then
-            echo "✅ Public API: $TUNNEL_URL"
+            echo "✅ Public API URL: $TUNNEL_URL"
             echo "::notice::API available at $TUNNEL_URL"
           else
             echo "⚠️ Tunnel not ready – check tunnel.log"
+            tail -20 tunnel.log
           fi
 
-          # Keep alive
+      - name: Keep alive
+        run: sleep infinity
+
+  # ============================================================
+  # WORKER NODES – Connect to Ray Head and join cluster
+  # ============================================================
+  worker:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        worker_id: [1, 2, 3]   # adjust to match WORKER_COUNT
+    timeout-minutes: 360
+
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-12 g++-12 libnuma-dev curl jq
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-12
+          sudo npm install -g holesail
+
+      - name: Install Python and build tools
+        run: |
+          pip install --upgrade pip
+          pip install cmake>=3.26 wheel packaging ninja "setuptools-scm>=8" numpy
+
+      - name: Build vLLM CPU backend
+        run: |
+          git clone https://github.com/vllm-project/vllm.git
+          cd vllm
+          pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+          VLLM_TARGET_DEVICE=cpu python setup.py install
+
+      - name: Fetch Head Node URL from repository
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "📡 Fetching Head Node URL..."
+          HEAD_URL=""
+          for attempt in {1..30}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" 2>/dev/null)
+            URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
+            if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
+              echo "Fetched URL: $URL"
+              HEAD_URL="$URL"
+              break
+            fi
+            echo "  Waiting for Head Node to publish URL... ($attempt/30)"
+            sleep 5
+          done
+          if [ -z "$HEAD_URL" ]; then
+            echo "❌ Failed to fetch Head Node URL"
+            exit 1
+          fi
+          echo "HEAD_NODE_URL=$HEAD_URL" >> $GITHUB_ENV
+
+      - name: Connect to Ray Head via Holesail and start worker
+        run: |
+          holesail --connect "$HEAD_NODE_URL" --port 6379 &
+          sleep 10
+          ray start --address="127.0.0.1:6379"
           sleep infinity
