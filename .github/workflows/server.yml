@@ -68,13 +68,11 @@ jobs:
           cd distributed-llama
           make dllama
           make dllama-api
-          ls -la   # verify files
+          ls -la
 
-      - name: Download model (llama3.2 1B Instruct Q40) with non‑interactive flags
+      - name: Download model (llama3.2 1B Instruct Q40) using launch.py
         run: |
-          # Use absolute path to avoid cd confusion
-          ls -la distributed-llama/   # debug
-          python3 distributed-llama/download-model.py llama3_2_1b_instruct_q40 -y -skip-run -skip-script
+          python3 distributed-llama/launch.py llama3_2_1b_instruct_q40 -y -skip-run -skip-script
           # verify model files
           ls -la distributed-llama/models/llama3_2_1b_instruct_q40/
 
