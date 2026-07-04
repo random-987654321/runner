@@ -1,6 +1,3 @@
-novel workflow to distribute the system 
-
-
 name: P2P Inference Mesh (Holesail)
 
 on:
@@ -170,11 +167,11 @@ jobs:
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
           ./llama-server \
             -m model.gguf \
-            -t 3 \
+            -t 4 \
             -tb 4 \
             --rpc ${RPC_ADDRS} \
             -fa on \
-            -ngl -1 \
+            -ngl 0 \
             -c 4096 \
             &
           
