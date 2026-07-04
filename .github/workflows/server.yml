@@ -167,8 +167,6 @@ jobs:
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
           ./llama-server \
             -m model.gguf \
-            -t 4 \
-            -tb 4 \
             --rpc ${RPC_ADDRS} \
             -fa on \
             -ngl 0 \
@@ -261,7 +259,7 @@ jobs:
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
           PORT=50052
-          ./rpc-server -H 0.0.0.0 -p ${PORT} -c -t 4&
+          ./rpc-server -H 0.0.0.0 -p ${PORT} -t 4 -c &
           sleep 5
           echo "Starting Holesail server on port ${PORT}..."
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
