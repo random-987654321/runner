@@ -8,6 +8,9 @@ permissions:
   contents: write
 
 jobs:
+  # ============================================
+  # QUEEN – coordinates workers and serves API
+  # ============================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -70,10 +73,9 @@ jobs:
           make dllama-api
           ls -la
 
-      - name: Download model (llama3.2 1B Instruct Q40) using launch.py
+      - name: Download model (llama3.2 1B Instruct Q40)
         run: |
           python3 distributed-llama/launch.py llama3_2_1b_instruct_q40 -y -skip-run -skip-script
-          # verify model files
           ls -la distributed-llama/models/llama3_2_1b_instruct_q40/
 
       - name: Wait for workers and collect Holesail URLs
@@ -81,7 +83,8 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "👑 Queen waiting for 5 workers..."
+          # We expect exactly 4 workers (power of two)
+          echo "👑 Queen waiting for 4 workers..."
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -93,13 +96,13 @@ jobs:
               WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
             fi
             echo "  Attempt $attempt: $WORKER_COUNT workers registered"
-            if [ "$WORKER_COUNT" -ge 5 ]; then
+            if [ "$WORKER_COUNT" -ge 4 ]; then
               echo "✅ All workers registered!"
               break
             fi
             sleep 5
           done
-          if [ "$WORKER_COUNT" -lt 5 ]; then
+          if [ "$WORKER_COUNT" -lt 4 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
@@ -227,12 +230,16 @@ jobs:
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
+  # ============================================
+  # WORKER – each runs a slice of the model
+  # ============================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5]
+        # Use exactly 4 workers (power of two)
+        instance: [1, 2, 3, 4]
 
     steps:
       - name: Install dependencies (Worker)
