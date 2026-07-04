@@ -62,25 +62,26 @@ jobs:
       - name: Install dependencies (Queen)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl python3 python3-pip nodejs npm openssl
+          sudo apt-get install -y jq curl python3 python3-pip nodejs npm openssl git build-essential
           sudo npm install -g holesail
 
-      - name: Clone and install distributed-llama
+      - name: Clone and build distributed-llama
         run: |
           git clone https://github.com/b4rtaz/distributed-llama.git
           cd distributed-llama
-          pip3 install .
+          make dllama
+          make dllama-api
+          ls -la  # show binaries
 
-      - name: Download model
+      - name: Download model using distributed-llama launcher
         run: |
-          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
-          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
-            echo "✅ Valid GGUF file downloaded"
-          else
-            echo "❌ Invalid GGUF file"
-            exit 1
-          fi
+          cd distributed-llama
+          # List available models (optional)
+          python3 launch.py
+          # Download a small Q40 model (adjust if needed)
+          python3 launch.py llama3_2_3b_instruct_q40
+          # The model files will be in ./models/llama3_2_3b_instruct_q40/
+          ls -la models/
 
       - name: Wait for workers and collect Holesail URLs
         env:
@@ -142,7 +143,7 @@ jobs:
             echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
             holesail "${url}" --port ${LOCAL_PORT} &
             if [ -n "$WORKER_ADDRS" ]; then
-              WORKER_ADDRS="${WORKER_ADDRS},127.0.0.1:${LOCAL_PORT}"
+              WORKER_ADDRS="${WORKER_ADDRS} 127.0.0.1:${LOCAL_PORT}"
             else
               WORKER_ADDRS="127.0.0.1:${LOCAL_PORT}"
             fi
@@ -152,34 +153,46 @@ jobs:
           echo "✅ All Holesail clients started. Worker addresses: ${WORKER_ADDRS}"
           sleep 10   # give tunnels time to establish
 
-      - name: Start distributed-llama root node and Cloudflare tunnel
+      - name: Start distributed-llama API server and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
           WORKER_ADDRS: ${{ env.WORKER_ADDRS }}
         run: |
-          echo "🌐 Starting distributed-llama root node with workers: ${WORKER_ADDRS}"
-          # The root node binds to 0.0.0.0:8080 by default (can be changed)
+          echo "🌐 Starting distributed-llama API server with workers: ${WORKER_ADDRS}"
           cd distributed-llama
-          python3 -m dllama.root \
-            --workers "${WORKER_ADDRS}" \
-            --model ../model.gguf \
-            --threads 2 \
-            --root_ip 0.0.0.0 \
-            --root_port 8080 \
+          # Build the worker address list as space-separated
+          # The model path: models/llama3_2_3b_instruct_q40/dllama_model_*.m
+          MODEL_FILE=$(find models -name "dllama_model_*.m" | head -1)
+          TOKENIZER_FILE=$(find models -name "dllama_tokenizer_*.t" | head -1)
+          if [ -z "$MODEL_FILE" ] || [ -z "$TOKENIZER_FILE" ]; then
+            echo "❌ Model or tokenizer not found"
+            exit 1
+          fi
+          echo "Using model: $MODEL_FILE"
+          echo "Using tokenizer: $TOKENIZER_FILE"
+          # Start API server on port 8080, bind to 0.0.0.0
+          ./dllama-api \
+            --port 8080 \
+            --model "$MODEL_FILE" \
+            --tokenizer "$TOKENIZER_FILE" \
+            --buffer-float-type q80 \
+            --nthreads 2 \
+            --max-seq-len 4096 \
+            --workers ${WORKER_ADDRS} \
             &
           cd ..
 
           for i in {1..60}; do
             if curl -s http://localhost:8080/health > /dev/null; then
-              echo "✅ distributed-llama root is ready"
+              echo "✅ API server is ready"
               break
             fi
-            echo "⏳ Waiting for root node... ($i/60)"
+            echo "⏳ Waiting for API server... ($i/60)"
             sleep 2
           done
           if ! curl -s http://localhost:8080/health > /dev/null; then
-            echo "❌ Root node failed to start"
+            echo "❌ API server failed to start"
             exit 1
           fi
 
@@ -204,6 +217,7 @@ jobs:
             exit 1
           fi
 
+          # Optional: update a chat frontend repo
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -237,14 +251,15 @@ jobs:
       - name: Install dependencies (Worker)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl python3 python3-pip nodejs npm openssl
+          sudo apt-get install -y jq curl python3 python3-pip nodejs npm openssl git build-essential
           sudo npm install -g holesail
 
-      - name: Clone and install distributed-llama
+      - name: Clone and build distributed-llama
         run: |
           git clone https://github.com/b4rtaz/distributed-llama.git
           cd distributed-llama
-          pip3 install .
+          make dllama
+          ls -la
 
       - name: Start distributed-llama worker and Holesail tunnel
         env:
@@ -257,7 +272,7 @@ jobs:
           PORT=50052
           cd distributed-llama
           # Worker binds to 0.0.0.0 so Holesail can forward
-          python3 -m dllama.worker --ip 0.0.0.0 --port ${PORT} &
+          ./dllama worker --port ${PORT} --nthreads 2 &
           cd ..
           sleep 5
 
@@ -316,10 +331,10 @@ jobs:
 
           # Keep worker alive – restart processes if they die
           while true; do
-            if ! pgrep -f "dllama.worker" > /dev/null; then
+            if ! pgrep -f "dllama worker" > /dev/null; then
               echo "⚠️ Worker process died, restarting..."
               cd distributed-llama
-              python3 -m dllama.worker --ip 0.0.0.0 --port ${PORT} &
+              ./dllama worker --port ${PORT} --nthreads 2 &
               cd ..
             fi
             if ! pgrep -f "holesail" > /dev/null; then
