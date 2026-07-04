@@ -75,49 +75,47 @@ jobs:
           python3 distributed-llama/launch.py llama3_2_1b_instruct_q40 -y -skip-run -skip-script
           ls -la distributed-llama/models/llama3_2_1b_instruct_q40/
 
-      # ---- Wait for exactly 1 worker ----
+      # ============================================================
+      # 🔧 FIXED: Wait for worker and extract valid Holesail URL
+      # ============================================================
       - name: Wait for 1 worker and collect Holesail URL
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "👑 Queen waiting for exactly 1 worker..."
+          echo "👑 Queen waiting for worker with valid URL..."
+          HOLESAIL_URLS=""
           for attempt in {1..120}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
             if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
               WORKER_COUNT=0
+              WORKER_FILES=""
             else
               WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
               WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
             fi
             echo "  Attempt $attempt: $WORKER_COUNT workers registered"
-            if [ "$WORKER_COUNT" -ge 1 ]; then
-              echo "✅ Worker registered!"
-              break
-            fi
+            # Try to extract a URL from any worker file
+            for file in $WORKER_FILES; do
+              if [ "$file" = ".keep" ]; then continue; fi
+              curl -s -H "Authorization: Bearer $GH_TOKEN" \
+                "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
+                > /tmp/worker.json
+              URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url' 2>/dev/null)
+              if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+                echo "✅ Found valid URL in $file: $URL"
+                HOLESAIL_URLS="$URL"
+                break 2
+              else
+                echo "⚠️ No valid URL in $file yet"
+              fi
+            done
             sleep 5
           done
-          if [ "$WORKER_COUNT" -lt 1 ]; then
-            echo "❌ Timeout waiting for worker"
-            exit 1
-          fi
-          HOLESAIL_URLS=""
-          for file in $WORKER_FILES; do
-            if [ "$file" = ".keep" ]; then continue; fi
-            curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
-              > /tmp/worker.json
-            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
-            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-              echo "Found URL: $URL"
-              HOLESAIL_URLS="$URL"
-              break
-            fi
-          done
           if [ -z "$HOLESAIL_URLS" ]; then
-            echo "❌ No valid Holesail URL found"
+            echo "❌ No valid Holesail URL found after 120 attempts"
             exit 1
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
@@ -219,7 +217,7 @@ jobs:
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1]   # only one worker
+        instance: [1]   # only one worker → total nodes = 2 (power of two)
 
     steps:
       - name: Install dependencies (Worker)
