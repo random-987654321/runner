@@ -1,4 +1,7 @@
-name: prima.cpp Ring Mesh (Holesail)
+novel workflow to distribute the system 
+
+
+name: P2P Inference Mesh (Holesail)
 
 on:
   workflow_dispatch:
@@ -7,17 +10,13 @@ permissions:
   actions: write
   contents: write
 
-env:
-  WORKER_COUNT: 4
-  MODEL_URL: "https://huggingface.co/DevQuasar-7/deepseek-ai.DeepSeek-R1-Distill-Qwen-7B-GGUF/resolve/main/deepseek-ai.DeepSeek-R1-Distill-Qwen-7B.Q4_K_M.gguf"
-
 jobs:
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Clean all state files
+      - name: Clean workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -34,493 +33,297 @@ jobs:
                 -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
             fi
           done
-
-          for i in $(seq 1 $WORKER_COUNT); do
-            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" 2>/dev/null)
-            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
-                -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}" || true
-            fi
-          done
-
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/master_url.txt" 2>/dev/null)
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
-              -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}" || true
-          fi
           echo "✅ Cleanup done."
-
-      - name: Install system dependencies
+      - name: Create workers directory
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "📁 Creating fresh workers directory..."
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers/.keep" 2>/dev/null)
+          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
+          echo "" | base64 -w0 > empty_keep
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\",\"sha\":\"${SHA}\"}" || true
+          else
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
+          fi
+          echo "✅ workers directory ready."
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential cmake git wget libzmq3-dev
-          sudo npm install -g holesail
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
+      - name: Install Holesail (global)
+        run: sudo npm install -g holesail
 
-      - name: Install fio
+      - name: Build llama-server with RPC support
         run: |
-          sudo apt-get install -y fio || true
-          if ! command -v fio &> /dev/null; then
-            git clone https://github.com/axboe/fio.git
-            cd fio
-            ./configure --prefix=/usr
-            make -j$(nproc)
-            sudo make install
-            cd ..
-          fi
-
-      - name: Install HiGHS
-        run: |
-          git clone https://github.com/ERGO-Code/HiGHS.git
-          cd HiGHS
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-b8487
           mkdir build && cd build
-          cmake ..
-          make -j$(nproc)
-          sudo make install
+          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target llama-server
+          cp bin/llama-server ../../
           cd ../..
-
-      - name: Clone and build prima.cpp
-        run: |
-          git clone https://github.com/OpenCPIL/prima.cpp.git
-          cd prima.cpp
-          make USE_HIGHS=1 -j$(nproc)
-          if [ ! -f ./llama-server ]; then
-            make llama-server
-          fi
-          if [ -f ./llama-server ]; then
-            echo "✅ llama-server built"
+          chmod +x llama-server
+          if ./llama-server --help 2>&1 | grep -q rpc; then
+            echo "✅ llama-server RPC support enabled"
           else
-            echo "❌ llama-server not found!"
-            ls -la
+            echo "❌ llama-server RPC support missing"
             exit 1
           fi
-          ./llama-cli --help | head -5
-
-      - name: Download model and validate
+      - name: Download model
         run: |
-          mkdir -p models
-          curl -L -o models/model.gguf "$MODEL_URL" -f --retry 3
-          if [ "$(head -c 4 models/model.gguf)" = "GGUF" ]; then
+          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
+          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
+          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
             echo "✅ Valid GGUF file downloaded"
           else
             echo "❌ Invalid GGUF file"
-            head -c 20 models/model.gguf | xxd
             exit 1
           fi
-
-      - name: Start Holesail tunnel for master port (6000)
+      - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          holesail --live 6000 > /tmp/holesail_master.txt 2>&1 &
-          sleep 5
-          MASTER_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_master.txt | head -1)
-          echo "MASTER_HOLESAIL_URL=$MASTER_URL" >> $GITHUB_ENV
-          echo "$MASTER_URL" > master_url.txt
-          ENCODED=$(base64 -w0 master_url.txt)
-
-          for attempt in {1..5}; do
-            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/master_url.txt")
-            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-              PAYLOAD=$(jq -n --arg msg "publish master url" --arg content "$ENCODED" --arg sha "$SHA" \
-                '{message: $msg, content: $content, sha: $sha}')
-            else
-              PAYLOAD=$(jq -n --arg msg "publish master url" --arg content "$ENCODED" \
-                '{message: $msg, content: $content}')
-            fi
-            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
-              -d "$PAYLOAD")
-            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Published master URL"
-              break
-            fi
-            if [ $attempt -lt 5 ]; then sleep 2; fi
-          done
-
-      - name: Wait for workers and build ring
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-          WORKER_COUNT: ${{ env.WORKER_COUNT }}
-          MASTER_URL: ${{ env.MASTER_HOLESAIL_URL }}
-        run: |
-          echo "👑 Queen waiting for $WORKER_COUNT workers..."
+          echo "👑 Queen waiting for 5 workers..."
           for attempt in {1..60}; do
-            ALL_FOUND=true
-            for i in $(seq 1 $WORKER_COUNT); do
-              RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/workers/worker_${i}.txt" 2>/dev/null)
-              if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
-                ALL_FOUND=false
-                break
-              fi
-            done
-            if [ "$ALL_FOUND" = true ]; then
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
+              WORKER_COUNT=0
+            else
+              WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
+              WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
+            fi
+            echo "  Attempt $attempt: $WORKER_COUNT workers registered"
+            if [ "$WORKER_COUNT" -ge 5 ]; then
               echo "✅ All workers registered!"
               break
             fi
-            echo "  Attempt $attempt: waiting..."
             sleep 5
           done
-          if [ "$ALL_FOUND" != true ]; then
+          if [ "$WORKER_COUNT" -lt 5 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
-
-          for i in $(seq 1 $WORKER_COUNT); do
-            NEXT_INDEX=$((i + 1))
-            if [ $NEXT_INDEX -gt $WORKER_COUNT ]; then
-              NEXT_URL="$MASTER_URL"
-            else
-              RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/workers/worker_${NEXT_INDEX}.txt" 2>/dev/null)
-              NEXT_URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
-              if [ -z "$NEXT_URL" ] || [ "$NEXT_URL" = "null" ]; then
-                echo "❌ Failed to get next URL for worker $i"
-                exit 1
+          HOLESAIL_URLS=""
+          for file in $WORKER_FILES; do
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
+              > /tmp/worker.json
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+              echo "Found URL: $URL"
+              if [ -n "$HOLESAIL_URLS" ]; then
+                HOLESAIL_URLS="${HOLESAIL_URLS},${URL}"
+              else
+                HOLESAIL_URLS="${URL}"
               fi
             fi
-            echo "$NEXT_URL" > next_url_${i}.txt
-            ENCODED_NEXT=$(base64 -w0 next_url_${i}.txt)
-
-            for attempt in {1..5}; do
-              FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt")
-              SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-              if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-                PAYLOAD=$(jq -n --arg msg "publish next url for worker $i" --arg content "$ENCODED_NEXT" --arg sha "$SHA" \
-                  '{message: $msg, content: $content, sha: $sha}')
-              else
-                PAYLOAD=$(jq -n --arg msg "publish next url for worker $i" --arg content "$ENCODED_NEXT" \
-                  '{message: $msg, content: $content}')
-              fi
-              RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
-                -d "$PAYLOAD")
-              if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-                echo "✅ Published next_url_${i}.txt"
-                break
-              fi
-              if [ $attempt -lt 5 ]; then sleep 2; fi
-            done
           done
-          echo "✅ Published next URLs for all workers."
-
-      - name: Connect to worker 1 via Holesail
+          if [ -z "$HOLESAIL_URLS" ]; then
+            echo "❌ No valid Holesail URLs found"
+            exit 1
+          fi
+          echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
+      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
+      - name: Connect to workers via Holesail (unique ports)
+        env:
+          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
+        run: |
+          echo "🔗 Connecting to workers via Holesail P2P tunnels..."
+          IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
+          LOCAL_PORT=60000
+          RPC_ADDRS=""
+          for url in "${URLS[@]}"; do
+            echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
+            # Use --port to force client to listen on a specific local port
+            holesail "${url}" --port ${LOCAL_PORT} &
+            if [ -n "$RPC_ADDRS" ]; then
+              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
+            else
+              RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
+            fi
+            LOCAL_PORT=$((LOCAL_PORT + 1))
+          done
+          echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
+          echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
+          sleep 10   # give tunnels time to establish
+      - name: Start llama-server with RPC and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/worker_1.txt" 2>/dev/null)
-          WORKER1_URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
-          if [ -z "$WORKER1_URL" ] || [ "$WORKER1_URL" = "null" ]; then
-            echo "❌ Failed to get worker 1 URL"
-            exit 1
-          fi
-          holesail --connect "$WORKER1_URL" --port 7001 &
-          sleep 5
-
-      - name: Start prima.cpp master (llama-server) with proper logging
-        run: |
-          cd prima.cpp
-          export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-          if [ ! -f ./llama-server ]; then
-            echo "❌ llama-server binary not found!"
-            exit 1
-          fi
-          chmod +x ./llama-server
-          WORLD=$((WORKER_COUNT + 1))
-          # Use stdbuf to disable buffering, pipe to tee to capture both file and stdout
-          stdbuf -oL -eL ./llama-server \
-            -m ../models/model.gguf \
-            -c 2048 \
-            --world $WORLD \
-            --rank 0 \
-            --master 0.0.0.0:6000 \
-            --next 127.0.0.1:7001 \
-            --host 0.0.0.0 \
-            --port 8080 \
-            2>&1 | tee master.log &
-          SERVER_PID=$!
-          echo "Server PID: $SERVER_PID"
-          sleep 2
-          # Force sync to ensure file is written
-          sync
-          if ! ps -p $SERVER_PID > /dev/null; then
-            echo "❌ llama-server died. Log:"
-            cat master.log || echo "master.log not found"
-            exit 1
-          fi
-          echo "✅ llama-server process is running (PID $SERVER_PID)"
-          echo "📄 Checking master.log existence:"
-          ls -la master.log || echo "master.log not found"
-          echo "📄 master.log (first 30 lines):"
-          head -30 master.log || echo "master.log not found"
-          echo "🔍 Listening ports:"
-          ss -lpn | grep -E "6000|8080" || echo "No ports found"
-
-      - name: Wait for master to be truly ready (200 OK)
-        run: |
-          cd prima.cpp
-          echo "🌐 Waiting for master API to be ready..."
-          READY=false
-          for i in {1..150}; do
-            if curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health | grep -q 200; then
-              echo "✅ Master API ready"
-              READY=true
+          echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
+          ./llama-server \
+            -m model.gguf \
+            -t 3 \
+            -tb 4 \
+            --rpc ${RPC_ADDRS} \
+            -fa on \
+            -ngl -1 \
+            -c 4096 \
+            &
+          
+          for i in {1..600}; do
+            if curl -s http://localhost:8080/health > /dev/null; then
+              echo "✅ llama-server is ready"
               break
             fi
-            echo "⏳ Waiting... ($i/150)"
+            echo "⏳ Waiting for llama-server... ($i/600)"
             sleep 2
-            if [ $i -eq 10 ]; then
-              echo "📄 master.log (last 20 lines):"
-              tail -20 master.log || echo "master.log not found"
-              echo "Processes:"
-              ps aux | grep llama-server || true
-              echo "Listening ports:"
-              ss -lpn | grep -E "6000|8080" || true
-            fi
           done
-          if [ "$READY" != "true" ]; then
-            echo "❌ Master failed to become ready within 5 minutes"
-            echo "📄 Full master.log:"
-            cat master.log || echo "master.log not found"
+          if ! curl -s http://localhost:8080/health > /dev/null; then
+            echo "❌ llama-server failed to start"
+            cat server.log
             exit 1
           fi
-
-      - name: Expose API via Cloudflare Tunnel
-        run: |
+          echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
-          sleep 5
-          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-          if [ -n "$TUNNEL_URL" ]; then
-            echo "✅ Public API: $TUNNEL_URL"
-            echo "::notice::API available at $TUNNEL_URL"
-          fi
-
-      - name: Keep alive
-        run: sleep infinity
-
-  worker:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        worker_id: [1, 2, 3, 4]
-    timeout-minutes: 360
-
-    steps:
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential cmake git wget libzmq3-dev
-          sudo npm install -g holesail
-
-      - name: Install fio
-        run: |
-          sudo apt-get install -y fio || true
-          if ! command -v fio &> /dev/null; then
-            git clone https://github.com/axboe/fio.git
-            cd fio
-            ./configure --prefix=/usr
-            make -j$(nproc)
-            sudo make install
-            cd ..
-          fi
-
-      - name: Install HiGHS
-        run: |
-          git clone https://github.com/ERGO-Code/HiGHS.git
-          cd HiGHS
-          mkdir build && cd build
-          cmake ..
-          make -j$(nproc)
-          sudo make install
-          cd ../..
-
-      - name: Clone and build prima.cpp
-        run: |
-          git clone https://github.com/OpenCPIL/prima.cpp.git
-          cd prima.cpp
-          make USE_HIGHS=1 -j$(nproc)
-
-      - name: Download model
-        run: |
-          mkdir -p models
-          curl -L -o models/model.gguf "$MODEL_URL" -f --retry 3
-          if [ "$(head -c 4 models/model.gguf)" != "GGUF" ]; then
-            echo "❌ Invalid GGUF file on worker"
-            exit 1
-          fi
-
-      - name: Fetch master URL
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-          WORKER_ID: ${{ matrix.worker_id }}
-        run: |
-          echo "📡 Worker $WORKER_ID fetching master URL..."
-          MASTER_URL=""
-          for attempt in {1..30}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/master_url.txt" 2>/dev/null)
-            if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
-              sleep 5
-              continue
-            fi
-            URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
-            if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
-              MASTER_URL="$URL"
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Tunnel URL: $TUNNEL_URL"
               break
             fi
-            sleep 5
+            echo "⏳ Waiting for tunnel... ($i/30)"
+            sleep 3
           done
-          if [ -z "$MASTER_URL" ]; then
-            echo "❌ Failed to fetch master URL"
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL"
+            tail -50 tunnel.log
             exit 1
           fi
-          echo "MASTER_HOLESAIL_URL=$MASTER_URL" >> $GITHUB_ENV
+          CHAT_REPO="${{ github.repository_owner }}/chat"
+          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
+          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
+          if [ "$SHA" != "null" ]; then
+            PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+              -d "$PAYLOAD"
+          fi
+          echo "::notice::Frontend URL: https://$CHAT_REPO"
+          echo "🔄 Queen is serving. Keeping alive..."
+          sleep infinity
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      matrix:
+        instance: [1, 2, 3, 4, 5]
 
-      - name: Connect to master via Holesail
+    steps:
+      - name: Install dependencies
         run: |
-          holesail --connect "$MASTER_HOLESAIL_URL" --port 6000 &
-          sleep 10
-          if nc -zv 127.0.0.1 6000 2>&1 | grep -q "succeeded"; then
-            echo "✅ Tunnel to master is open on 127.0.0.1:6000"
-          else
-            echo "❌ Tunnel failed – cannot connect to master"
-            exit 1
-          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
+      - name: Install Holesail (global)
+        run: sudo npm install -g holesail
 
-      - name: Expose worker and register
+      - name: Build rpc-server
+        run: |
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-b8487
+          mkdir build && cd build
+          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target rpc-server
+          cp bin/rpc-server ../../
+          cd ../..
+          chmod +x rpc-server
+      - name: Start RPC server and create Holesail tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
-          WORKER_ID: ${{ matrix.worker_id }}
+          INSTANCE_ID: ${{ matrix.instance }}
         run: |
-          RPC_PORT=$((5000 + WORKER_ID))
-          holesail --live $RPC_PORT > /tmp/holesail_worker.txt 2>&1 &
+          set -e
+          echo "🐝 Worker $INSTANCE_ID starting..."
+          PORT=50052
+          ./rpc-server -H 0.0.0.0 -p ${PORT} -c &
           sleep 5
-          WORKER_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_worker.txt | head -1)
-          echo "✅ Worker $WORKER_ID: $WORKER_URL"
+          echo "Starting Holesail server on port ${PORT}..."
+          holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
+          sleep 5
+          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
+          if [ -z "$CONNECTION_STRING" ]; then
+            echo "❌ Failed to get connection string from Holesail"
+            cat /tmp/holesail_output.txt
+            exit 1
+          fi
+          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
+          WORKER_FILE="workers/hole${INSTANCE_ID}.json"
           mkdir -p workers
-          echo "$WORKER_URL" > workers/worker_${WORKER_ID}.txt
-          ENCODED=$(base64 -w0 workers/worker_${WORKER_ID}.txt)
-
-          for attempt in {1..5}; do
+          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
+          ENCODED=$(base64 -w0 ${WORKER_FILE})
+          for attempt in {1..10}; do
+            echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
             FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/worker_${WORKER_ID}.txt")
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
             SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
             if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" --arg content "$ENCODED" --arg sha "$SHA" \
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
+                --arg sha "$SHA" \
                 '{message: $msg, content: $content, sha: $sha}')
             else
-              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" --arg content "$ENCODED" \
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
                 '{message: $msg, content: $content}')
             fi
             RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/worker_${WORKER_ID}.txt" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
               -d "$PAYLOAD")
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker $WORKER_ID registered"
+              echo "✅ Worker $INSTANCE_ID registered successfully!"
               break
             fi
-            if [ $attempt -lt 5 ]; then sleep 2; fi
-          done
-
-      - name: Fetch next URL and connect
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-          WORKER_ID: ${{ matrix.worker_id }}
-        run: |
-          echo "📡 Worker $WORKER_ID fetching next URL..."
-          NEXT_URL=""
-          for attempt in {1..30}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/next_url_${WORKER_ID}.txt" 2>/dev/null)
-            if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
-              sleep 5
+            STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
+            if [ "$STATUS" = "409" ]; then
+              echo "⚠️ Conflict detected – retrying in 3 seconds..."
+              sleep 3
               continue
             fi
-            URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
-            if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
-              NEXT_URL="$URL"
-              break
-            fi
-            sleep 5
-          done
-          if [ -z "$NEXT_URL" ]; then
-            echo "❌ Failed to fetch next URL"
+            echo "❌ Failed to register worker $INSTANCE_ID"
+            echo "Response: $RESPONSE"
             exit 1
-          fi
-          echo "NEXT_HOLESAIL_URL=$NEXT_URL" >> $GITHUB_ENV
-
-      - name: Connect to next node
-        run: |
-          NEXT_PORT=$((7000 + WORKER_ID))
-          holesail --connect "$NEXT_HOLESAIL_URL" --port $NEXT_PORT &
-          sleep 5
-
-      - name: Start prima.cpp worker (llama-cli) with wait
-        env:
-          WORKER_ID: ${{ matrix.worker_id }}
-          WORKER_COUNT: ${{ env.WORKER_COUNT }}
-        run: |
-          echo "⏳ Waiting 60 seconds for master to be ready..."
-          sleep 90
-
-          cd prima.cpp
-          export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-          RANK=$WORKER_ID
-          if [ $WORKER_ID -eq $WORKER_COUNT ]; then
-            NEXT="127.0.0.1:6000"
-          else
-            NEXT_PORT=$((7000 + WORKER_ID))
-            NEXT="127.0.0.1:$NEXT_PORT"
-          fi
-          WORLD=$((WORKER_COUNT + 1))
-          nohup ./llama-cli \
-            -m ../models/model.gguf \
-            -c 2048 \
-            --world $WORLD \
-            --rank $RANK \
-            --master 127.0.0.1:6000 \
-            --next "$NEXT" \
-            --prefetch \
-            > worker.log 2>&1 &
-
-          sleep 10
-          echo "📄 worker.log (first 30 lines):"
-          head -30 worker.log || echo "worker.log not found"
-
-      - name: Keep alive
-        run: sleep infinity
+          done
+          while true; do
+            if ! pgrep -f "rpc-server" > /dev/null; then
+              echo "⚠️ RPC server died, restarting..."
+              ./rpc-server -H 0.0.0.0 -p ${PORT} -c &
+            fi
+            if ! pgrep -f "holesail" > /dev/null; then
+              echo "⚠️ Holesail server died, restarting..."
+              holesail --live ${PORT} &
+            fi
+            sleep 30
+          done
