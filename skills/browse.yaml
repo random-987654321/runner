@@ -9,3 +9,4 @@ parameters:
 mcp_server: "npx @playwright/mcp@latest"
 server_args: "--headless --browser chromium"
 port: 50052
+
