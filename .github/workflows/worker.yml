@@ -1,0 +1,98 @@
+name: Standard MCP Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      skill_name:
+        description: 'Skill name'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl nodejs npm python3 python3-pip
+          sudo npm install -g holesail
+
+      - name: Read skill definition and start MCP server
+        env:
+          SKILL_NAME: ${{ github.event.inputs.skill_name }}
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          SKILL_FILE="skills/${SKILL_NAME}.yaml"
+          if [ ! -f "$SKILL_FILE" ]; then
+            echo "❌ Skill file not found"
+            exit 1
+          fi
+
+          # Extract MCP server command, args, and port from YAML
+          MCP_SERVER=$(grep '^mcp_server:' "$SKILL_FILE" | sed 's/mcp_server: //' | xargs)
+          SERVER_ARGS=$(grep '^server_args:' "$SKILL_FILE" | sed 's/server_args: //' | xargs)
+          PORT=$(grep '^port:' "$SKILL_FILE" | sed 's/port: //' | xargs)
+          PORT=${PORT:-50052}
+
+          echo "Starting MCP server: $MCP_SERVER $SERVER_ARGS --port $PORT"
+          eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
+          sleep 15   # give server time to bind
+
+          # Create Holesail tunnel and capture the connection string
+          holesail --live $PORT > /tmp/holesail_output.txt 2>&1 &
+          sleep 10
+          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
+          if [ -z "$CONNECTION_STRING" ]; then
+            echo "❌ No Holesail URL"
+            cat /tmp/holesail_output.txt
+            exit 1
+          fi
+          echo "✅ Worker for $SKILL_NAME URL: $CONNECTION_STRING"
+
+          # Register in the workers/ directory
+          mkdir -p workers
+          WORKER_FILE="workers/${SKILL_NAME}.json"
+          echo "{\"skill\": \"${SKILL_NAME}\", \"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
+          ENCODED=$(base64 -w0 ${WORKER_FILE})
+
+          for attempt in {1..15}; do
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n --arg msg "register $SKILL_NAME" --arg content "$ENCODED" --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              PAYLOAD=$(jq -n --arg msg "register $SKILL_NAME" --arg content "$ENCODED" \
+                '{message: $msg, content: $content}')
+            fi
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
+              -d "$PAYLOAD")
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+              echo "✅ Worker registered in workers/${SKILL_NAME}.json"
+              break
+            fi
+            sleep 3
+          done
+
+          # Keep worker alive
+          while true; do
+            if ! pgrep -f "$(echo "$MCP_SERVER" | awk '{print $1}')" > /dev/null; then
+              eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
+            fi
+            if ! pgrep -f "holesail" > /dev/null; then
+              holesail --live $PORT &
+            fi
+            sleep 30
+          done
