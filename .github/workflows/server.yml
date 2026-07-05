@@ -24,10 +24,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y jq curl git build-essential cmake python3 python3-pip nodejs npm
           sudo npm install -g holesail
-          # Install uv (required for uvx)
+          # Install uv
           curl -LsSf https://astral.sh/uv/install.sh | sh
           export PATH="$HOME/.cargo/bin:$PATH"
-          # Install Python version of mcp-proxy
+          # Install mcp-proxy
           pip3 install mcp-proxy
 
       - name: Build llama.cpp with MCP support
@@ -98,19 +98,16 @@ jobs:
             URL="${pair#*:}"
             echo "Connecting $SKILL -> $URL to localhost:$LOCAL_PORT"
             holesail "$URL" --port $LOCAL_PORT &
-            # Add to config
             CONFIG_JSON=$(echo "$CONFIG_JSON" | jq ".mcpServers[\"$SKILL\"] = {\"url\": \"http://localhost:$LOCAL_PORT/mcp\"}")
             LOCAL_PORT=$((LOCAL_PORT + 1))
           done
           echo "$CONFIG_JSON" > mcp_config.json
           echo "✅ mcp-proxy config created."
-          echo "Config content:"
           cat mcp_config.json
 
-      - name: Start mcp-proxy aggregator (uvx)
+      - name: Start mcp-proxy aggregator
         run: |
           echo "Starting mcp-proxy on port ${{ env.MCP_PROXY_PORT }}..."
-          # Use Python mcp-proxy (which is uvx compatible)
           mcp-proxy \
             --named-server-config mcp_config.json \
             --allow-origin "*" \
@@ -144,20 +141,48 @@ jobs:
             exit 1
           fi
 
-          # Cloudflare tunnel
-          if [ ! -f ./cloudflared ]; then
-            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x cloudflared
-          fi
+      - name: Start Cloudflare tunnel and capture URL
+        id: tunnel
+        run: |
+          # Start tunnel in background
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:${{ env.LLAMA_PORT }} > tunnel.log 2>&1 &
-          for i in {1..30}; do
+          # Wait for the URL (retry up to 60 seconds)
+          TUNNEL_URL=""
+          for i in {1..20}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
               echo "✅ Tunnel URL: $TUNNEL_URL"
               break
             fi
+            echo "⏳ Waiting for tunnel... ($i/20)"
             sleep 3
           done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "⚠️ Could not extract tunnel URL from logs. Displaying log content:"
+            cat tunnel.log
+            # As a fallback, try to get from cloudflared's API or just wait longer
+            sleep 30
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+          fi
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+            echo "✅ Tunnel URL captured: $TUNNEL_URL"
+          else
+            echo "❌ Failed to capture tunnel URL after multiple attempts."
+            exit 1
+          fi
+
+      - name: Print instructions
+        env:
+          TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
+        run: |
           echo "::notice::Frontend URL: $TUNNEL_URL"
           echo "::notice::MCP servers available at: $TUNNEL_URL/servers/<skill>/mcp"
+          echo "----------------------------------------------------------------"
+          echo "📋 MANUAL STEP: In the WebUI, go to Settings → MCP → Add New Server"
+          echo "   For each skill, add: $TUNNEL_URL/servers/<skill>/mcp"
+          echo "   Example: $TUNNEL_URL/servers/calculate/mcp"
+          echo "   Then toggle each server to 'active'."
+          echo "----------------------------------------------------------------"
+          # Keep the workflow alive
           sleep infinity
