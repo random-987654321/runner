@@ -45,7 +45,6 @@ jobs:
 
           echo "Starting MCP server: $MCP_SERVER $SERVER_ARGS --port $PORT"
 
-          # For npx commands, add retry logic
           if [[ "$MCP_SERVER" == "npx" ]]; then
             for i in {1..5}; do
               echo "Attempt $i to start npx server..."
@@ -62,9 +61,8 @@ jobs:
             eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
           fi
 
-          sleep 15   # give server time to bind
+          sleep 15
 
-          # Holesail tunnel
           holesail --live $PORT > /tmp/holesail_output.txt 2>&1 &
           sleep 10
           CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
@@ -75,7 +73,6 @@ jobs:
           fi
           echo "✅ Worker for $SKILL_NAME URL: $CONNECTION_STRING"
 
-          # Register in workers/ directory
           mkdir -p workers
           WORKER_FILE="workers/${SKILL_NAME}.json"
           echo "{\"skill\": \"${SKILL_NAME}\", \"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
@@ -104,7 +101,6 @@ jobs:
             sleep 3
           done
 
-          # Keep alive
           while true; do
             COMMAND_NAME=$(echo "$MCP_SERVER" | awk '{print $1}')
             if ! pgrep -f "$COMMAND_NAME" > /dev/null; then
