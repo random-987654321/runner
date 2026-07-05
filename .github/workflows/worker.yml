@@ -23,8 +23,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y curl nodejs npm python3 python3-pip
           sudo npm install -g holesail
+          pip3 install fastmcp requests
 
-      - name: Read skill definition and start MCP server
+      - name: Read skill definition and start MCP server (with retry)
         env:
           SKILL_NAME: ${{ github.event.inputs.skill_name }}
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -36,18 +37,34 @@ jobs:
             exit 1
           fi
 
-          # Extract MCP server command, args, and port from YAML
-          # Use sed to strip leading/trailing spaces and outer quotes
+          # Extract fields cleanly
           MCP_SERVER=$(grep '^mcp_server:' "$SKILL_FILE" | sed -E 's/^mcp_server:[[:space:]]*//' | sed -E 's/^"//;s/"$//')
           SERVER_ARGS=$(grep '^server_args:' "$SKILL_FILE" | sed -E 's/^server_args:[[:space:]]*//' | sed -E 's/^"//;s/"$//')
           PORT=$(grep '^port:' "$SKILL_FILE" | sed -E 's/^port:[[:space:]]*//' | sed -E 's/^"//;s/"$//')
           PORT=${PORT:-50052}
 
           echo "Starting MCP server: $MCP_SERVER $SERVER_ARGS --port $PORT"
-          eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
+
+          # For npx commands, add retry logic
+          if [[ "$MCP_SERVER" == "npx" ]]; then
+            for i in {1..5}; do
+              echo "Attempt $i to start npx server..."
+              eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
+              sleep 5
+              if pgrep -f "$(echo "$MCP_SERVER" | awk '{print $1}')" > /dev/null; then
+                echo "✅ npx server started successfully"
+                break
+              fi
+              echo "⚠️ Attempt $i failed, retrying in 5s..."
+              sleep 5
+            done
+          else
+            eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
+          fi
+
           sleep 15   # give server time to bind
 
-          # Create Holesail tunnel and capture the connection string
+          # Holesail tunnel
           holesail --live $PORT > /tmp/holesail_output.txt 2>&1 &
           sleep 10
           CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
@@ -58,7 +75,7 @@ jobs:
           fi
           echo "✅ Worker for $SKILL_NAME URL: $CONNECTION_STRING"
 
-          # Register in the workers/ directory
+          # Register in workers/ directory
           mkdir -p workers
           WORKER_FILE="workers/${SKILL_NAME}.json"
           echo "{\"skill\": \"${SKILL_NAME}\", \"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
@@ -87,13 +104,16 @@ jobs:
             sleep 3
           done
 
-          # Keep worker alive
+          # Keep alive
           while true; do
-            # Check if the MCP server process is running (using the first word of the command)
             COMMAND_NAME=$(echo "$MCP_SERVER" | awk '{print $1}')
             if ! pgrep -f "$COMMAND_NAME" > /dev/null; then
               echo "⚠️ MCP server died, restarting..."
-              eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
+              if [[ "$MCP_SERVER" == "npx" ]]; then
+                eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
+              else
+                eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
+              fi
             fi
             if ! pgrep -f "holesail" > /dev/null; then
               echo "⚠️ Holesail died, restarting..."
