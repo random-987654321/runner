@@ -1,0 +1,10 @@
+name: fetch_url
+description: "Fetch a URL and return its text content."
+parameters:
+  type: object
+  properties:
+    url:
+      type: string
+  required: ["url"]
+mcp_server: "npx @modelcontextprotocol/server-fetch"
+port: 50053
