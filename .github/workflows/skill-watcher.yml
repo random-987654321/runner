@@ -1,14 +1,14 @@
-name: Skill Watcher
+name: Skill Watcher & Worker Dispatcher
 
 on:
   push:
     paths:
       - 'skills/*.yaml'
-  workflow_dispatch:
+  workflow_dispatch:   # manual trigger for testing
 
 permissions:
   contents: read
-  actions: write
+  actions: write   # needed to dispatch workflow runs
 
 jobs:
   detect_and_spawn:
@@ -16,25 +16,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 2   # to detect changes
 
       - name: Detect new skill files
         id: detect
         run: |
-          NEW_FILES=$(git diff --name-only --diff-filter=A HEAD^ HEAD -- skills/*.yaml 2>/dev/null || echo "")
-          if [ -n "$NEW_FILES" ]; then
-            echo "new_files=$NEW_FILES" >> $GITHUB_OUTPUT
+          # For push events, check diff; for workflow_dispatch, list all skills
+          if [ "${{ github.event_name }}" == "push" ]; then
+            NEW_FILES=$(git diff --name-only --diff-filter=A HEAD^ HEAD -- skills/*.yaml 2>/dev/null || echo "")
           else
-            echo "No new skill files."
+            # manual trigger: treat all skills as new (or you can use a list)
+            NEW_FILES=$(ls skills/*.yaml 2>/dev/null || echo "")
           fi
+          echo "new_files=$NEW_FILES" >> $GITHUB_OUTPUT
 
-      - name: Trigger workers for each new skill
+      - name: Count active worker runs
+        id: count_runs
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Count currently running worker workflows (status: in_progress, queued)
+          RUNNING=$(gh run list --workflow worker.yml --status in_progress --status queued --json status --jq length)
+          echo "running=$RUNNING" >> $GITHUB_OUTPUT
+
+      - name: Trigger workers for each new skill (limit 19)
         if: steps.detect.outputs.new_files != ''
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
+          RUNNING=${{ steps.count_runs.outputs.running }}
+          MAX_WORKERS=19
           for file in ${{ steps.detect.outputs.new_files }}; do
             SKILL_NAME=$(basename "$file" .yaml)
-            echo "Spawning worker for skill: $SKILL_NAME"
+            if [ $RUNNING -ge $MAX_WORKERS ]; then
+              echo "⚠️ Already at $MAX_WORKERS workers. Skipping $SKILL_NAME."
+              break
+            fi
+            echo "🔄 Spawning worker for skill: $SKILL_NAME"
             gh workflow run worker.yml -f skill_name="$SKILL_NAME"
+            RUNNING=$((RUNNING + 1))
           done
