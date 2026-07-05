@@ -21,14 +21,11 @@ jobs:
       - name: Detect new skill files
         id: detect
         run: |
-          # For push events, check diff; for workflow_dispatch, list all skills
           if [ "${{ github.event_name }}" == "push" ]; then
             NEW_FILES=$(git diff --name-only --diff-filter=A HEAD^ HEAD -- skills/*.yaml 2>/dev/null || echo "")
           else
-            # manual trigger: list all skills, but keep as a single line
             NEW_FILES=$(ls skills/*.yaml 2>/dev/null | tr '\n' ' ' || echo "")
           fi
-          # Trim trailing spaces
           NEW_FILES=$(echo "$NEW_FILES" | xargs)
           echo "new_files=$NEW_FILES" >> $GITHUB_OUTPUT
           echo "✅ Detected files: $NEW_FILES"
@@ -37,10 +34,8 @@ jobs:
         id: count_runs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
         run: |
-          # Count currently running worker workflows
-          RUNNING=$(gh run list --workflow worker.yml --status in_progress --status queued --json status --jq length 2>/dev/null || echo 0)
+          RUNNING=$(gh run list --workflow worker.yml --status in_progress --status queued --json status --jq length --repo ${{ github.repository }} 2>/dev/null || echo 0)
           echo "running=$RUNNING" >> $GITHUB_OUTPUT
           echo "📊 Active workers: $RUNNING"
 
@@ -51,7 +46,6 @@ jobs:
         run: |
           RUNNING=${{ steps.count_runs.outputs.running }}
           MAX_WORKERS=19
-          # Split the space-separated list of files
           for file in ${{ steps.detect.outputs.new_files }}; do
             if [ $RUNNING -ge $MAX_WORKERS ]; then
               echo "⚠️ Already at $MAX_WORKERS workers. Skipping remaining."
@@ -61,6 +55,5 @@ jobs:
             echo "🔄 Spawning worker for skill: $SKILL_NAME"
             gh workflow run worker.yml -f skill_name="$SKILL_NAME"
             RUNNING=$((RUNNING + 1))
-            # Small delay to avoid hitting rate limits
             sleep 2
           done
