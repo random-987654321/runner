@@ -1,80 +1,60 @@
+#!/usr/bin/env python3
 import asyncio
 import json
-import os
+import glob
+import socket
+import subprocess
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import httpx
 import uvicorn
-import glob
-import time
 
 app = FastAPI()
 client = httpx.AsyncClient(timeout=30.0)
-routing_table = {}  # skill_name -> local MCP endpoint URL
+routing_table = {}
+worker_processes = {}
+
+def is_port_free(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        s.close()
+        return True
+    except OSError:
+        return False
 
 @app.on_event("startup")
 async def startup():
-    # Periodically scan the workers/ directory for new registrations
     asyncio.create_task(scan_workers())
 
 async def scan_workers():
     while True:
-        # Look for .json files in workers/
         for f in glob.glob("workers/*.json"):
             try:
                 with open(f) as fp:
                     data = json.load(fp)
                     skill = data.get("skill")
                     url = data.get("url")
-                    if skill and url and skill not in routing_table:
-                        # Assign a local port for this worker
-                        port = 6000
-                        while True:
-                            # Check if port is free
-                            import socket
-                            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            try:
-                                s.bind(("127.0.0.1", port))
-                                s.close()
-                                break
-                            except OSError:
-                                port += 1
-                        # Start Holesail client to connect to the worker
-                        # We use subprocess to run holesail in background
-                        import subprocess
-                        subprocess.Popen(["holesail", url, "--port", str(port)])
-                        # Wait a moment for tunnel
-                        await asyncio.sleep(5)
-                        # Register with proxy
-                        endpoint = f"http://localhost:{port}/mcp"
-                        routing_table[skill] = endpoint
-                        print(f"✅ Added route: {skill} -> {endpoint}")
+                    if not skill or not url:
+                        continue
+                    if skill in routing_table:
+                        continue
+                    port = 6000
+                    while not is_port_free(port):
+                        port += 1
+                    proc = subprocess.Popen(["holesail", url, "--port", str(port)])
+                    worker_processes[skill] = proc
+                    await asyncio.sleep(5)
+                    endpoint = f"http://localhost:{port}/mcp"
+                    routing_table[skill] = endpoint
+                    print(f"✅ Registered worker for '{skill}' at {endpoint}")
             except Exception as e:
                 print(f"⚠️ Error scanning {f}: {e}")
-        await asyncio.sleep(10)  # scan every 10 seconds
-
-@app.post("/add_route")
-async def add_route(request: Request):
-    data = await request.json()
-    skill = data.get("skill")
-    endpoint = data.get("endpoint")
-    if not skill or not endpoint:
-        raise HTTPException(400, "Missing skill or endpoint")
-    routing_table[skill] = endpoint
-    return {"status": "ok"}
-
-@app.post("/remove_route")
-async def remove_route(request: Request):
-    data = await request.json()
-    skill = data.get("skill")
-    if skill in routing_table:
-        del routing_table[skill]
-    return {"status": "ok"}
+        await asyncio.sleep(10)
 
 @app.post("/mcp")
 async def mcp_gateway(request: Request):
     body = await request.json()
-    # Assume MCP request contains "tool" field with "name"
     tool_name = body.get("tool", {}).get("name")
     if not tool_name:
         raise HTTPException(400, "Missing tool name")
