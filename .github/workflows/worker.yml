@@ -22,10 +22,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl nodejs npm python3 python3-pip
+          # Install uv (provides uvx)
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.cargo/bin:$PATH"
           # Install cloudflared
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
-          pip3 install fastmcp requests
+          # Ensure uvx is available in subsequent steps
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Read skill definition and start MCP server
         env:
@@ -33,6 +37,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
+          # Now uvx should be available
           SKILL_FILE="skills/${SKILL_NAME}.yaml"
           if [ ! -f "$SKILL_FILE" ]; then
             echo "❌ Skill file not found"
@@ -45,6 +50,9 @@ jobs:
           PORT=$(grep '^port:' "$SKILL_FILE" | sed -E 's/^port:[[:space:]]*//' | sed -E 's/^"//;s/"$//')
           PORT=${PORT:-50052}
 
+          # Force host 0.0.0.0 so cloudflared can connect
+          SERVER_ARGS="$SERVER_ARGS --host 0.0.0.0"
+
           echo "Starting MCP server: $MCP_SERVER $SERVER_ARGS --port $PORT"
           if [[ "$MCP_SERVER" == "npx" ]]; then
             eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
@@ -52,6 +60,28 @@ jobs:
             eval "$MCP_SERVER $SERVER_ARGS --port $PORT" &
           fi
           sleep 10
+
+          # ---------- VERIFY SERVER IS LISTENING ----------
+          echo "🔍 Checking if MCP server is listening on port $PORT..."
+          if netstat -tulpn 2>/dev/null | grep -q ":$PORT "; then
+            echo "✅ Server is listening on port $PORT"
+          else
+            echo "❌ Server is NOT listening on port $PORT"
+            ps aux | grep -E "$MCP_SERVER|$PORT" || echo "No process found"
+            exit 1
+          fi
+
+          # Test the endpoint (try /mcp first, fallback to /sse)
+          MCP_PATH="mcp"
+          if curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT/sse | grep -q "200\|405"; then
+            MCP_PATH="sse"
+            echo "✅ Server responds on /sse"
+          elif curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT/mcp | grep -q "200\|405"; then
+            MCP_PATH="mcp"
+            echo "✅ Server responds on /mcp"
+          else
+            echo "⚠️ Could not determine endpoint path. Defaulting to /mcp"
+          fi
 
           # ---------- START CLOUDFLARE TUNNEL ----------
           echo "☁️ Starting Cloudflare tunnel for worker..."
@@ -73,10 +103,11 @@ jobs:
             exit 1
           fi
 
-          # ---------- REGISTER WITH QUEEN (save to workers/ directory) ----------
+          # ---------- REGISTER WITH QUEEN ----------
           WORKER_FILE="workers/${SKILL_NAME}.json"
           mkdir -p workers
-          echo "{\"skill\": \"${SKILL_NAME}\", \"url\": \"${TUNNEL_URL}/mcp\"}" > ${WORKER_FILE}
+          FULL_URL="${TUNNEL_URL}/${MCP_PATH}"
+          echo "{\"skill\": \"${SKILL_NAME}\", \"url\": \"${FULL_URL}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
 
           for attempt in {1..15}; do
@@ -96,7 +127,7 @@ jobs:
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
               -d "$PAYLOAD")
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker registered with URL: $TUNNEL_URL/mcp"
+              echo "✅ Worker registered with URL: $FULL_URL"
               break
             fi
             sleep 3
