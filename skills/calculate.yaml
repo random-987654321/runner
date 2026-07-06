@@ -1,11 +1,3 @@
-name: calculate
-description: "Evaluate a mathematical expression."
-parameters:
-  type: object
-  properties:
-    expr:
-      type: string
-  required: ["expr"]
-mcp_server: "python3"
-server_args: "mcp_calculate.py"
-port: 50054
+mcp_server: "python"
+server_args: "scripts/mcp_server_wrapper.py --skill calculate --model models/phi-3-mini-q4.gguf"
+port: 50052
