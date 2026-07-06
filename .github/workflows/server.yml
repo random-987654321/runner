@@ -42,7 +42,7 @@ jobs:
           mkdir -p ~/.openclaw
           mkdir -p ~/.openclaw/workspace/skills/run_worker
           
-          # 2. Inject configuration structure cleanly into openclaw.json with valid bind keywords
+          # 2. Inject configuration structure with wide-open CORS for the dynamic tunnel URLs
           cat << 'EOF' > ~/.openclaw/openclaw.json
           {
             "gateway": {
@@ -50,6 +50,14 @@ jobs:
               "bind": "loopback",
               "auth": {
                 "mode": "none"
+              },
+              "controlUi": {
+                "allowedOrigins": ["*"]
+              },
+              "cors": {
+                "origin": "*",
+                "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+                "allowedHeaders": ["Content-Type", "Authorization"]
               }
             },
             "agents": {
@@ -90,7 +98,7 @@ jobs:
 
           # 4. Enforce execution permissions on the worker orchestrator script
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
-
+          
           
       - name: Start Gateway Engine
         run: |
