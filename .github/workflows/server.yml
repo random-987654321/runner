@@ -11,7 +11,7 @@ env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
   GATEWAY_PORT: 18789
-  QUEEN_SCRIPT_DIR: /tmp/queen
+  SCRIPT_DIR: /tmp/queen
 
 jobs:
   queen:
@@ -25,9 +25,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y curl git nodejs npm python3 python3-pip jq
           curl -fsSL https://ollama.com/install.sh | sh
-          # Install OpenClaw globally with sudo
           sudo npm install -g openclaw
-          # Ensure openclaw is in PATH
           echo "/usr/local/bin" >> $GITHUB_PATH
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
@@ -40,21 +38,24 @@ jobs:
 
       - name: Setup scripts
         run: |
-          mkdir -p ${{ env.QUEEN_SCRIPT_DIR }}
-          cp -r scripts/* ${{ env.QUEEN_SCRIPT_DIR }}/ 2>/dev/null || true
-          chmod +x ${{ env.QUEEN_SCRIPT_DIR }}/*.sh
+          mkdir -p ${{ env.SCRIPT_DIR }}
+          cp scripts/* ${{ env.SCRIPT_DIR }}/ 2>/dev/null || true
+          chmod +x ${{ env.SCRIPT_DIR }}/*.sh
 
       - name: Configure OpenClaw
         env:
-          SCRIPT_DIR: ${{ env.QUEEN_SCRIPT_DIR }}
+          SCRIPT_DIR: ${{ env.SCRIPT_DIR }}
         run: |
           mkdir -p ~/.openclaw
           sed "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" config/openclaw.json > ~/.openclaw/openclaw.json
+          # Validate – if it fails, we'll see the error clearly
+          openclaw config validate
 
       - name: Start Gateway
         run: |
-          openclaw gateway start --port ${{ env.GATEWAY_PORT }} &
-          for i in {1..30}; do
+          openclaw gateway start &
+          sleep 5
+          for i in {1..20}; do
             if curl -s http://localhost:${{ env.GATEWAY_PORT }}/health > /dev/null; then
               echo "✅ Gateway ready"
               break
@@ -79,7 +80,7 @@ jobs:
           openclaw config set gateway.controlUi.allowedOrigins '["'"$TUNNEL_URL"'"]'
           pkill -f "openclaw gateway" || true
           sleep 2
-          openclaw gateway start --port ${{ env.GATEWAY_PORT }} &
+          openclaw gateway start &
           sleep 5
 
       - name: Print access
