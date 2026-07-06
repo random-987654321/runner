@@ -7,6 +7,12 @@ permissions:
   contents: write
   actions: write
 
+env:
+  MAX_WORKERS: 19
+  OLLAMA_MODEL: granite4:tiny-h
+  GATEWAY_PORT: 18789
+  QUEEN_SCRIPT_DIR: /tmp/queen
+
 jobs:
   queen:
     runs-on: ubuntu-latest
@@ -14,205 +20,85 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # -------- Phase 1: Install dependencies --------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl git nodejs npm python3 python3-pip jq
-          # Install Holesail
-          sudo npm install -g holesail
-          # Install Ollama
           curl -fsSL https://ollama.com/install.sh | sh
-          # Install OpenClaw
           npm install -g openclaw
           echo "$(npm root -g)/bin" >> $GITHUB_PATH
-          # Install cloudflared
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Start Ollama and pull model
+      # -------- Phase 2: Start Ollama --------
+      - name: Start Ollama
         run: |
           ollama serve &
           sleep 5
-          ollama pull granite4:tiny-h
+          ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Create result server (Python)
+      # -------- Phase 3: Setup scripts directory --------
+      - name: Setup scripts
         run: |
-          cat > /tmp/result_server.py << 'EOF'
-          import os
-          import json
-          from http.server import HTTPServer, BaseHTTPRequestHandler
-          import threading
+          mkdir -p ${{ env.QUEEN_SCRIPT_DIR }}
+          cp -r scripts/* ${{ env.QUEEN_SCRIPT_DIR }}/ 2>/dev/null || true
+          chmod +x ${{ env.QUEEN_SCRIPT_DIR }}/*.sh
 
-          RESULTS_FILE = "results.json"
-          lock = threading.Lock()
-
-          class ResultHandler(BaseHTTPRequestHandler):
-              def do_POST(self):
-                  if self.path == '/result':
-                      length = int(self.headers.get('Content-Length', 0))
-                      body = self.rfile.read(length).decode()
-                      try:
-                          data = json.loads(body)
-                          task_id = data.get('task_id')
-                          result = data.get('result')
-                          secret = data.get('secret')
-                          with lock:
-                              if os.path.exists(RESULTS_FILE):
-                                  with open(RESULTS_FILE, 'r') as f:
-                                      results = json.load(f)
-                              else:
-                                  results = {}
-                              results[task_id] = {'result': result, 'secret': secret}
-                              with open(RESULTS_FILE, 'w') as f:
-                                  json.dump(results, f, indent=2)
-                          self.send_response(200)
-                          self.end_headers()
-                          self.wfile.write(b'OK')
-                      except Exception as e:
-                          self.send_response(400)
-                          self.end_headers()
-                          self.wfile.write(str(e).encode())
-                  else:
-                      self.send_response(404)
-                      self.end_headers()
-
-              def do_GET(self):
-                  if self.path == '/health':
-                      self.send_response(200)
-                      self.end_headers()
-                      self.wfile.write(b'OK')
-                  else:
-                      self.send_response(404)
-                      self.end_headers()
-
-          def run():
-              server = HTTPServer(('0.0.0.0', 8000), ResultHandler)
-              print("✅ Result server listening on port 8000")
-              server.serve_forever()
-
-          if __name__ == '__main__':
-              run()
-          EOF
-          python3 /tmp/result_server.py &
-          sleep 2
-
-      - name: Generate Holesail key and expose result server
-        id: holesail
-        run: |
-          # Generate a random 16-byte key as hex
-          KEY=$(openssl rand -hex 16)
-          echo "key=$KEY" >> $GITHUB_OUTPUT
-          echo "🚀 Holesail key: $KEY"
-          # Start Holesail server exposing port 8000
-          holesail --live 8000 --key "$KEY" &
-          sleep 5
-
-      - name: Configure OpenClaw with tools
+      # -------- Phase 4: Configure OpenClaw --------
+      - name: Configure OpenClaw
+        env:
+          SCRIPT_DIR: ${{ env.QUEEN_SCRIPT_DIR }}
         run: |
           mkdir -p ~/.openclaw
-          cat > ~/.openclaw/openclaw.json << 'EOF'
-          {
-            "models": {
-              "providers": {
-                "ollama": {
-                  "baseUrl": "http://localhost:11434",
-                  "models": [{"id": "granite4:tiny-h", "api": "ollama"}]
-                }
-              }
-            },
-            "agents": {
-              "defaults": {
-                "model": { "primary": "ollama/granite4:tiny-h" },
-                "tools": ["spawn_workers", "check_results"]
-              }
-            },
-            "tools": {
-              "spawn_workers": {
-                "type": "command",
-                "command": "bash /tmp/spawn_workers.sh",
-                "description": "Spawn GitHub Actions workers with Holesail key.",
-                "parameters": {
-                  "subtasks": {
-                    "type": "string",
-                    "description": "JSON array of objects with 'id' and 'description'."
-                  }
-                }
-              },
-              "check_results": {
-                "type": "command",
-                "command": "bash /tmp/check_results.sh",
-                "description": "Show aggregated results from all workers.",
-                "parameters": {}
-              }
-            }
-          }
-          EOF
+          # Inject script paths into config
+          sed "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" config/openclaw.json > ~/.openclaw/openclaw.json
 
-      - name: Create helper scripts
-        env:
-          HOLESAIL_KEY: ${{ steps.holesail.outputs.key }}
-          REPO: ${{ github.repository }}
+      # -------- Phase 5: Start OpenClaw Gateway --------
+      - name: Start Gateway
         run: |
-          # spawn_workers.sh
-          cat > /tmp/spawn_workers.sh << 'SCRIPT'
-          #!/bin/bash
-          SUBTASKS="$1"
-          echo "$SUBTASKS" | jq -c '.[]' | while read -r item; do
-            id=$(echo "$item" | jq -r '.id')
-            desc=$(echo "$item" | jq -r '.description')
-            echo "Spawning worker for task: $id"
-            gh workflow run worker.yaml -f task_id="$id" -f task_description="$desc" -f holesail_key="$HOLESAIL_KEY" --repo ${{ github.repository }}
-            sleep 1
-          done
-          echo "✅ Workers spawned."
-          SCRIPT
-          chmod +x /tmp/spawn_workers.sh
-
-          # check_results.sh
-          cat > /tmp/check_results.sh << 'SCRIPT'
-          #!/bin/bash
-          if [ ! -f results.json ]; then
-            echo "No results yet. Wait for workers to finish."
-            exit 0
-          fi
-          cat results.json | jq .
-          SCRIPT
-          chmod +x /tmp/check_results.sh
-
-      - name: Start OpenClaw Gateway
-        run: |
-          openclaw gateway start --port 18789 &
+          openclaw gateway start --port ${{ env.GATEWAY_PORT }} &
           for i in {1..30}; do
-            if curl -s http://localhost:18789/health > /dev/null; then
+            if curl -s http://localhost:${{ env.GATEWAY_PORT }}/health > /dev/null; then
               echo "✅ Gateway ready"
               break
             fi
             sleep 2
           done
 
+      # -------- Phase 6: Start Cloudflare Tunnel --------
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://localhost:18789 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --url http://localhost:${{ env.GATEWAY_PORT }} > tunnel.log 2>&1 &
           for i in {1..30}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$URL" ]; then echo "tunnel_url=$URL" >> $GITHUB_OUTPUT; break; fi
             sleep 3
           done
 
-      - name: Allow tunnel origin
+      # -------- Phase 7: Update allowed origins --------
+      - name: Update allowed origins
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
         run: |
           openclaw config set gateway.controlUi.allowedOrigins '["'"$TUNNEL_URL"'"]'
           pkill -f "openclaw gateway" || true
           sleep 2
-          openclaw gateway start --port 18789 &
+          openclaw gateway start --port ${{ env.GATEWAY_PORT }} &
           sleep 5
 
+      # -------- Phase 8: Print access info --------
       - name: Print access
         run: |
+          echo "================================================================="
           echo "🌐 OpenClaw Web UI: ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo "🔑 Holesail key: ${{ steps.holesail.outputs.key }}"
-          echo "💡 Ask the Queen to spawn workers with a JSON list of sub‑tasks."
+          echo ""
+          echo "📋 Configuration:"
+          echo "   - Model: ${{ env.OLLAMA_MODEL }}"
+          echo "   - Max workers: ${{ env.MAX_WORKERS }}"
+          echo "   - Gateway port: ${{ env.GATEWAY_PORT }}"
+          echo ""
+          echo "💡 Just ask anything. The Queen will automatically create workers."
+          echo "================================================================="
           sleep infinity
