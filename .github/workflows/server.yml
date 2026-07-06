@@ -42,11 +42,24 @@ jobs:
           mkdir -p ~/.openclaw
           mkdir -p ~/.openclaw/workspace/skills/run_worker
           
-          # 2. Inject bare-minimum valid schema configuration keys
+          # 2. Inject required schema keys, explicitly specifying local mode
           cat << 'EOF' > ~/.openclaw/openclaw.json
           {
             "gateway": {
-              "port": 18789
+              "port": 18789,
+              "mode": "local",
+              "bind": "loopback",
+              "auth": {
+                "mode": "none"
+              },
+              "controlUi": {
+                "allowedOrigins": ["*"]
+              }
+            },
+            "agents": {
+              "defaults": {
+                "model": "ollama/granite4:tiny-h"
+              }
             },
             "models": {
               "providers": {
@@ -84,8 +97,8 @@ jobs:
 
       - name: Start Gateway Engine
         run: |
-          # Force binding over all interfaces via CLI to allow safe proxy routing
-          nohup openclaw gateway start --host 0.0.0.0 > openclaw.log 2>&1 &
+          # Use --allow-unconfigured flag to bypass deployment onboarding safeguards in CI
+          nohup openclaw gateway start --allow-unconfigured > openclaw.log 2>&1 &
           
           echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
           for i in {1..20}; do
@@ -124,7 +137,7 @@ jobs:
           echo "================================================================="
           echo ""
           echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
-          head -n 20 openclaw.log || true
+          head -n 40 openclaw.log || true
           echo ""
           echo "--- LOG DIAGNOSTICS (Cloudflared Output Preview) ---"
           head -n 20 tunnel.log || true
