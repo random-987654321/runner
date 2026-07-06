@@ -40,7 +40,8 @@ jobs:
       - name: Configure OpenClaw Engine
         run: |
           mkdir -p ~/.openclaw
-          openclaw config init --force
+          rm -f ~/.openclaw/config.json 2>/dev/null || true
+          openclaw config init
           openclaw config set models.providers.ollama.baseUrl "http://localhost:11434"
           openclaw config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
           openclaw config set agents.default.model "ollama/granite4:tiny-h"
