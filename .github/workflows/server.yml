@@ -42,13 +42,29 @@ jobs:
           cp scripts/* ${{ env.SCRIPT_DIR }}/ 2>/dev/null || true
           chmod +x ${{ env.SCRIPT_DIR }}/*.sh
 
+      # ----- FIXED: Use openclaw config set to build valid config -----
       - name: Configure OpenClaw
         env:
           SCRIPT_DIR: ${{ env.SCRIPT_DIR }}
         run: |
           mkdir -p ~/.openclaw
-          sed "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" config/openclaw.json > ~/.openclaw/openclaw.json
-          # Validate – if it fails, we'll see the error clearly
+          # Set model provider
+          openclaw config set models.ollama.baseUrl "http://localhost:11434"
+          openclaw config set models.ollama.defaultModel "${{ env.OLLAMA_MODEL }}"
+          # Set default agent
+          openclaw config set agents.default.model "ollama/${{ env.OLLAMA_MODEL }}"
+          openclaw config set agents.default.systemPrompt "You are a helpful assistant. When a user asks a question that requires research, summarization, data processing, or any non-trivial task, use the 'run_worker' skill. Always delegate complex tasks to workers. Never try to answer complex questions yourself."
+          # Define skill
+          openclaw config set skills.run_worker.type "command"
+          openclaw config set skills.run_worker.command "$SCRIPT_DIR/worker_launcher.sh"
+          openclaw config set skills.run_worker.description "Execute a query in a temporary GitHub Actions worker. Returns the result."
+          openclaw config set skills.run_worker.parameters.query.type "string"
+          openclaw config set skills.run_worker.parameters.query.description "The exact user query to be executed"
+          # Attach skill to default agent
+          openclaw config set agents.default.skills '["run_worker"]'
+          # Gateway port
+          openclaw config set gateway.port ${{ env.GATEWAY_PORT }}
+          # Validate
           openclaw config validate
 
       - name: Start Gateway
