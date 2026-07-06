@@ -1,93 +1,30 @@
 #!/bin/bash
-set -e
+# Read incoming JSON parameters from OpenClaw
+QUERY=$(echo "$1" | jq -r '.query')
 
-MAX_WORKERS=19
-REPO="${REPO:-${{ github.repository }}}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Count current running worker workflows to protect limit (Max 19)
+CURRENT_RUNS=$(gh run list --workflow=worker.yml --status=in_progress --json databaseId | jq '. | length')
 
-QUERY="$1"
-if [ -z "$QUERY" ]; then
-    echo "❌ Error: query is required"
+if [ "$CURRENT_RUNS" -ge 19 ]; then
+    echo "❌ Execution blocked: Maximum worker threshold (19) reached."
     exit 1
 fi
 
-echo "🧠 Creating worker for query: $QUERY"
+# Generate a highly unpredictable random string for the Holesail P2P network channel
+SECURE_HOLESAIL_KEY=$(openssl rand -hex 16)
 
-# Count running workers
-RUNNING=$(python3 "$SCRIPT_DIR/github_ops.py" --count-running "Temporary Worker" 2>/dev/null || echo 0)
-if [ "$RUNNING" -ge "$MAX_WORKERS" ]; then
-    echo "❌ All $MAX_WORKERS workers are busy. Please wait."
-    exit 1
-fi
+# Start a background Holesail connector instance on the Queen side to accept worker data
+holesail --listen 12001 --key "$SECURE_HOLESAIL_KEY" &
+HOLESAIL_PID=$!
 
-TIMESTAMP=$(date +%s)
-FILENAME="worker_${TIMESTAMP}.yaml"
+# Trigger the detached GitHub action worker workflow via Github CLI
+gh workflow run worker.yml \
+  -f query="$QUERY" \
+  -f connection_secret="$SECURE_HOLESAIL_KEY"
 
-cat > /tmp/worker.yaml << 'WORKER_EOF'
-name: Temporary Worker
+echo "⏳ Worker dispatched successfully over secure network channel: $SECURE_HOLESAIL_KEY"
 
-on:
-  workflow_dispatch:
-
-jobs:
-  worker:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          ollama serve &
-          sleep 5
-          ollama pull granite4:tiny-h
-          sudo npm install -g openclaw
-          echo "/usr/local/bin" >> $GITHUB_PATH
-          mkdir -p ~/.openclaw
-          openclaw config init --force
-          openclaw config set models.providers.ollama.baseUrl "http://localhost:11434"
-          openclaw config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
-          openclaw config set agents.default.model "ollama/granite4:tiny-h"
-
-      - name: Execute query
-        run: |
-          openclaw agent run --task "$QUERY" --output result.json
-          mkdir -p upload
-          cp result.json upload/
-        env:
-          QUERY: ${{ github.event.inputs.query }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: result
-          path: upload/
-WORKER_EOF
-
-ESCAPED_QUERY=$(echo "$QUERY" | sed 's/"/\\"/g')
-sed -i "s/\$QUERY/$ESCAPED_QUERY/g" /tmp/worker.yaml
-
-echo "📝 Creating workflow $FILENAME..."
-SHA=$(python3 "$SCRIPT_DIR/github_ops.py" --create "$FILENAME" "$(cat /tmp/worker.yaml)")
-echo "✅ Created (sha=$SHA)"
-
-sleep 5
-python3 "$SCRIPT_DIR/github_ops.py" --trigger "$FILENAME"
-
-echo "⏳ Waiting for completion..."
-RUN_ID=$(python3 "$SCRIPT_DIR/github_ops.py" --wait "$FILENAME" 600)
-echo "✅ Done (run_id=$RUN_ID)"
-
-echo "📥 Downloading result..."
-RESULT=$(python3 "$SCRIPT_DIR/github_ops.py" --download "$RUN_ID")
-if [ -n "$RESULT" ]; then
-    echo "$RESULT" | jq .
-else
-    echo "⚠️ No result found"
-fi
-
-echo "🗑️ Cleaning up..."
-python3 "$SCRIPT_DIR/github_ops.py" --delete "$FILENAME" "$SHA"
-echo "✅ Done"
-echo "$RESULT"
+# Wait for the worker to pipe results back over Holesail, then clean up process
+# (In a production environment, you would use netcat/websockets to fetch output here)
+sleep 60
+kill $HOLESAIL_PID 2>/dev/null
