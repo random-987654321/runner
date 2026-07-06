@@ -1,17 +1,10 @@
 #!/bin/bash
-#
-# Worker launcher - creates, triggers, monitors, and deletes a dynamic worker
-# Usage: worker_launcher.sh "user query"
-#
-
 set -e
 
-# ---------- Configuration ----------
 MAX_WORKERS=19
 REPO="${REPO:-${{ github.repository }}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ---------- Input ----------
 QUERY="$1"
 if [ -z "$QUERY" ]; then
     echo "❌ Error: query is required"
@@ -20,20 +13,16 @@ fi
 
 echo "🧠 Creating worker for query: $QUERY"
 
-# ---------- Check concurrency limit ----------
+# Count running workers
 RUNNING=$(python3 "$SCRIPT_DIR/github_ops.py" --count-running "Temporary Worker" 2>/dev/null || echo 0)
 if [ "$RUNNING" -ge "$MAX_WORKERS" ]; then
     echo "❌ All $MAX_WORKERS workers are busy. Please wait."
     exit 1
 fi
 
-echo "✅ Currently $RUNNING workers running. Spawning new one."
-
-# ---------- Generate unique filename ----------
 TIMESTAMP=$(date +%s)
 FILENAME="worker_${TIMESTAMP}.yaml"
 
-# ---------- Build worker YAML ----------
 cat > /tmp/worker.yaml << 'WORKER_EOF'
 name: Temporary Worker
 
@@ -53,21 +42,19 @@ jobs:
           ollama serve &
           sleep 5
           ollama pull granite4:tiny-h
-          npm install -g openclaw
-          echo "$(npm root -g)/bin" >> $GITHUB_PATH
+          sudo npm install -g openclaw
+          echo "/usr/local/bin" >> $GITHUB_PATH
           mkdir -p ~/.openclaw
           echo '{
             "models": {
-              "providers": {
-                "ollama": {
-                  "baseUrl": "http://localhost:11434",
-                  "models": [{"id": "granite4:tiny-h", "api": "ollama"}]
-                }
+              "ollama": {
+                "baseUrl": "http://localhost:11434",
+                "defaultModel": "granite4:tiny-h"
               }
             },
             "agents": {
-              "defaults": {
-                "model": { "primary": "ollama/granite4:tiny-h" }
+              "default": {
+                "model": "ollama/granite4:tiny-h"
               }
             }
           }' > ~/.openclaw/openclaw.json
@@ -87,42 +74,30 @@ jobs:
           path: upload/
 WORKER_EOF
 
-# Replace placeholder with actual query
 ESCAPED_QUERY=$(echo "$QUERY" | sed 's/"/\\"/g')
 sed -i "s/\$QUERY/$ESCAPED_QUERY/g" /tmp/worker.yaml
 
-# ---------- Create the workflow file ----------
+# Create workflow via Python helper
 echo "📝 Creating workflow $FILENAME..."
 SHA=$(python3 "$SCRIPT_DIR/github_ops.py" --create "$FILENAME" "$(cat /tmp/worker.yaml)")
-echo "✅ Created workflow (sha=$SHA)"
+echo "✅ Created (sha=$SHA)"
 
-# ---------- Wait for registration ----------
 sleep 5
-
-# ---------- Trigger the workflow ----------
-echo "🚀 Triggering workflow..."
 python3 "$SCRIPT_DIR/github_ops.py" --trigger "$FILENAME"
 
-# ---------- Poll for completion ----------
-echo "⏳ Waiting for worker to finish..."
+echo "⏳ Waiting for completion..."
 RUN_ID=$(python3 "$SCRIPT_DIR/github_ops.py" --wait "$FILENAME" 600)
-echo "✅ Worker completed (run_id=$RUN_ID)"
+echo "✅ Done (run_id=$RUN_ID)"
 
-# ---------- Download result ----------
 echo "📥 Downloading result..."
 RESULT=$(python3 "$SCRIPT_DIR/github_ops.py" --download "$RUN_ID")
-
 if [ -n "$RESULT" ]; then
-    echo "✅ Result:"
     echo "$RESULT" | jq .
 else
     echo "⚠️ No result found"
 fi
 
-# ---------- Clean up ----------
-echo "🗑️ Deleting temporary workflow..."
+echo "🗑️ Cleaning up..."
 python3 "$SCRIPT_DIR/github_ops.py" --delete "$FILENAME" "$SHA"
-echo "✅ Cleanup complete"
-
-# ---------- Output result ----------
+echo "✅ Done"
 echo "$RESULT"
