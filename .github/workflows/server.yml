@@ -29,6 +29,9 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           # Install mcp-proxy
           pip3 install mcp-proxy
+          # Cloudflared
+          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
 
       - name: Build llama.cpp with MCP support
         run: |
@@ -103,7 +106,6 @@ jobs:
           done
           echo "$CONFIG_JSON" > mcp_config.json
           echo "✅ mcp-proxy config created."
-          cat mcp_config.json
 
       - name: Start mcp-proxy aggregator
         run: |
@@ -126,7 +128,7 @@ jobs:
             -ngl 0 \
             --host 0.0.0.0 \
             --port ${{ env.LLAMA_PORT }} \
-            --webui-mcp-proxy \
+            --ui-mcp-proxy \
             &
 
           for i in {1..60}; do
@@ -144,33 +146,23 @@ jobs:
       - name: Start Cloudflare tunnel and capture URL
         id: tunnel
         run: |
-          # Start tunnel in background
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:${{ env.LLAMA_PORT }} > tunnel.log 2>&1 &
-          # Wait for the URL (retry up to 60 seconds)
           TUNNEL_URL=""
-          for i in {1..20}; do
+          for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
               echo "✅ Tunnel URL: $TUNNEL_URL"
               break
             fi
-            echo "⏳ Waiting for tunnel... ($i/20)"
+            echo "⏳ Waiting for tunnel... ($i/30)"
             sleep 3
           done
           if [ -z "$TUNNEL_URL" ]; then
-            echo "⚠️ Could not extract tunnel URL from logs. Displaying log content:"
+            echo "⚠️ Could not extract tunnel URL. Displaying log:"
             cat tunnel.log
-            # As a fallback, try to get from cloudflared's API or just wait longer
-            sleep 30
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-          fi
-          if [ -n "$TUNNEL_URL" ]; then
-            echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
-            echo "✅ Tunnel URL captured: $TUNNEL_URL"
-          else
-            echo "❌ Failed to capture tunnel URL after multiple attempts."
             exit 1
           fi
+          echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
 
       - name: Print instructions
         env:
@@ -182,7 +174,6 @@ jobs:
           echo "📋 MANUAL STEP: In the WebUI, go to Settings → MCP → Add New Server"
           echo "   For each skill, add: $TUNNEL_URL/servers/<skill>/mcp"
           echo "   Example: $TUNNEL_URL/servers/calculate/mcp"
-          echo "   Then toggle each server to 'active'."
+          echo "   Then click Edit on each and toggle 'Use llama-server proxy' ON."
           echo "----------------------------------------------------------------"
-          # Keep the workflow alive
-          sleep infinity
+          sleep infinity  # keep the runner alive
