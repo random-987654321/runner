@@ -42,12 +42,12 @@ jobs:
           mkdir -p ~/.openclaw
           mkdir -p ~/.openclaw/workspace/skills/run_worker
           
-          # 2. Inject configuration structure cleanly into openclaw.json
+          # 2. Inject configuration structure cleanly into openclaw.json with valid bind keywords
           cat << 'EOF' > ~/.openclaw/openclaw.json
           {
             "gateway": {
               "port": 18789,
-              "bind": "127.0.0.1",
+              "bind": "loopback",
               "auth": {
                 "mode": "none"
               }
@@ -62,7 +62,11 @@ jobs:
                 "ollama": {
                   "baseUrl": "http://localhost:11434",
                   "models": [
-                    { "id": "granite4:tiny-h", "api": "ollama" }
+                    { 
+                      "id": "granite4:tiny-h", 
+                      "name": "granite4:tiny-h",
+                      "api": "ollama" 
+                    }
                   ]
                 }
               }
@@ -87,6 +91,7 @@ jobs:
           # 4. Enforce execution permissions on the worker orchestrator script
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
+          
       - name: Start Gateway Engine
         run: |
           openclaw gateway start &
