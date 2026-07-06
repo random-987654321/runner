@@ -1,0 +1,50 @@
+name: Temporary Worker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          sleep 5
+          ollama pull granite4:tiny-h
+          npm install -g openclaw
+          echo "$(npm root -g)/bin" >> $GITHUB_PATH
+          mkdir -p ~/.openclaw
+          echo '{
+            "models": {
+              "providers": {
+                "ollama": {
+                  "baseUrl": "http://localhost:11434",
+                  "models": [{"id": "granite4:tiny-h", "api": "ollama"}]
+                }
+              }
+            },
+            "agents": {
+              "defaults": {
+                "model": { "primary": "ollama/granite4:tiny-h" }
+              }
+            }
+          }' > ~/.openclaw/openclaw.json
+
+      - name: Execute query
+        run: |
+          openclaw agent run --task "$QUERY" --output result.json
+          mkdir -p upload
+          cp result.json upload/
+        env:
+          QUERY: ${{ github.event.inputs.query }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: upload/
