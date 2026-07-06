@@ -1,27 +1,18 @@
 {
   "models": {
-    "providers": {
-      "ollama": {
-        "baseUrl": "http://localhost:11434",
-        "models": [
-          {
-            "id": "granite4:tiny-h",
-            "api": "ollama"
-          }
-        ]
-      }
+    "ollama": {
+      "baseUrl": "http://localhost:11434",
+      "defaultModel": "granite4:tiny-h"
     }
   },
   "agents": {
-    "defaults": {
-      "model": {
-        "primary": "ollama/granite4:tiny-h"
-      },
-      "systemPrompt": "You are a helpful assistant. When a user asks a question that requires research, summarization, data processing, or any non-trivial task, use the 'run_worker' tool. Always delegate complex tasks to workers. Never try to answer complex questions yourself.",
-      "tools": ["run_worker"]
+    "default": {
+      "model": "ollama/granite4:tiny-h",
+      "systemPrompt": "You are a helpful assistant. When a user asks a question that requires research, summarization, data processing, or any non-trivial task, use the 'run_worker' skill. Always delegate complex tasks to workers. Never try to answer complex questions yourself.",
+      "skills": ["run_worker"]
     }
   },
-  "tools": {
+  "skills": {
     "run_worker": {
       "type": "command",
       "command": "__SCRIPT_DIR__/worker_launcher.sh",
@@ -33,5 +24,8 @@
         }
       }
     }
+  },
+  "gateway": {
+    "port": 18789
   }
 }
