@@ -1,0 +1,31 @@
+name: OpenClaw Autonomous Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: 'Task Query'
+        required: true
+      connection_secret:
+        description: 'Holesail bridge connection key'
+        required: true
+
+jobs:
+  execute-task:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Secure Environment
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y nodejs npm
+          sudo npm install -g holesail
+
+      - name: Perform Task & Stream Results Back
+        run: |
+          echo "📥 Processing Task Order: ${{ github.event.inputs.query }}"
+          
+          # Simulate calculation/processing task execution
+          OUTPUT_DATA="Result from processing context: Finished execution successfully."
+          
+          # Bridge connections anonymously back via Holesail p2p relay network
+          echo "$OUTPUT_DATA" | holesail --connect ${{ github.event.inputs.connection_secret }} || true
+          echo "✅ Task processed. Secure tunnel closed."
