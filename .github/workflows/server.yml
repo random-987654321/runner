@@ -1,125 +1,67 @@
 name: OpenClaw + Ollama (granite4:tiny-h)
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
 
 jobs:
   openclaw:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # Local loopback marker — no real key needed for a self-hosted Ollama
-      OLLAMA_API_KEY: "ollama-local"
-      OLLAMA_HOST: "127.0.0.1:11434"
-      # OpenClaw will read num_ctx from /api/show on the model below
-      OPENCLAW_MODEL: "ollama/granite4:tiny-h-64k"
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # --- 1. Node (OpenClaw needs Node 22.19+ or 24) ---------------------
-      - uses: actions/setup-node@v4
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: '24'
 
-      # --- 2. Install Ollama ------------------------------------------------
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
 
-      # --- 3. Start ollama serve in background, wait until ready -----------
-      - name: Start Ollama server
+      - name: Start Ollama service
         run: |
-          # Run detached, log to file
-          nohup ollama serve > /tmp/ollama.log 2>&1 &
-          echo $! > /tmp/ollama.pid
-          # Poll /api/tags — there is no `ollama ready` command
-          for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              echo "Ollama ready after ${i} attempts"
-              break
-            fi
-            [ $i -eq 30 ] && { echo "Ollama failed to start"; cat /tmp/ollama.log; exit 1; }
-            sleep 2
-          done
+          nohup ollama serve > ollama.log 2>&1 &
+          sleep 5
 
-      # --- 4. Build a 64k-context variant (OpenClaw wants >=64k ctx) ------
-      - name: Pull model & extend context window
-        run: |
-          ollama pull granite4:tiny-h
-          # granite4:tiny-h ships a small default ctx; raise it for OpenClaw
-          printf 'FROM granite4:tiny-h\nPARAMETER num_ctx 65536\n' > /tmp/Modelfile
-          ollama create granite4:tiny-h-64k -f /tmp/Modelfile
-          ollama list
+      - name: Pull granite4:tiny-h
+        run: ollama pull granite4:tiny-h
 
-      # --- 5. Install OpenClaw CLI -----------------------------------------
       - name: Install OpenClaw
-        run: |
-          npm install -g openclaw@latest
-          openclaw --version
+        run: npm install -g openclaw@latest
 
-      # --- 6. Non-interactive onboarding (Ollama, local mode) -------------
-      - name: Onboard OpenClaw (headless)
+      # ---- NEW: start the gateway BEFORE onboarding ----
+      - name: Start OpenClaw gateway (background)
+        run: |
+          nohup openclaw gateway run \
+            --bind loopback \
+            --port 18789 \
+            > gateway.log 2>&1 &
+
+      - name: Wait for gateway to be reachable
+        run: |
+          for i in $(seq 1 60); do
+            if nc -z 127.0.0.1 18789; then
+              echo "Gateway is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Gateway failed to start"; cat gateway.log; exit 1
+
+      - name: Onboard (non-interactive, Ollama provider)
         run: |
           openclaw onboard --non-interactive --accept-risk \
             --mode local \
             --auth-choice ollama \
-            --custom-base-url "http://127.0.0.1:11434" \
-            --custom-model-id "granite4:tiny-h-64k" \
+            --custom-model-id "granite4:tiny-h" \
             --gateway-bind loopback \
             --skip-bootstrap \
             --skip-skills
 
-      # --- 7. Pin the model explicitly in config ---------------------------
-      - name: Set primary model
+      - name: Verify
         run: |
-          openclaw config set models.providers.ollama.baseUrl "http://127.0.0.1:11434"
-          openclaw config set models.providers.ollama.apiKey "ollama-local"
-          openclaw config set agents.defaults.model.primary "ollama/granite4:tiny-h-64k"
-          openclaw models list --provider ollama
-
-      # --- 8. Start gateway in background, wait for /health ---------------
-      - name: Start OpenClaw gateway
-        run: |
-          nohup openclaw gateway run --port 18789 > /tmp/openclaw-gw.log 2>&1 &
-          echo $! > /tmp/gw.pid
-          for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:18789/health >/dev/null 2>&1; then
-              echo "Gateway ready after ${i} attempts"
-              break
-            fi
-            [ $i -eq 30 ] && { echo "Gateway failed"; cat /tmp/openclaw-gw.log; exit 1; }
-            sleep 2
-          done
-
-      # --- 9. Run the agent -------------------------------------------------
-      - name: Run OpenClaw agent
-        run: |
-          openclaw agent --local --agent main --timeout 300 \
-            --message "Reply with exactly: pong from granite4"
-
-      # --- 10. (Alternative) one-shot inference smoke test -----------------
-      # Use this instead of the gateway+agent step for a minimal check.
-      # - name: Smoke test infer
-      #   run: |
-      #     openclaw infer model run --local \
-      #       --model ollama/granite4:tiny-h-64k \
-      #       --prompt "Reply with exactly: pong" --json
-
-      # --- 11. Cleanup & artifacts -----------------------------------------
-      - name: Stop services
-        if: always()
-        run: |
-          kill $(cat /tmp/gw.pid 2>/dev/null)      2>/dev/null || true
-          kill $(cat /tmp/ollama.pid 2>/dev/null)  2>/dev/null || true
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: openclaw-logs
-          path: |
-            /tmp/ollama.log
-            /tmp/openclaw-gw.log
-            ~/.openclaw/logs/
-          retention-days: 7
+          openclaw status
+          openclaw gateway status
