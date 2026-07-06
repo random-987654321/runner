@@ -45,19 +45,10 @@ jobs:
           sudo npm install -g openclaw
           echo "/usr/local/bin" >> $GITHUB_PATH
           mkdir -p ~/.openclaw
-          echo '{
-            "models": {
-              "ollama": {
-                "baseUrl": "http://localhost:11434",
-                "defaultModel": "granite4:tiny-h"
-              }
-            },
-            "agents": {
-              "default": {
-                "model": "ollama/granite4:tiny-h"
-              }
-            }
-          }' > ~/.openclaw/openclaw.json
+          openclaw config init --force
+          openclaw config set models.providers.ollama.baseUrl "http://localhost:11434"
+          openclaw config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
+          openclaw config set agents.default.model "ollama/granite4:tiny-h"
 
       - name: Execute query
         run: |
@@ -77,7 +68,6 @@ WORKER_EOF
 ESCAPED_QUERY=$(echo "$QUERY" | sed 's/"/\\"/g')
 sed -i "s/\$QUERY/$ESCAPED_QUERY/g" /tmp/worker.yaml
 
-# Create workflow via Python helper
 echo "📝 Creating workflow $FILENAME..."
 SHA=$(python3 "$SCRIPT_DIR/github_ops.py" --create "$FILENAME" "$(cat /tmp/worker.yaml)")
 echo "✅ Created (sha=$SHA)"
