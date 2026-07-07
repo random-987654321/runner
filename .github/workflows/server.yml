@@ -20,27 +20,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Provision non-engine dependencies cleanly
-      - name: Install System Dependencies
+      # 1. Provision foundational packages including nginx for header spoofing
+      - name: Install Queen Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd
+          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd nginx
+          curl -fsSL https://ollama.com/install.sh | sh
           sudo npm install -g openclaw holesail
           
           # Fetch cloudflared binary directly
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. FIX: Use the valid Marketplace namespace for the Ollama setup action
-      - name: Setup Ollama Engine
-        uses: ai-action/setup-ollama@v2
-
-      # 3. Pull required model weight files cleanly over the active service instance
-      - name: Pull Ollama Model Weights
+      # 2. Spin up base model weights runtime
+      - name: Start Ollama Engine
         run: |
+          ollama serve &
+          sleep 5
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Provision workspace skills layout
+      # 3. Provision workspace skills layout
       - name: Setup Custom Agent Skills
         run: |
           mkdir -p ~/.openclaw/workspace/skills/run_worker
@@ -58,36 +57,41 @@ jobs:
           EOF
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      # 5. Spin up NGINX to intercept traffic and strip dynamic CORS browser origins
-      - name: Setup NGINX Proxy Service
-        uses: nyurik/action-setup-nginx@v1
-        with:
-          port: ${{ env.PROXY_PORT }}
-          conf-file-text: |
-            events { worker_connections 1024; }
-            http {
-                server {
-                    listen 19000;
-                    
-                    location / {
-                        proxy_pass http://127.0.0.1:18789;
-                        
-                        # Strip dynamic proxy headers and feed local context to OpenClaw
-                        proxy_set_header Origin "http://127.0.0.1:18789";
-                        proxy_set_header Host "127.0.0.1:18789";
-                        
-                        # Maintain WebSocket handshake stability
-                        proxy_http_version 1.1;
-                        proxy_set_header Upgrade $http_upgrade;
-                        proxy_set_header Connection "Upgrade";
-                        
-                        proxy_read_timeout 86400s;
-                        proxy_send_timeout 86400s;
-                    }
-                }
-            }
+      # 4. Configure & Launch NGINX Reverse Proxy for absolute Origin Stripping
+      - name: Configure and Start NGINX Proxy
+        run: |
+          cat << 'EOF' > openclaw-proxy.conf
+          error_log /tmp/nginx_error.log info;
+          access_log /tmp/nginx_access.log;
+          pid /tmp/nginx.pid;
+          events { worker_connections 1024; }
+          
+          http {
+              server {
+                  listen 19000;
+                  
+                  location / {
+                      proxy_pass http://127.0.0.1:18789;
+                      
+                      # Force mock origin configurations to completely trick OpenClaw's validation
+                      proxy_set_header Origin "http://127.0.0.1:18789";
+                      proxy_set_header Host "127.0.0.1:18789";
+                      
+                      # Support persistent WebSocket handshakes cleanly
+                      proxy_http_version 1.1;
+                      proxy_set_header Upgrade $http_upgrade;
+                      proxy_set_header Connection "Upgrade";
+                      
+                      proxy_read_timeout 86400s;
+                      proxy_send_timeout 86400s;
+                  }
+              }
+          }
+          EOF
+          # Start NGINX in user-space targeting our specific config path
+          /usr/sbin/nginx -c $(pwd)/openclaw-proxy.conf
 
-      # 6. Launch OpenClaw Gateway natively via Ollama wrapper toolchains
+      # 5. Launch OpenClaw natively via Ollama wrapper
       - name: Launch OpenClaw Gateway via Ollama
         run: |
           nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
@@ -102,10 +106,11 @@ jobs:
             sleep 3
           done
 
-      # 7. Bind Cloudflare Tunnel proxy targeting the NGINX input port instead
+      # 6. Bind Cloudflare Tunnel proxy targeting the NGINX Proxy Port instead
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
+          # Route traffic through the NGINX wrapper at 19000 instead of direct 18789
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.PROXY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
@@ -120,7 +125,7 @@ jobs:
           done
           sleep 5
 
-      # 8. Output link data and maintain connection live state indefinitely
+      # 7. Output link data and maintain connection live state
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
@@ -129,5 +134,8 @@ jobs:
           echo ""
           echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
           head -n 20 openclaw.log || true
+          echo ""
+          echo "--- LOG DIAGNOSTICS (NGINX Status Check) ---"
+          ps aux | grep nginx || true
           echo "================================================================="
           sleep infinity
