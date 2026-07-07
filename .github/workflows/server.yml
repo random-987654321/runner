@@ -58,7 +58,10 @@ jobs:
           # Enforce execution permissions on your deployment script
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-          # Use official headless integration command to instantly provision & bind the gateway
+          # Inject environment variables to force open-origin parsing during the automated ollama launch process
+          export OPENCLAW_GATEWAY_CONTROL_UI_ALLOWED_ORIGINS="https://*.trycloudflare.com"
+          export OPENCLAW_GATEWAY_AUTH_MODE="none"
+          
           nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
           
           echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
