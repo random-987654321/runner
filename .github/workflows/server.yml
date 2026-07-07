@@ -32,20 +32,23 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-ollama-
 
+      # 3. Provision environment runtime packages
       - name: Install Node & System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl git nodejs npm jq
           sudo npm install -g openclaw holesail
           
-          # Download cloudflared binary directly
+          # Fetch cloudflared binary directly
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
+      # 4. Bind model architecture to localized daemon instance
       - name: Pull Model Weights
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
+      # 5. Populate workspace tasks and custom tools manifest
       - name: Pre-build Architecture & Skills Layout
         run: |
           mkdir -p ~/.openclaw/workspace/skills/run_worker
@@ -63,6 +66,7 @@ jobs:
           EOF
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
+      # 6. Instantiate core OpenClaw gateway config layout & process invocation
       - name: Configure and Launch OpenClaw Natively
         run: |
           mkdir -p ~/.openclaw
@@ -98,7 +102,7 @@ jobs:
           }
           EOF
 
-          # Turn off strict browser origin checking to allow cloudflare routing to pass
+          # Turn off strict browser origin checking to allow arbitrary cloudflare addresses to map cleanly
           OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true" nohup openclaw gateway start > openclaw.log 2>&1 &
           
           echo "⏳ Verifying control gateway boot sequence..."
@@ -110,13 +114,14 @@ jobs:
             sleep 3
           done
 
+      # 7. Establish upstream cloudflare tunneling and assert global connectivity status
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          # Route the cloudflare proxy explicitly to the live port
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
+          URL=""
           for i in {1..20}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$URL" ]; then 
@@ -126,8 +131,22 @@ jobs:
             fi
             sleep 3
           done
-          sleep 5
 
+          echo "🌐 Warming up edge tunnel routing network structures..."
+          sleep 12
+          
+          echo "📡 Verifying edge tunnel connectivity public propagation status..."
+          for i in {1..10}; do
+            STATUS=$(curl -o /dev/null -s -w "%{http_code}" "$URL" || echo "000")
+            if [ "$STATUS" -ne "000" ] && [ "$STATUS" -ne "502" ]; then
+              echo "✅ Cloudflare Edge route is live on the public internet! (Status: $STATUS)"
+              break
+            fi
+            echo "Tunnel routing is propagating, waiting for edge setup... ($i/10)"
+            sleep 6
+          done
+
+      # 8. Print active runtime diagnostics and keep pipeline active
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
