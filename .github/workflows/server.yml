@@ -10,7 +10,7 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  GATEWAY_PORT: 18789
+  HERMES_PORT: 11434  # Hermes orchestrator hooks into the native loopback endpoint
 
 jobs:
   queen:
@@ -19,18 +19,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Update package managers and provision system tools
+      # 1. Update package managers and provision system binary dependencies
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl git nodejs npm jq netcat-openbsd
-          sudo npm install -g openclaw holesail
           
-          # Fetch cloudflared binary directly
+          # Fetch cloudflared binary directly for the portal edge route
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Setup Ollama runtime environment
+      # 2. Setup Ollama runtime engine core
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
@@ -39,57 +38,40 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Map OpenClaw custom skills specifications
-      - name: Setup Custom Agent Skills
+      # 4. Launch Hermes Agent platform natively via Ollama orchestration
+      - name: Launch Hermes Agent Workspace
+        id: hermes_boot
         run: |
-          mkdir -p ~/.openclaw/workspace/skills/run_worker
-          cat << 'EOF' > ~/.openclaw/workspace/skills/run_worker/SKILL.md
-          # run_worker
+          # Boot down the autonomous agent using the specified granite core weights
+          nohup ollama launch hermes --model ${{ env.OLLAMA_MODEL }} --yes > hermes.log 2>&1 &
           
-          Execute a query in an autonomous, temporary GitHub Actions worker over Holesail.
-          
-          ## Configuration
-          - type: command
-          - command: /home/runner/work/runner/runner/scripts/worker_launcher.sh
-          
-          ## Parameters
-          - query (string): The precise task query to be executed by the worker.
-          EOF
-          chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
-
-      # 5. Launch OpenClaw Gateway and extract the dynamic security token
-      - name: Launch OpenClaw Gateway via Ollama
-        id: openclaw_boot
-        run: |
-          nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
-          
-          echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
+          echo "⏳ Waiting for Hermes Agent Core to bind to endpoint..."
           for i in {1..20}; do
-            if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
-              echo "✅ OpenClaw Gateway successfully verified online!"
+            if curl -s http://127.0.0.1:${{ env.HERMES_PORT }} > /dev/null || [ $? -eq 52 ]; then
+              echo "✅ Hermes Agent Engine successfully verified online!"
               break
             fi
             echo "Keep waiting... ($i/20)"
             sleep 3
           done
           
-          # 🔐 Extract the dynamic token from initialization logs
-          echo "🔑 Parsing Gateway Security Access Credentials..."
-          TOKEN=$(grep -oP '(?:token=|Token:\s*)([a-zA-Z0-9_\.\-]+)' openclaw.log | head -1 | sed 's/token=//I' | sed 's/Token:\s*//I')
+          # 🔐 Extract the dynamic security entry token from Hermes setup logs if present
+          echo "🔑 Parsing Hermes Access Credentials..."
+          TOKEN=$(grep -oP '(?:token=|Token:\s*)([a-zA-Z0-9_\.\-]+)' hermes.log | head -1 | sed 's/token=//I' | sed 's/Token:\s*//I')
           
           if [ -n "$TOKEN" ]; then
-            echo "gateway_token=$TOKEN" >> $GITHUB_OUTPUT
+            echo "agent_token=$TOKEN" >> $GITHUB_OUTPUT
             echo "Successfully parsed token marker."
           else
-            echo "gateway_token=none" >> $GITHUB_OUTPUT
-            echo "⚠️ Warning: No explicit token found. Gateway might be running wide open."
+            echo "agent_token=none" >> $GITHUB_OUTPUT
+            echo "ℹ️ No explicit token restriction detected in boot configurations."
           fi
 
-      # 6. Fire up Cloudflare Tunnel pointing straight at the OpenClaw native gateway port
+      # 5. Fire up Cloudflare Tunnel pointing straight at the active Hermes Engine
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
@@ -103,24 +85,24 @@ jobs:
           done
           sleep 5
 
-      # 7. Output stable entry endpoint URL with Token Auth Query appended automatically
+      # 6. Output clean entry endpoint URL with structural keep-alive state
       - name: Print Orchestration Access Route & Keep Alive
         run: |
-          TOKEN_VAL="${{ steps.openclaw_boot.outputs.gateway_token }}"
+          TOKEN_VAL="${{ steps.hermes_boot.outputs.agent_token }}"
           BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
           
           echo "================================================================="
           if [ "$TOKEN_VAL" != "none" ] && [ -n "$TOKEN_VAL" ]; then
-            echo "🌐 AUTHENTICATED PORTAL ROUTE:"
+            echo "🌐 AUTHENTICATED HERMES AGENT ROUTE:"
             echo "👉 ${BASE_URL}/?token=${TOKEN_VAL}"
             echo ""
-            echo "🔑 RAW GATEWAY TOKEN: ${TOKEN_VAL}"
+            echo "🔑 RAW INSTANCE TOKEN: ${TOKEN_VAL}"
           else
-            echo "🌐 OPENCLAW PORTAL ROUTE: ${BASE_URL}"
+            echo "🌐 HERMES PORTAL ROUTE: ${BASE_URL}"
           fi
           echo "================================================================="
           echo ""
-          echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
-          head -n 20 openclaw.log || true
+          echo "--- LOG DIAGNOSTICS (Hermes Initialization Preview) ---"
+          head -n 25 hermes.log || true
           echo "================================================================="
           sleep infinity
