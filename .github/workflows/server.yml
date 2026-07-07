@@ -7,8 +7,9 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_DASHBOARD_PORT: 9119
+  HERMES_FRONTEND_PORT: 9119
   HERMES_BACKEND_PORT: 9120
+  HERMES_PUBLIC_PORT: 8888
 jobs:
   queen:
     runs-on: ubuntu-latest
@@ -19,7 +20,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd openssh-server
+          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd nginx
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
           
@@ -56,13 +57,12 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           
-      # NEW STEP: Start the backend API server manually on port 9120
-      - name: Start Hermes Backend Gateway
+      - name: Start Hermes Backend Server
         run: |
           echo "🚀 Starting Hermes backend API server..."
-          nohup hermes gateway run --host 127.0.0.1 --port ${{ env.HERMES_BACKEND_PORT }} > hermes_backend.log 2>&1 &
+          nohup hermes serve --host 127.0.0.1 --port ${{ env.HERMES_BACKEND_PORT }} > hermes_backend.log 2>&1 &
           
-          echo "⏳ Waiting for backend API to bind to 127.0.0.1:${{ env.HERMES_BACKEND_PORT }}..."
+          echo "⏳ Waiting for backend to bind..."
           for i in {1..15}; do
             if nc -z 127.0.0.1 ${{ env.HERMES_BACKEND_PORT }}; then
               echo "✅ Backend API is online!"
@@ -71,35 +71,70 @@ jobs:
             sleep 2
           done
           
-      # Dashboard starts on 9119 and talks to the backend on 9120
-      - name: Start Hermes Native Dashboard
+      - name: Start Hermes Dashboard Frontend
         env:
           HERMES_ALLOWED_ORIGINS: "*"
           HERMES_ALLOWED_HOSTS: "*"
           HERMES_DISABLE_CSRF: "true"
           HERMES_INSECURE: "true"
         run: |
+          echo "🚀 Starting Hermes frontend dashboard..."
           nohup hermes dashboard \
             --host 127.0.0.1 \
-            --port ${{ env.HERMES_DASHBOARD_PORT }} \
+            --port ${{ env.HERMES_FRONTEND_PORT }} \
             --no-open \
             --skip-build > hermes_dashboard.log 2>&1 &
           
-          echo "⏳ Waiting for dashboard frontend to bind..."
+          echo "⏳ Waiting for frontend to bind..."
           for i in {1..15}; do
-            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then
-              echo "✅ Dashboard is online!"
+            if nc -z 127.0.0.1 ${{ env.HERMES_FRONTEND_PORT }}; then
+              echo "✅ Frontend is online!"
               break
             fi
             sleep 2
           done
+
+      # NEW STEP: Nginx stitches the frontend and backend together under one port
+      - name: Configure Nginx Reverse Proxy
+        run: |
+          sudo tee /etc/nginx/sites-available/hermes > /dev/null <<EOF
+          server {
+              listen ${{ env.HERMES_PUBLIC_PORT }};
+              
+              # Send standard web traffic to the Dashboard Frontend
+              location / {
+                  proxy_pass http://127.0.0.1:${{ env.HERMES_FRONTEND_PORT }};
+                  proxy_set_header Host \$host;
+              }
+
+              # Send WebSocket & API traffic to the Backend Server
+              location /ws {
+                  proxy_pass http://127.0.0.1:${{ env.HERMES_BACKEND_PORT }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade \$http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host \$host;
+              }
+              
+              location /api {
+                  proxy_pass http://127.0.0.1:${{ env.HERMES_BACKEND_PORT }};
+                  proxy_set_header Host \$host;
+              }
+          }
+          EOF
+          
+          sudo ln -sf /etc/nginx/sites-available/hermes /etc/nginx/sites-enabled/
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t && sudo systemctl restart nginx
+          echo "✅ Nginx proxy is online on port ${{ env.HERMES_PUBLIC_PORT }}!"
           
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
+          # Point the tunnel to the Nginx proxy port
           nohup ./cloudflared tunnel \
-            --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header "127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }}" > tunnel.log 2>&1 &
+            --url http://127.0.0.1:${{ env.HERMES_PUBLIC_PORT }} \
+            --http-host-header "127.0.0.1:${{ env.HERMES_PUBLIC_PORT }}" > tunnel.log 2>&1 &
           
           sleep 2
           
