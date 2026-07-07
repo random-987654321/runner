@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Update package managers and provision system environment binaries
+      # 1. Install system binaries
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
@@ -38,17 +38,29 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Clone and launch the official Hermes WebUI Server with Provider variables
+      # 4. PRE-CONFIGURE HERMES AGENT SETTINGS
+      # This injects the exact provider options directly into the runner's profile home directory
+      - name: Pre-configure Hermes Provider Settings
+        run: |
+          mkdir -p ~/.config/hermes
+          cat << 'EOF' > ~/.config/hermes/config.json
+          {
+            "provider": "ollama",
+            "model": "granite4:tiny-h",
+            "ollama": {
+              "host": "http://127.0.0.1:11434"
+            }
+          }
+          EOF
+          echo "✅ Injected default configuration file into local profile path!"
+
+      # 5. Clone and launch the official Hermes WebUI Server
       - name: Deploy Hermes WebUI Workspace
         run: |
           git clone https://github.com/nesquena/hermes-webui.git hermes-ui-repo
           cd hermes-ui-repo
           
-          # 🔗 CRITICAL FIX: Explicitly passing provider variables forces the UI 
-          # to pick up your local Ollama runtime and map its pulled models.
-          export HERMES_PROVIDER="ollama"
-          export OLLAMA_HOST="http://127.0.0.1:11434"
-          
+          # Run the start script in the background—it will now inherit our pre-configured file
           nohup bash start.sh > ../hermes_ui.log 2>&1 &
           cd ..
           
@@ -61,7 +73,7 @@ jobs:
             sleep 3
           done
 
-      # 5. Connect Cloudflare Tunnel straight to the native Hermes UI port (8787)
+      # 6. Connect Cloudflare Tunnel straight to the native Hermes UI port (8787)
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
@@ -79,7 +91,7 @@ jobs:
           done
           sleep 5
 
-      # 6. Print accurate access route guidelines and maintain loop persistence
+      # 7. Print accurate access route guidelines and maintain loop persistence
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
