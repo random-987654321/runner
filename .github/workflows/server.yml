@@ -19,52 +19,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Pull core engine applications and runtime frameworks
+      # 1. Update package managers and provision system environment binaries
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl git python3-pip netcat-openbsd
           pip install websockets
           
-          # Fetch cloudflared binary directly
+          # Fetch cloudflared binary directly for external connection routes
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Setup Ollama Server Environment
+      # 2. Setup Ollama runtime container framework
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      # 3. Cache and provision model weight structures
+      # 3. Pull required weight files natively
       - name: Pull Ollama Model Weights
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Spin up the underlying Python Header Stripper Proxy
+      # 4. Boot down the python bypass routing layer
       - name: Start Python CORS Handshake Proxy
         run: |
           python3 scripts/cors_proxy.py &
           sleep 2
 
-      # 5. Spin up Open WebUI container mapped directly to host ports
-      - name: Deploy Open WebUI Panel
+      # 5. Clone and bootstrap the official nesquena/hermes-webui application panel
+      - name: Deploy Hermes WebUI Workspace
         run: |
-          docker run -d -p 3000:8080 \
-            --add-host=host.docker.internal:host-gateway \
-            -v open-webui:/app/backend/data \
-            --name open-webui \
-            --restart always \
-            ghcr.io/open-webui/open-webui:main
+          git clone https://github.com/nesquena/hermes-webui.git hermes-ui-repo
+          cd hermes-ui-repo
           
-          echo "⏳ Waiting for Web UI container space to wake up..."
-          for i in {1..30}; do
-            if curl -s http://127.0.0.1:3000 > /dev/null; then
-              echo "✅ Interface Dashboard fully online and bound!"
+          # Install dependencies and start the lightweight dashboard process in background
+          pip install -r requirements.txt || true
+          nohup python3 bootstrap.py --port 8000 > ../hermes_ui.log 2>&1 &
+          cd ..
+          
+          echo "⏳ Waiting for official Hermes Dashboard to bind to operational port..."
+          for i in {1..20}; do
+            if curl -s http://127.0.0.1:8000 > /dev/null || [ $? -eq 52 ]; then
+              echo "✅ Hermes Community WebUI successfully verified online!"
               break
             fi
             sleep 3
           done
 
-      # 6. Establish secure edge connection over Cloudflare
+      # 6. Establish secure tunnel connection routing back to the local script space
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
@@ -82,17 +83,17 @@ jobs:
           done
           sleep 5
 
-      # 7. Print stable entry point and preserve runtime threads
+      # 7. Print access route path guidelines and maintain loop persistence
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
           
           echo "================================================================="
-          echo "🌐 INTERACTIVE WORKSPACE INTERFACE PORTAL READY:"
+          echo "🌐 OFFICIAL HERMES WEBUI PORTAL READY:"
           echo "👉 ${BASE_URL}"
           echo "================================================================="
           echo ""
-          echo "--- CONTAINER RUNTIME STATUS ---"
-          docker ps || true
+          echo "--- DASHBOARD STATUS (Previewing WebUI Workspace Boot Log) ---"
+          head -n 25 hermes_ui.log || true
           echo "================================================================="
           sleep infinity
