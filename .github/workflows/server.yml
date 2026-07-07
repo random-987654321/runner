@@ -1,3 +1,10 @@
+Yes, you absolutely can remove it! Now that we are loop-verifying the local OpenClaw gateway first, `cloudflared` will find a live port immediately when it boots up.
+
+We can completely replace the second loop with a simple 3-second wait to let `cloudflared` register its address, grab the URL using `grep`, and proceed immediately.
+
+### 📋 Cleaned-Up `.github/workflows/queen.yml` File
+
+```yaml
 name: Queen Orchestrator
 
 on:
@@ -19,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Tool-based Ollama installation (Served in background automatically)
+      # 1. Clean, tool-based Ollama installation
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
@@ -65,13 +72,15 @@ jobs:
 
       - name: Configure and Launch OpenClaw Natively
         run: |
-          mkdir -p ~/.openclaw
+          mkdir -p ~/.openclaw/workspace/data
+          mkdir -p ~/.openclaw/workspace/agents
+          
           cat << EOF > ~/.openclaw/openclaw.json
           {
             "gateway": {
               "port": 18789,
               "mode": "local",
-              "bind": "auto",
+              "bind": "127.0.0.1",
               "auth": {
                 "mode": "none"
               }
@@ -98,38 +107,32 @@ jobs:
           }
           EOF
 
-          # Turn off cross-origin checks completely 
+          # Disable origin restriction checks completely
           OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true" nohup openclaw gateway start > openclaw.log 2>&1 &
           
-          echo "⏳ Verifying control gateway boot sequence..."
-          for i in {1..20}; do
-            if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
-              echo "✅ OpenClaw Gateway is online and listening!"
+          echo "⏳ Running verification loop on internal OpenClaw Gateway port..."
+          for i in {1..25}; do
+            STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://127.0.0.1:${{ env.GATEWAY_PORT }} || echo "failed")
+            if [ "$STATUS" != "failed" ] && [ "$STATUS" != "000" ]; then
+              echo "✅ OpenClaw verified online locally! (Status: $STATUS)"
               break
             fi
             sleep 3
           done
 
+      # 7. No loop for cloudflared: Start it, sleep briefly, and parse the token domain string
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
-          echo "⏳ Catching TryCloudflare edge address registration..."
-          URL=""
-          for i in {1..20}; do
-            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then 
-              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
-              echo "Found address: $URL"
-              break
-            fi
-            sleep 3
-          done
+          echo "⏳ Waiting 5 seconds for tunnel connection handshake..."
+          sleep 5
           
-          # Give it a baseline static cooldown wait for edge mapping, then move on
-          echo "🌐 Allowing 15 seconds for global routing setup..."
-          sleep 15
+          # Grab the assigned domain out of the log stream directly
+          URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+          echo "Found address: $URL"
+          echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
 
       - name: Print Orchestration Access Route & Keep Alive
         run: |
@@ -144,3 +147,5 @@ jobs:
           head -n 20 tunnel.log || true
           echo "================================================================="
           sleep infinity
+
+```
