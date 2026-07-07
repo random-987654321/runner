@@ -8,6 +8,7 @@ env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
   HERMES_DASHBOARD_PORT: 9119
+  HERMES_BACKEND_PORT: 9120
 jobs:
   queen:
     runs-on: ubuntu-latest
@@ -26,8 +27,7 @@ jobs:
         uses: ai-action/setup-ollama@v2
         
       - name: Pull Ollama Model Weights
-        run: |
-          ollama pull ${{ env.OLLAMA_MODEL }}
+        run: ollama pull ${{ env.OLLAMA_MODEL }}
           
       - name: Verify Ollama is Ready
         run: |
@@ -56,26 +56,22 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           
-      - name: Install & Start Hermes Backend Gateway
+      # NEW STEP: Start the backend API server manually on port 9120
+      - name: Start Hermes Backend Gateway
         run: |
-          echo "🚀 Installing Hermes gateway service..."
-          hermes gateway install 2>&1 | tee install.log
+          echo "🚀 Starting Hermes backend API server..."
+          nohup hermes gateway run --host 127.0.0.1 --port ${{ env.HERMES_BACKEND_PORT }} > hermes_backend.log 2>&1 &
           
-          echo "🚀 Attempting to start Hermes backend gateway..."
-          nohup hermes gateway start > hermes_gateway.log 2>&1 &
+          echo "⏳ Waiting for backend API to bind to 127.0.0.1:${{ env.HERMES_BACKEND_PORT }}..."
+          for i in {1..15}; do
+            if nc -z 127.0.0.1 ${{ env.HERMES_BACKEND_PORT }}; then
+              echo "✅ Backend API is online!"
+              break
+            fi
+            sleep 2
+          done
           
-          echo "⏳ Waiting for backend gateway to initialize..."
-          sleep 5
-          
-          if pgrep -f "hermes" > /dev/null; then
-            echo "✅ Gateway process is running!"
-          else
-            echo "❌ Gateway failed to start. Printing logs:"
-            cat install.log
-            echo "---"
-            cat hermes_gateway.log
-          fi
-          
+      # Dashboard starts on 9119 and talks to the backend on 9120
       - name: Start Hermes Native Dashboard
         env:
           HERMES_ALLOWED_ORIGINS: "*"
@@ -89,13 +85,13 @@ jobs:
             --no-open \
             --skip-build > hermes_dashboard.log 2>&1 &
           
-          echo "⏳ Waiting for dashboard to bind..."
-          for i in {1..30}; do
+          echo "⏳ Waiting for dashboard frontend to bind..."
+          for i in {1..15}; do
             if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then
               echo "✅ Dashboard is online!"
               break
             fi
-            sleep 3
+            sleep 2
           done
           
       - name: Start Cloudflare Tunnel Connection
