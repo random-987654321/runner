@@ -62,8 +62,8 @@ jobs:
           # We use --http-host-header to make the Dashboard "think" 
           # the request is originating from 127.0.0.1
           nohup ./cloudflared tunnel \
-            --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
+            --url http://0.0.0.0:${{ env.HERMES_DASHBOARD_PORT }} \
+            --http-host-header 0.0.0.0:${{ env.HERMES_DASHBOARD_PORT }} \
             > tunnel.log 2>&1 &
           
           # URL Capture
