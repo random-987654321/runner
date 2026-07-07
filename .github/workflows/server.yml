@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Install all runtime binaries & toolsets natively
+      # 1. Provision essential tools and binary stacks
       - name: Install Queen Dependencies
         run: |
           sudo apt-get update -qq
@@ -31,20 +31,18 @@ jobs:
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Fire up the base model weights engine 
+      # 2. Spin up base model weights runtime
       - name: Start Ollama Engine
         run: |
           ollama serve &
           sleep 5
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 3. Provision skills directory & launch the gateway with origin overrides
+      # 3. Launch OpenClaw natively using the wrapper with global environment injections
       - name: Launch OpenClaw Gateway via Ollama
         run: |
-          # Create custom skill workspace folder for your launcher script
           mkdir -p ~/.openclaw/workspace/skills/run_worker
           
-          # Register your custom agent skill tool via markdown manifest natively
           cat << 'EOF' > ~/.openclaw/workspace/skills/run_worker/SKILL.md
           # run_worker
           
@@ -58,34 +56,24 @@ jobs:
           - query (string): The precise task query to be executed by the worker.
           EOF
 
-          # Enforce execution permissions on your deployment script
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-          # A. Run via Ollama first to assemble initial environment parameters & profiles
-          ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes &
-          sleep 12
-          
-          # B. Gracefully kill the profile instance to free up the target ports
-          pkill -f "openclaw" || true
-          sleep 3
-
-          # C. Relaunch via pristine native binary to enforce clean global environment flags
-          export OPENCLAW_GATEWAY_PORT=${{ env.GATEWAY_PORT }}
+          # Inject origin bypass directly into the parent environment, then launch
           export OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true"
           
-          nohup openclaw gateway start > openclaw.log 2>&1 &
+          nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
           
           echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
           for i in {1..20}; do
             if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
-              echo "✅ OpenClaw Gateway successfully verified online without origin checks!"
+              echo "✅ OpenClaw Gateway successfully verified online and accessible!"
               break
             fi
             echo "Keep waiting... ($i/20)"
             sleep 3
           done
 
-      # 4. Bind the active upstream dynamic cloudflare proxy tunnel
+      # 4. Bind public routing tunnel proxy
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
@@ -101,11 +89,9 @@ jobs:
             fi
             sleep 3
           done
-          
-          # Dynamic network buffer cooldown
           sleep 5
 
-      # 5. Output active connection string & park runner execution path
+      # 5. Output link data and maintain connection live state
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
@@ -118,6 +104,4 @@ jobs:
           echo "--- LOG DIAGNOSTICS (Cloudflared Output Preview) ---"
           head -n 20 tunnel.log || true
           echo "================================================================="
-          
-          # Hold runner pipeline open
           sleep infinity
