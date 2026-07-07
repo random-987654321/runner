@@ -19,11 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Clean, tool-based Ollama installation
+      # 1. Clean, tool-based Ollama installation (Automatically serves in background)
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      # 2. Cache the model directory to save massive deployment time on rerun
+      # 2. Cache model weights directory to skip downloading on future runs
       - name: Cache Ollama Model Weights
         uses: actions/cache@v4
         with:
@@ -38,7 +38,7 @@ jobs:
           sudo apt-get install -y curl git nodejs npm jq
           sudo npm install -g openclaw holesail
           
-          # Download cloudflared binary
+          # Download cloudflared binary directly
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
@@ -98,14 +98,22 @@ jobs:
           }
           EOF
 
-          # Start up with absolute cross-origin safety fallback active, dropping the invalid CLI flag
+          # Turn off strict browser origin checking to allow cloudflare routing to pass
           OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true" nohup openclaw gateway start > openclaw.log 2>&1 &
-          sleep 5
-          cat openclaw.log || true
+          
+          echo "⏳ Verifying control gateway boot sequence..."
+          for i in {1..20}; do
+            if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
+              echo "✅ OpenClaw Gateway is online and listening!"
+              break
+            fi
+            sleep 3
+          done
 
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
+          # Route the cloudflare proxy explicitly to the live port
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
