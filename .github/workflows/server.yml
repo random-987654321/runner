@@ -29,7 +29,7 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
           
-      - name: Verify Ollama is Ready & Model Works
+      - name: Verify Ollama is Ready
         run: |
           echo "⏳ Waiting for Ollama API..."
           for i in {1..30}; do
@@ -39,21 +39,11 @@ jobs:
             fi
             sleep 2
           done
-          echo "🧠 Testing model inference..."
-          ollama run ${{ env.OLLAMA_MODEL }} "Say hello" 2>&1 | head -5
 
       - name: Install Official Hermes Agent
         run: |
           python3 -m pip install --upgrade pip
           pip install "hermes-agent[web,pty]"
-          
-      # NEW STEP: This will print a list of all available commands (serve, api, gateway, etc.)
-      - name: Discover Hermes Commands
-        run: |
-          echo "==============================================="
-          echo "Below are all available Hermes CLI commands:"
-          echo "==============================================="
-          hermes --help
           
       - name: Pre-configure Hermes Runtime Environment
         run: |
@@ -66,18 +56,31 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           
-      - name: Start Hermes Services
+      - name: Start Hermes Backend Gateway
+        run: |
+          echo "🚀 Attempting to start Hermes backend gateway..."
+          nohup hermes gateway start > hermes_gateway.log 2>&1 &
+          
+          echo "⏳ Waiting for backend gateway to initialize..."
+          sleep 5
+          
+          if pgrep -f "hermes gateway" > /dev/null; then
+            echo "✅ Gateway process is running!"
+          else
+            echo "❌ Gateway failed to start. Printing error log:"
+            cat hermes_gateway.log
+            echo "⚠️ Trying fallback command: hermes serve..."
+            nohup hermes serve > hermes_serve.log 2>&1 &
+            sleep 5
+          fi
+          
+      - name: Start Hermes Native Dashboard
         env:
           HERMES_ALLOWED_ORIGINS: "*"
           HERMES_ALLOWED_HOSTS: "*"
           HERMES_DISABLE_CSRF: "true"
           HERMES_INSECURE: "true"
         run: |
-          # Attempting to start the backend gateway alongside the dashboard
-          # If 'serve' is wrong, it will error in the logs, helping us find the right word
-          nohup hermes serve > hermes_backend.log 2>&1 &
-          sleep 2
-          
           nohup hermes dashboard \
             --host 127.0.0.1 \
             --port ${{ env.HERMES_DASHBOARD_PORT }} \
