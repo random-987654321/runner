@@ -20,12 +20,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Provision foundational packages including nginx for header spoofing
-      - name: Install Queen Dependencies
+      # 1. Provision all core binaries and system packages natively
+      - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl git nodejs npm jq netcat-openbsd nginx
-          curl -fsSL https://ollama.com/install.sh | sh
+          
+          # Clean up any default system-wide NGINX instances that might conflict
+          sudo systemctl stop nginx || true
+          
           sudo npm install -g openclaw holesail
           
           # Fetch cloudflared binary directly
@@ -33,13 +36,15 @@ jobs:
           chmod +x cloudflared
 
       # 2. Spin up base model weights runtime
-      - name: Start Ollama Engine
+      - name: Setup Ollama Engine
+        uses: ai-action/setup-ollama@v2
+
+      # 3. Pull required model weight files
+      - name: Pull Ollama Model Weights
         run: |
-          ollama serve &
-          sleep 5
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 3. Provision workspace skills layout
+      # 4. Provision workspace skills layout
       - name: Setup Custom Agent Skills
         run: |
           mkdir -p ~/.openclaw/workspace/skills/run_worker
@@ -57,23 +62,37 @@ jobs:
           EOF
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      # 4. Configure & Launch NGINX Reverse Proxy for absolute Origin Stripping
-      - name: Configure and Start NGINX Proxy
+      # 5. Manual NGINX Setup (Using EOF to perfectly preserve literal syntax)
+      - name: Configure and Start NGINX Proxy (Manual)
         run: |
-          cat << 'EOF' > openclaw-proxy.conf
-          error_log /tmp/nginx_error.log info;
-          access_log /tmp/nginx_access.log;
-          pid /tmp/nginx.pid;
-          events { worker_connections 1024; }
+          mkdir -p /tmp/nginx
+          
+          # Using single quotes around 'EOF' stops GitHub Actions from parsing $ variables
+          cat << 'EOF' > /tmp/nginx/openclaw-proxy.conf
+          error_log /tmp/nginx/error.log info;
+          access_log /tmp/nginx/access.log;
+          pid /tmp/nginx/nginx.pid;
+          daemon on;
+          
+          events { 
+              worker_connections 1024; 
+          }
           
           http {
+              # Direct temporary paths to avoid permission blocks
+              client_body_temp_path /tmp/nginx/client_body;
+              proxy_temp_path       /tmp/nginx/proxy_temp;
+              fastcgi_temp_path     /tmp/nginx/fastcgi_temp;
+              uwsgi_temp_path       /tmp/nginx/uwsgi_temp;
+              scgi_temp_path        /tmp/nginx/scgi_temp;
+
               server {
                   listen 19000;
                   
                   location / {
                       proxy_pass http://127.0.0.1:18789;
                       
-                      # Force mock origin configurations to completely trick OpenClaw's validation
+                      # Force mock origin configurations to trick OpenClaw's validation
                       proxy_set_header Origin "http://127.0.0.1:18789";
                       proxy_set_header Host "127.0.0.1:18789";
                       
@@ -88,10 +107,15 @@ jobs:
               }
           }
           EOF
-          # Start NGINX in user-space targeting our specific config path
-          /usr/sbin/nginx -c $(pwd)/openclaw-proxy.conf
+          
+          # Run NGINX targeting our explicitly crafted configuration file
+          sudo /usr/sbin/nginx -c /tmp/nginx/openclaw-proxy.conf
+          
+          # Quick verification check
+          sleep 2
+          ps aux | grep nginx
 
-      # 5. Launch OpenClaw natively via Ollama wrapper
+      # 6. Launch OpenClaw Gateway
       - name: Launch OpenClaw Gateway via Ollama
         run: |
           nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
@@ -106,11 +130,10 @@ jobs:
             sleep 3
           done
 
-      # 6. Bind Cloudflare Tunnel proxy targeting the NGINX Proxy Port instead
+      # 7. Bind Cloudflare Tunnel proxy targeting the manual NGINX port
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          # Route traffic through the NGINX wrapper at 19000 instead of direct 18789
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.PROXY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
@@ -125,7 +148,7 @@ jobs:
           done
           sleep 5
 
-      # 7. Output link data and maintain connection live state
+      # 8. Output link data and maintain connection live state indefinitely
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
@@ -134,8 +157,5 @@ jobs:
           echo ""
           echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
           head -n 20 openclaw.log || true
-          echo ""
-          echo "--- LOG DIAGNOSTICS (NGINX Status Check) ---"
-          ps aux | grep nginx || true
           echo "================================================================="
           sleep infinity
