@@ -9,7 +9,7 @@ permissions:
 
 env:
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_WEBUI_PORT: 9119
+  HERMES_DASHBOARD_PORT: 9119
 
 jobs:
   queen:
@@ -18,13 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install System Dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl python3-pip netcat-openbsd
-          # Install Hermes Agent and dependencies
           pip install "hermes-agent[web,pty]"
-          # Install Cloudflare Tunnel (cloudflared)
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
@@ -32,35 +30,36 @@ jobs:
         uses: ai-action/setup-ollama@v2
       - run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Launch Hermes WebUI
+      - name: Launch Hermes Dashboard
         run: |
-          # Ensure the configuration directory exists
           mkdir -p ~/.hermes
-          
-          # Start the WebUI in the background
-          # We use --host 0.0.0.0 so it is accessible from the tunnel
-          nohup python3 -m hermes_webui.server \
+          # Start dashboard in the background
+          # Note: Using 0.0.0.0 ensures it binds to all network interfaces
+          nohup hermes dashboard \
             --host 0.0.0.0 \
-            --port ${{ env.HERMES_WEBUI_PORT }} > webui.log 2>&1 &
+            --port ${{ env.HERMES_DASHBOARD_PORT }} \
+            --no-open \
+            --skip-build > hermes.log 2>&1 &
           
-          # Readiness Probe: Ensure WebUI is fully responsive before proceeding
-          echo "Waiting for WebUI to be responsive..."
-          for i in {1..20}; do
-            if curl -s http://127.0.0.1:${{ env.HERMES_WEBUI_PORT }} > /dev/null; then
-              echo "WebUI is live!"
+          # CRITICAL: Wait until the port is actually responding
+          echo "Waiting for Hermes Dashboard to be responsive..."
+          for i in {1..40}; do
+            if curl -s http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > /dev/null; then
+              echo "Dashboard is live!"
               break
             fi
+            echo "Waiting ($i/40)..."
             sleep 5
           done
 
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
-          # Expose the WebUI port through the tunnel
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_WEBUI_PORT }} > tunnel.log 2>&1 &
+          # Start tunnel WITHOUT host header overrides to prevent gateway errors
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > tunnel.log 2>&1 &
           
-          # Extract and output the public URL
-          for i in {1..15}; do
+          # Capture the URL
+          for i in {1..20}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$URL" ]; then 
               echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
@@ -69,9 +68,15 @@ jobs:
             sleep 3
           done
 
-      - name: Portal Access
+      - name: Access Endpoint
         run: |
-          echo "========================================================="
-          echo "🌐 HERMES WEBUI READY: ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo "========================================================="
+          echo "🌐 PORTAL READY: ${{ steps.tunnel.outputs.tunnel_url }}"
           sleep infinity
+
+      - name: Debug Logs
+        if: always()
+        run: |
+          echo "--- Hermes Logs ---"
+          cat hermes.log
+          echo "--- Tunnel Logs ---"
+          cat tunnel.log
