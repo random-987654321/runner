@@ -57,7 +57,7 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           
-      # ADDED CORS VARIABLES TO THE BACKEND TO PREVENT INFINITE RELOAD
+      # 1. Backend with CORS enabled (fixes infinite reload)
       - name: Start Hermes Backend Server
         env:
           HERMES_ALLOWED_ORIGINS: "*"
@@ -77,6 +77,7 @@ jobs:
             sleep 2
           done
           
+      # 2. Frontend
       - name: Start Hermes Dashboard Frontend
         env:
           HERMES_ALLOWED_ORIGINS: "*"
@@ -100,33 +101,31 @@ jobs:
             sleep 2
           done
 
-      # SIMPLIFIED & ENHANCED NGINX CONFIG
+      # 3. Safe Nginx config (removed the broken 'if' statement that caused 502)
       - name: Configure Nginx Reverse Proxy
         run: |
           sudo tee /etc/nginx/sites-available/hermes > /dev/null <<'EOF'
           server {
               listen 8888;
 
-              # 1. MAGIC WEBSOCKET CATCH-ALL: 
-              # If the browser asks for a WebSocket, force it to the backend, no matter the path!
-              if ($http_upgrade = "websocket") {
+              # Send WebSocket traffic to the Backend
+              location /ws {
                   proxy_pass http://127.0.0.1:9120;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
                   proxy_set_header Connection "upgrade";
                   proxy_set_header Host 127.0.0.1:9120;
                   proxy_set_header Origin $http_origin;
-                  break;
               }
 
-              # 2. API calls go to Backend
+              # Send standard API traffic to the Backend
               location /api {
                   proxy_pass http://127.0.0.1:9120;
                   proxy_set_header Host 127.0.0.1:9120;
                   proxy_set_header Origin $http_origin;
               }
 
-              # 3. Everything else (HTML, JS, CSS) goes to Frontend
+              # Send everything else (HTML/JS/CSS) to the Frontend
               location / {
                   proxy_pass http://127.0.0.1:9119;
                   proxy_set_header Host 127.0.0.1:9119;
@@ -141,7 +140,6 @@ jobs:
           
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
-        # REMOVED --http-host-header so Nginx can manage headers cleanly
         run: |
           nohup ./cloudflared tunnel \
             --url http://127.0.0.1:${{ env.HERMES_PUBLIC_PORT }} > tunnel.log 2>&1 &
