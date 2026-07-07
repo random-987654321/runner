@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl python3-pip netcat-openbsd
@@ -30,7 +30,7 @@ jobs:
         uses: ai-action/setup-ollama@v2
       - run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Start Hermes Dashboard (Pure Local)
+      - name: Configure and Start Hermes Dashboard
         run: |
           mkdir -p ~/.hermes
           cat << 'EOF' > ~/.hermes/config.yaml
@@ -41,28 +41,42 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           nohup hermes dashboard --host 127.0.0.1 --no-open --port ${{ env.HERMES_DASHBOARD_PORT }} > dashboard.log 2>&1 &
+          
+          # Ensure dashboard is responsive
+          for i in {1..15}; do if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then break; fi; sleep 2; done
 
-      - name: Start CORS Proxy (Adapter)
+      - name: Start CORS Proxy (scripts/cors_proxy.py)
         run: |
-          nohup python3 cors_proxy.py > proxy.log 2>&1 &
-          # Wait for proxy to bind
-          for i in {1..10}; do if nc -z 127.0.0.1 ${{ env.PROXY_PORT }}; then break; fi; sleep 2; done
+          nohup python3 scripts/cors_proxy.py > proxy.log 2>&1 &
+          # Ensure proxy is responsive
+          for i in {1..10}; do if nc -z 127.0.0.1 ${{ env.PROXY_PORT }}; then echo "✅ Proxy active"; break; fi; sleep 2; done
 
-      - name: Start Cloudflare Tunnel (Points to Proxy)
+      - name: Start Cloudflare Tunnel (Pointing to Proxy)
         id: tunnel
         run: |
-          # The tunnel points to the proxy (9120), not the dashboard (9119)
+          # Point tunnel to the proxy (9120) to fix WebSocket and Host header issues
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.PROXY_PORT }} > tunnel.log 2>&1 &
+          
+          # Capture the TryCloudflare URL
           for i in {1..20}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then echo "tunnel_url=$URL" >> $GITHUB_OUTPUT; break; fi
+            if [ -n "$URL" ]; then 
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              break
+            fi
             sleep 3
           done
 
-      - name: Final Output
+      - name: Orchestration Access Route
         run: |
           echo "========================================================="
-          echo "🌐 ACCESS YOUR HERMES DASHBOARD:"
+          echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
           echo "👉 ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "========================================================="
+          # Check for errors if URL failed to capture
+          if [ -z "${{ steps.tunnel.outputs.tunnel_url }}" ]; then
+            echo "❌ Failed to capture tunnel URL. Check tunnel.log."
+            cat tunnel.log
+            exit 1
+          fi
           sleep infinity
