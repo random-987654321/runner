@@ -1,103 +1,123 @@
 name: Queen Orchestrator
-
 on:
   workflow_dispatch:
-
 permissions:
   contents: write
   actions: write
-
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
   HERMES_DASHBOARD_PORT: 9119
-
 jobs:
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-
-      # 1. Spin up Ollama Engine Natively on the runner for maximum hardware acceleration
+      
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd openssh-server
+          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
-
-      # 2. Pull base model weights and automatically extend context to 64K
-      - name: Build 64K Context Agent Model Variant
+        
+      - name: Pull Ollama Model Weights
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
           
-          # Creating the Modelfile to match the 64,000 threshold required by Hermes tools
-          echo "FROM ${{ env.OLLAMA_MODEL }}" > Modelfile
-          echo "PARAMETER num_ctx 64000" >> Modelfile
-          ollama create granite4-64k -f Modelfile
+      - name: Verify Ollama is Ready & Model Works
+        run: |
+          echo "⏳ Waiting for Ollama API..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 11434; then
+              echo "✅ Ollama is online!"
+              break
+            fi
+            sleep 2
+          done
+          echo "🧠 Testing model inference..."
+          ollama run ${{ env.OLLAMA_MODEL }} "Say hello" 2>&1 | head -5
+
+      - name: Install Official Hermes Agent
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install "hermes-agent[web,pty]"
           
-          echo "✅ Custom 64K Context Model Variant successfully registered:"
-          ollama list
-
-      # 3. Provision isolated bridge infrastructure
-      - name: Create Isolated Container Network
+      # NEW STEP: This will print a list of all available commands (serve, api, gateway, etc.)
+      - name: Discover Hermes Commands
         run: |
-          docker network create hermes-net
-
-      # 4. Spin up Hermes Agent Dashboard inside a network-isolated container environment
-      - name: Launch Hermes Container
+          echo "==============================================="
+          echo "Below are all available Hermes CLI commands:"
+          echo "==============================================="
+          hermes --help
+          
+      - name: Pre-configure Hermes Runtime Environment
         run: |
-          docker run -d \
-            --name hermes-dashboard \
-            --network hermes-net \
-            -p ${{ env.HERMES_DASHBOARD_PORT }}:${{ env.HERMES_DASHBOARD_PORT }} \
-            -e HERMES_ALLOWED_ORIGINS="*" \
-            -e HERMES_ALLOWED_HOSTS="*" \
-            -e HERMES_DISABLE_CSRF="true" \
-            -e HERMES_INSECURE="true" \
-            -v ~/.hermes:/root/.hermes \
-            python:3.11-slim /bin/bash -c "
-              pip install --upgrade pip && \
-              pip install 'hermes-agent[web,pty]' && \
-              mkdir -p /root/.hermes && \
-              echo 'provider: \"ollama\"' > /root/.hermes/config.yaml && \
-              echo 'model: \"granite4-64k\"' >> /root/.hermes/config.yaml && \
-              echo 'providers:' >> /root/.hermes/config.yaml && \
-              echo '  ollama:' >> /root/.hermes/config.yaml && \
-              echo '    base_url: \"http://host.docker.internal:11434\"' >> /root/.hermes/config.yaml && \
-              hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_DASHBOARD_PORT }} --no-open --skip-build
-            "
-
-          echo "⏳ Waiting for containerized application boot sequence..."
-          sleep 15
-          docker logs hermes-dashboard
-
-      # 5. Direct the Cloudflare Tunnel client with transport and host headers optimized
-      - name: Start Cloudflare Tunnel Container
+          mkdir -p ~/.hermes
+          cat << 'EOF' > ~/.hermes/config.yaml
+          provider: "ollama"
+          model: "granite4:tiny-h"
+          providers:
+            ollama:
+              base_url: "http://127.0.0.1:11434"
+          EOF
+          
+      - name: Start Hermes Services
+        env:
+          HERMES_ALLOWED_ORIGINS: "*"
+          HERMES_ALLOWED_HOSTS: "*"
+          HERMES_DISABLE_CSRF: "true"
+          HERMES_INSECURE: "true"
         run: |
-          docker run -d \
-            --name cloudflared-tunnel \
-            --network hermes-net \
-            cloudflare/cloudflared:latest \
-            tunnel \
-            --url http://hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header "hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}" \
-            --no-tls-verify
-
-          echo "⏳ Catching dynamic public edge route URL..."
-          # Active loop to reliably catch the ephemeral address from container logs
-          for i in {1..20}; do
-            URL=$(docker logs cloudflared-tunnel 2>&1 | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1)
-            if [ -n "$URL" ]; then 
-              echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-              echo "✅ URL Captured: $URL"
+          # Attempting to start the backend gateway alongside the dashboard
+          # If 'serve' is wrong, it will error in the logs, helping us find the right word
+          nohup hermes serve > hermes_backend.log 2>&1 &
+          sleep 2
+          
+          nohup hermes dashboard \
+            --host 127.0.0.1 \
+            --port ${{ env.HERMES_DASHBOARD_PORT }} \
+            --no-open \
+            --skip-build > hermes_dashboard.log 2>&1 &
+          
+          echo "⏳ Waiting for dashboard to bind..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then
+              echo "✅ Dashboard is online!"
               break
             fi
             sleep 3
           done
-
-      # 6. Output direct URL access routes and sustain active keep-alive loop
+          
+      - name: Start Cloudflare Tunnel Connection
+        id: tunnel
+        run: |
+          nohup ./cloudflared tunnel \
+            --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
+            --http-host-header "127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }}" > tunnel.log 2>&1 &
+          
+          sleep 2
+          
+          echo "⏳ Catching TryCloudflare edge address registration..."
+          for i in {1..20}; do
+            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$URL" ]; then 
+              echo "✅ Tunnel successfully established!"
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              break
+            fi
+            echo "Waiting for Cloudflare edge... (Attempt $i/20)" 
+            sleep 3
+          done
+          
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
           echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
-          echo "👉 ${{ env.TUNNEL_URL }}"
+          echo "👉 ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "================================================================="
           sleep infinity
