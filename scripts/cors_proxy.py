@@ -6,8 +6,9 @@ import urllib.error
 import asyncio
 import websockets
 
-TARGET_HTTP = "http://127.0.0.1:3000"
-TARGET_WS = "ws://127.0.0.1:3000"
+# Configuration targeted precisely at the nesquena/hermes-webui runtime default
+TARGET_HTTP = "http://127.0.0.1:8000"
+TARGET_WS = "ws://127.0.0.1:8000"
 PROXY_PORT_HTTP = 19000
 PROXY_PORT_WS = 19001
 
@@ -19,7 +20,7 @@ class CORSProxyHandler(http.server.BaseHTTPRequestHandler):
         url = f"{TARGET_HTTP}{self.path}"
         req_headers = {k: v for k, v in self.headers.items() if k.lower() not in ['host', 'origin']}
         req_headers['Origin'] = TARGET_HTTP
-        req_headers['Host'] = "127.0.0.1:3000"
+        req_headers['Host'] = "127.0.0.1:8000"
         
         content_length = int(self.headers.get('Content-Length', 0))
         req_data = self.rfile.read(content_length) if content_length > 0 else None
@@ -57,7 +58,7 @@ async def ws_forward(src, dst):
         pass
 
 async def ws_handler(client_ws):
-    headers = {"Origin": TARGET_HTTP, "Host": "127.0.0.1:3000"}
+    headers = {"Origin": TARGET_HTTP, "Host": "127.0.0.1:8000"}
     try:
         async with websockets.connect(TARGET_WS + client_ws.path, extra_headers=headers) as target_ws:
             await asyncio.gather(
