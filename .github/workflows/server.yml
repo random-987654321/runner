@@ -31,13 +31,16 @@ jobs:
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Automatically install Ollama, start the server, and download model weights
+      # 2. FIX: Use the valid Marketplace namespace for the Ollama setup action
       - name: Setup Ollama Engine
-        uses: aktech/setup-ollama@v5
-        with:
-          model: ${{ env.OLLAMA_MODEL }}
+        uses: ai-action/setup-ollama@v2
 
-      # 3. Provision workspace skills layout
+      # 3. Pull required model weight files cleanly over the active service instance
+      - name: Pull Ollama Model Weights
+        run: |
+          ollama pull ${{ env.OLLAMA_MODEL }}
+
+      # 4. Provision workspace skills layout
       - name: Setup Custom Agent Skills
         run: |
           mkdir -p ~/.openclaw/workspace/skills/run_worker
@@ -55,7 +58,7 @@ jobs:
           EOF
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      # 4. Spin up NGINX to intercept traffic and strip dynamic CORS browser origins
+      # 5. Spin up NGINX to intercept traffic and strip dynamic CORS browser origins
       - name: Setup NGINX Proxy Service
         uses: nyurik/action-setup-nginx@v1
         with:
@@ -84,7 +87,7 @@ jobs:
                 }
             }
 
-      # 5. Launch OpenClaw Gateway natively via Ollama wrapper toolchains
+      # 6. Launch OpenClaw Gateway natively via Ollama wrapper toolchains
       - name: Launch OpenClaw Gateway via Ollama
         run: |
           nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
@@ -99,7 +102,7 @@ jobs:
             sleep 3
           done
 
-      # 6. Bind Cloudflare Tunnel proxy targeting the NGINX input port instead
+      # 7. Bind Cloudflare Tunnel proxy targeting the NGINX input port instead
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
@@ -117,7 +120,7 @@ jobs:
           done
           sleep 5
 
-      # 7. Output link data and maintain connection live state indefinitely
+      # 8. Output link data and maintain connection live state indefinitely
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
