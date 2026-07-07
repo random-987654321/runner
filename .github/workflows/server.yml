@@ -31,8 +31,9 @@ jobs:
         uses: ai-action/setup-ollama@v2
       - run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Start Hermes Dashboard (Local)
+      - name: Start Services (Dashboard + Proxy)
         run: |
+          # 1. Start Hermes Dashboard
           mkdir -p ~/.hermes
           cat << 'EOF' > ~/.hermes/config.yaml
           provider: "ollama"
@@ -43,28 +44,40 @@ jobs:
           EOF
           nohup hermes dashboard --host 127.0.0.1 --no-open --port ${{ env.HERMES_DASHBOARD_PORT }} > dashboard.log 2>&1 &
 
-      - name: Start CORS Proxy (Adapter)
-        run: |
+          # 2. Start CORS Proxy Adapter
           nohup python3 scripts/cors_proxy.py > proxy.log 2>&1 &
-          # Wait for proxy to bind
-          for i in {1..10}; do if nc -z 127.0.0.1 ${{ env.PROXY_PORT }}; then break; fi; sleep 2; done
 
-      - name: Start Cloudflare Tunnel (Pointing to Proxy)
+          # 3. SERVICE READINESS GATE
+          echo "⏳ Waiting for services to stabilize..."
+          for i in {1..20}; do
+            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }} && nc -z 127.0.0.1 ${{ env.PROXY_PORT }}; then
+              echo "✅ All local services online."
+              break
+            fi
+            sleep 3
+            if [ $i -eq 20 ]; then echo "❌ Services failed to start."; cat dashboard.log; exit 1; fi
+          done
+
+      - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
-          # Tunnel points to the proxy, which cleans the headers
+          # Tunnel now connects to the verified proxy port
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.PROXY_PORT }} > tunnel.log 2>&1 &
           
+          # URL Capture
           for i in {1..20}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then echo "tunnel_url=$URL" >> $GITHUB_OUTPUT; break; fi
+            if [ -n "$URL" ]; then 
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              break
+            fi
             sleep 3
           done
 
-      - name: Final Output
+      - name: Orchestration Access Route
         run: |
           echo "========================================================="
-          echo "🌐 ACCESS YOUR HERMES DASHBOARD (VIA PROXY):"
+          echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
           echo "👉 ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "========================================================="
           sleep infinity
