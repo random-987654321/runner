@@ -10,33 +10,27 @@ permissions:
 env:
   OLLAMA_MODEL: granite4:tiny-h
   HERMES_DASHBOARD_PORT: 9119
+  PROXY_PORT: 9120
 
 jobs:
   queen:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install System Dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd
+          sudo apt-get install -y curl python3-pip netcat-openbsd
+          pip install fastapi uvicorn httpx hermes-agent[web,pty]
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Setup Ollama Engine
+      - name: Setup Ollama & Model
         uses: ai-action/setup-ollama@v2
+      - run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Pull Ollama Model Weights
-        run: ollama pull ${{ env.OLLAMA_MODEL }}
-
-      - name: Install Official Hermes Agent
-        run: |
-          python3 -m pip install --upgrade pip
-          pip install "hermes-agent[web,pty]"
-
-      - name: Pre-configure Hermes Runtime Environment
+      - name: Start Hermes Dashboard (Pure Local)
         run: |
           mkdir -p ~/.hermes
           cat << 'EOF' > ~/.hermes/config.yaml
@@ -46,37 +40,29 @@ jobs:
             ollama:
               base_url: "http://127.0.0.1:11434"
           EOF
+          nohup hermes dashboard --host 127.0.0.1 --no-open --port ${{ env.HERMES_DASHBOARD_PORT }} > dashboard.log 2>&1 &
 
-      # Step 7 (Tunnel) happens first to capture the URL for Step 6 (Dashboard)
-      - name: Start Cloudflare Tunnel Connection
+      - name: Start CORS Proxy (Adapter)
+        run: |
+          nohup python3 cors_proxy.py > proxy.log 2>&1 &
+          # Wait for proxy to bind
+          for i in {1..10}; do if nc -z 127.0.0.1 ${{ env.PROXY_PORT }}; then break; fi; sleep 2; done
+
+      - name: Start Cloudflare Tunnel (Points to Proxy)
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          # The tunnel points to the proxy (9120), not the dashboard (9119)
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.PROXY_PORT }} > tunnel.log 2>&1 &
           for i in {1..20}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then 
-              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
-              break
-            fi
+            if [ -n "$URL" ]; then echo "tunnel_url=$URL" >> $GITHUB_OUTPUT; break; fi
             sleep 3
           done
 
-      - name: Start Hermes Native Dashboard
+      - name: Final Output
         run: |
-          # Pass the tunnel URL as an allowed-origin to fix the WebSocket disconnect
-          nohup hermes dashboard \
-            --host 127.0.0.1 \
-            --no-open \
-            --skip-build \
-            --allowed-origin "${{ steps.tunnel.outputs.tunnel_url }}" \
-            --port ${{ env.HERMES_DASHBOARD_PORT }} > hermes_dashboard.log 2>&1 &
-          
-          sleep 5
-
-      - name: Print Orchestration Access Route
-        run: |
-          echo "================================================================="
-          echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
+          echo "========================================================="
+          echo "🌐 ACCESS YOUR HERMES DASHBOARD:"
           echo "👉 ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo "================================================================="
+          echo "========================================================="
           sleep infinity
