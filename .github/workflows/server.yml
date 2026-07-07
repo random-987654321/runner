@@ -10,7 +10,7 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  PROXY_PORT: 19000
+  HERMES_UI_PORT: 8787  # Native default port for nesquena/hermes-webui
 
 jobs:
   queen:
@@ -24,13 +24,12 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl git python3-pip netcat-openbsd
-          pip install websockets
           
           # Fetch cloudflared binary directly for external connection routes
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Setup Ollama runtime container framework
+      # 2. Setup Ollama runtime environment
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
@@ -39,37 +38,31 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Boot down the python bypass routing layer
-      - name: Start Python CORS Handshake Proxy
-        run: |
-          python3 scripts/cors_proxy.py &
-          sleep 2
-
-      # 5. Clone and bootstrap the official nesquena/hermes-webui application panel
+      # 4. Clone and launch the official Hermes WebUI Server natively
       - name: Deploy Hermes WebUI Workspace
         run: |
           git clone https://github.com/nesquena/hermes-webui.git hermes-ui-repo
           cd hermes-ui-repo
           
-          # Install dependencies and start the lightweight dashboard process in background
-          pip install -r requirements.txt || true
-          nohup python3 bootstrap.py --port 8000 > ../hermes_ui.log 2>&1 &
+          # Run the official start script in the background to handle the environment boot sequence
+          # This natively spins up on port 8787
+          nohup bash start.sh > ../hermes_ui.log 2>&1 &
           cd ..
           
-          echo "⏳ Waiting for official Hermes Dashboard to bind to operational port..."
-          for i in {1..20}; do
-            if curl -s http://127.0.0.1:8000 > /dev/null || [ $? -eq 52 ]; then
+          echo "⏳ Waiting for Hermes WebUI server to bind to port ${{ env.HERMES_UI_PORT }}..."
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:${{ env.HERMES_UI_PORT }} > /dev/null || [ $? -eq 52 ]; then
               echo "✅ Hermes Community WebUI successfully verified online!"
               break
             fi
             sleep 3
           done
 
-      # 6. Establish secure tunnel connection routing back to the local script space
+      # 5. Connect Cloudflare Tunnel straight to the native Hermes UI port (8787)
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.PROXY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_UI_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
@@ -83,7 +76,7 @@ jobs:
           done
           sleep 5
 
-      # 7. Print access route path guidelines and maintain loop persistence
+      # 6. Print accurate access route guidelines and maintain loop persistence
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
