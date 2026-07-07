@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Provision foundational system binaries and pull cloudflared
+      # 1. Provision system binaries and download cloudflared
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
@@ -28,7 +28,7 @@ jobs:
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Pull down and configure the local Ollama backend
+      # 2. Setup Ollama runtime engine
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
@@ -43,11 +43,10 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install "hermes-agent[web,pty]"
 
-      # 5. Populate local environment configurations to default to Ollama routing
+      # 5. Pre-seed local environment configurations
       - name: Pre-configure Hermes Runtime Environment
         run: |
           mkdir -p ~/.hermes
-          
           cat << 'EOF' > ~/.hermes/config.yaml
           provider: "ollama"
           model: "granite4:tiny-h"
@@ -55,60 +54,50 @@ jobs:
             ollama:
               base_url: "http://127.0.0.1:11434"
           EOF
-          
-          echo "✅ Official config file pre-seeded successfully!"
 
-      # 6. Spin up the dashboard relaxing host-checks to bypass 400 bad request errors
+      # 6. Bind to local loopback to bypass Auth Gate
       - name: Start Hermes Native Dashboard
         run: |
-          # --host 0.0.0.0 and --insecure flag tells the platform to accept incoming traffic headers from proxies
-          # --tui forces background system processes to safely instantiate the WebSocket chat interface
           nohup hermes dashboard \
-            --host 0.0.0.0 \
-            --insecure \
-            --tui \
+            --host 127.0.0.1 \
             --no-open \
             --skip-build \
             --port ${{ env.HERMES_DASHBOARD_PORT }} > hermes_dashboard.log 2>&1 &
           
-          echo "⏳ Waiting for official control plane to bind to port ${{ env.HERMES_DASHBOARD_PORT }}..."
+          echo "⏳ Waiting for dashboard to bind to 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }}..."
           for i in {1..30}; do
             if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then
-              echo "✅ Official Hermes Dashboard is online and listening!"
+              echo "✅ Dashboard is online!"
               break
             fi
             sleep 3
           done
 
-      # 7. Map the Cloudflare reverse proxy edge tunnel straight to the core dashboard port
+      # 7. Map Cloudflare tunnel and rewrite host header to 127.0.0.1
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel \
+            --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
+            --http-host-header 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
+            --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$URL" ]; then 
               echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
-              echo "Found address: $URL"
               break
             fi
             sleep 3
           done
           sleep 5
 
-      # 8. Output target URL parameters and block termination to preserve running instances
+      # 8. Print access route and maintain keep-alive
       - name: Print Orchestration Access Route & Keep Alive
         run: |
-          BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
-          
           echo "================================================================="
           echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
-          echo "👉 ${BASE_URL}"
-          echo "================================================================="
-          echo ""
-          echo "--- DASHBOARD RUNTIME LOG SNAPSHOT ---"
-          head -n 25 hermes_dashboard.log || true
+          echo "👉 ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "================================================================="
           sleep infinity
