@@ -10,7 +10,8 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_PORT: 11434  
+  HERMES_PORT: 11434
+  PROXY_PORT: 19000
 
 jobs:
   queen:
@@ -23,7 +24,8 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd
+          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd python3-pip
+          pip install websockets
           
           # Pull down the cloudflared edge routing daemon
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -38,10 +40,14 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. FIX: Launch Hermes with explicit wildcard CORS permission allowed
+      # 4. Boot up the local Python Proxy Layer
+      - name: Start Python CORS Handshake Proxy
+        run: |
+          python3 scripts/cors_proxy.py &
+          sleep 2
+
+      # 5. Launch Hermes Web UI and Agent Core natively
       - name: Launch Hermes Agent Workspace
-        env:
-          OLLAMA_ORIGINS: "*"  # 🌐 CRITICAL FIX: Directs Ollama to accept Cloudflare header scopes
         run: |
           # Spin up the native web environment using the pulled model weights
           nohup ollama launch hermes --model ${{ env.OLLAMA_MODEL }} --yes > hermes.log 2>&1 &
@@ -56,11 +62,11 @@ jobs:
             sleep 3
           done
 
-      # 5. Connect Cloudflare Tunnel directly to the local Hermes web instance
+      # 6. Connect Cloudflare Tunnel to the Python Proxy instead of directly to Hermes
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.PROXY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
@@ -74,13 +80,13 @@ jobs:
           done
           sleep 5
 
-      # 6. Print clean public entry URL and hold job execution alive
+      # 7. Print public entry URL and hold job execution alive
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
           
           echo "================================================================="
-          echo "🌐 HERMES WEB INTERFACE PORTAL READY:"
+          echo "🌐 HERMES PROXIED INTERFACE PORTAL READY:"
           echo "👉 ${BASE_URL}"
           echo "================================================================="
           echo ""
