@@ -10,7 +10,7 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_UI_PORT: 8787  # Native default port for nesquena/hermes-webui
+  HERMES_UI_PORT: 8787  
 
 jobs:
   queen:
@@ -38,14 +38,17 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Clone and launch the official Hermes WebUI Server natively
+      # 4. Clone and launch the official Hermes WebUI Server with Provider variables
       - name: Deploy Hermes WebUI Workspace
         run: |
           git clone https://github.com/nesquena/hermes-webui.git hermes-ui-repo
           cd hermes-ui-repo
           
-          # Run the official start script in the background to handle the environment boot sequence
-          # This natively spins up on port 8787
+          # 🔗 CRITICAL FIX: Explicitly passing provider variables forces the UI 
+          # to pick up your local Ollama runtime and map its pulled models.
+          export HERMES_PROVIDER="ollama"
+          export OLLAMA_HOST="http://127.0.0.1:11434"
+          
           nohup bash start.sh > ../hermes_ui.log 2>&1 &
           cd ..
           
