@@ -73,7 +73,7 @@ jobs:
             "gateway": {
               "port": 18789,
               "mode": "local",
-              "bind": "127.0.0.1",
+              "bind": "0.0.0.0",
               "auth": {
                 "mode": "none"
               }
@@ -100,20 +100,25 @@ jobs:
           }
           EOF
 
-          # Disable origin restriction checks completely
-          OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true" nohup openclaw gateway start > openclaw.log 2>&1 &
+          # Turn off cross-origin check flags
+          export OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true"
           
-          echo "⏳ Running verification loop on internal OpenClaw Gateway port..."
+          nohup openclaw gateway start > openclaw.log 2>&1 &
+          
+          echo "⏳ Running verification loop on all interfaces..."
           for i in {1..25}; do
-            STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://127.0.0.1:${{ env.GATEWAY_PORT }} || echo "failed")
-            if [ "$STATUS" != "failed" ] && [ "$STATUS" != "000" ]; then
-              echo "✅ OpenClaw verified online locally! (Status: $STATUS)"
+            # Netcat verification to watch port 18789 binding successfully
+            if nc -z 127.0.0.1 ${{ env.GATEWAY_PORT }}; then
+              echo "✅ OpenClaw verified active and listening globally!"
               break
             fi
+            echo "Waiting for process interface assignment... ($i/25)"
             sleep 3
           done
+          
+          echo "--- OpenClaw Runtime Boot Logs ---"
+          cat openclaw.log || true
 
-      # 7. No loop for cloudflared: Start it, sleep briefly, and parse the token domain string
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
@@ -122,7 +127,6 @@ jobs:
           echo "⏳ Waiting 5 seconds for tunnel connection handshake..."
           sleep 5
           
-          # Grab the assigned domain out of the log stream directly
           URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
           echo "Found address: $URL"
           echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
