@@ -10,7 +10,7 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_PORT: 11434  # Native port serving the Hermes web app and engine framework
+  HERMES_PORT: 11434  
 
 jobs:
   queen:
@@ -38,8 +38,10 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Launch Hermes Web UI and Agent Core natively
+      # 4. FIX: Launch Hermes with explicit wildcard CORS permission allowed
       - name: Launch Hermes Agent Workspace
+        env:
+          OLLAMA_ORIGINS: "*"  # 🌐 CRITICAL FIX: Directs Ollama to accept Cloudflare header scopes
         run: |
           # Spin up the native web environment using the pulled model weights
           nohup ollama launch hermes --model ${{ env.OLLAMA_MODEL }} --yes > hermes.log 2>&1 &
