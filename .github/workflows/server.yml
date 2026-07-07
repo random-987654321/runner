@@ -20,22 +20,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Provision all core binaries and system packages natively
+      # 1. Update package managers and provision global node/python components
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd nginx
-          
-          # Clean up any default system-wide NGINX instances that might conflict
-          sudo systemctl stop nginx || true
-          
+          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd python3-pip
           sudo npm install -g openclaw holesail
+          pip install websockets
           
           # Fetch cloudflared binary directly
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Spin up base model weights runtime
+      # 2. Setup Ollama runtime
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
@@ -44,7 +41,7 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Provision workspace skills layout
+      # 4. Map OpenClaw custom skills specifications
       - name: Setup Custom Agent Skills
         run: |
           mkdir -p ~/.openclaw/workspace/skills/run_worker
@@ -62,60 +59,13 @@ jobs:
           EOF
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      # 5. Manual NGINX Setup (Using EOF to perfectly preserve literal syntax)
-      - name: Configure and Start NGINX Proxy (Manual)
+      # 5. FIX: Boot down the python bypass routing layer from the updated scripts directory
+      - name: Start Python CORS Handshake Proxy
         run: |
-          mkdir -p /tmp/nginx
-          
-          # Using single quotes around 'EOF' stops GitHub Actions from parsing $ variables
-          cat << 'EOF' > /tmp/nginx/openclaw-proxy.conf
-          error_log /tmp/nginx/error.log info;
-          access_log /tmp/nginx/access.log;
-          pid /tmp/nginx/nginx.pid;
-          daemon on;
-          
-          events { 
-              worker_connections 1024; 
-          }
-          
-          http {
-              # Direct temporary paths to avoid permission blocks
-              client_body_temp_path /tmp/nginx/client_body;
-              proxy_temp_path       /tmp/nginx/proxy_temp;
-              fastcgi_temp_path     /tmp/nginx/fastcgi_temp;
-              uwsgi_temp_path       /tmp/nginx/uwsgi_temp;
-              scgi_temp_path        /tmp/nginx/scgi_temp;
-
-              server {
-                  listen 19000;
-                  
-                  location / {
-                      proxy_pass http://127.0.0.1:18789;
-                      
-                      # Force mock origin configurations to trick OpenClaw's validation
-                      proxy_set_header Origin "http://127.0.0.1:18789";
-                      proxy_set_header Host "127.0.0.1:18789";
-                      
-                      # Support persistent WebSocket handshakes cleanly
-                      proxy_http_version 1.1;
-                      proxy_set_header Upgrade $http_upgrade;
-                      proxy_set_header Connection "Upgrade";
-                      
-                      proxy_read_timeout 86400s;
-                      proxy_send_timeout 86400s;
-                  }
-              }
-          }
-          EOF
-          
-          # Run NGINX targeting our explicitly crafted configuration file
-          sudo /usr/sbin/nginx -c /tmp/nginx/openclaw-proxy.conf
-          
-          # Quick verification check
+          python3 scripts/cors_proxy.py &
           sleep 2
-          ps aux | grep nginx
 
-      # 6. Launch OpenClaw Gateway
+      # 6. Launch OpenClaw core control instance
       - name: Launch OpenClaw Gateway via Ollama
         run: |
           nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
@@ -130,7 +80,7 @@ jobs:
             sleep 3
           done
 
-      # 7. Bind Cloudflare Tunnel proxy targeting the manual NGINX port
+      # 7. Fire up Cloudflare Tunnel pointing straight at the Python proxy interface
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
@@ -148,7 +98,7 @@ jobs:
           done
           sleep 5
 
-      # 8. Output link data and maintain connection live state indefinitely
+      # 8. Output stable entry endpoint URL and maintain active runtime thread state
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
