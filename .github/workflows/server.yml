@@ -19,11 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Clean, tool-based Ollama installation
+      # 1. Faster, tool-based Ollama engine configuration
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      # 2. Cache weights
+      # 2. Caches the heavy model weights directory to drop execution times drastically
       - name: Cache Ollama Model Weights
         uses: actions/cache@v4
         with:
@@ -32,13 +32,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-ollama-
 
-      - name: Install Node & System Dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl git nodejs npm jq
           sudo npm install -g openclaw holesail
           
-          # Fetch cloudflared binary directly
+          # Download cloudflared binary directly
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
@@ -63,70 +63,38 @@ jobs:
           EOF
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      - name: Configure and Launch OpenClaw Natively
+      # 3. Utilizing your working 'ollama launch openclaw' approach
+      - name: Launch OpenClaw Gateway via Ollama wrapper
         run: |
-          mkdir -p ~/.openclaw/workspace/data
-          mkdir -p ~/.openclaw/workspace/agents
-          
-          cat << EOF > ~/.openclaw/openclaw.json
-          {
-            "gateway": {
-              "port": 18789,
-              "mode": "local",
-              "bind": "auto",
-              "auth": {
-                "mode": "none"
-              }
-            },
-            "agents": {
-              "defaults": {
-                "model": "ollama/granite4:tiny-h"
-              }
-            },
-            "models": {
-              "providers": {
-                "ollama": {
-                  "baseUrl": "http://127.0.0.1:11434",
-                  "models": [
-                    { 
-                      "id": "granite4:tiny-h", 
-                      "name": "granite4:tiny-h",
-                      "api": "ollama" 
-                    }
-                  ]
-                }
-              }
-            }
-          }
-          EOF
-
           export OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true"
-          nohup openclaw gateway start > openclaw.log 2>&1 &
+          nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
           
-          echo "⏳ Running verification loop on auto-bind layout..."
-          for i in {1..25}; do
-            if nc -z 127.0.0.1 ${{ env.GATEWAY_PORT }}; then
-              echo "✅ OpenClaw configuration validated and gateway is listening!"
+          echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
+          for i in {1..20}; do
+            if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
+              echo "✅ OpenClaw Gateway successfully verified online!"
               break
             fi
-            echo "Waiting for process to come online... ($i/25)"
+            echo "Keep waiting... ($i/20)"
             sleep 3
           done
-          
-          echo "--- OpenClaw Runtime Boot Logs ---"
-          cat openclaw.log || true
 
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
-          echo "⏳ Waiting 5 seconds for tunnel connection handshake..."
+          echo "⏳ Catching TryCloudflare edge address registration..."
+          for i in {1..20}; do
+            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$URL" ]; then 
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              echo "Found address: $URL"
+              break
+            fi
+            sleep 3
+          done
           sleep 5
-          
-          URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-          echo "Found address: $URL"
-          echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
 
       - name: Print Orchestration Access Route & Keep Alive
         run: |
@@ -135,7 +103,7 @@ jobs:
           echo "================================================================="
           echo ""
           echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
-          cat openclaw.log || true
+          head -n 40 openclaw.log || true
           echo ""
           echo "--- LOG DIAGNOSTICS (Cloudflared Output Preview) ---"
           head -n 20 tunnel.log || true
