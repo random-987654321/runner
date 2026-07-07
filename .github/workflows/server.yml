@@ -56,7 +56,7 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
 
-      # 6. Configure Nginx with sudo privilege safe-redirection via 'tee'
+      # 6. Configure Nginx with Buffering Disabled for Streaming Data
       - name: Configure Nginx Reverse Proxy
         run: |
           cat << 'EOF' | sudo tee /etc/nginx/sites-available/default > /dev/null
@@ -78,7 +78,12 @@ jobs:
                   proxy_set_header Upgrade $http_upgrade;
                   proxy_set_header Connection "upgrade";
                   
-                  # Keep connections active
+                  # CRITICAL: Disable response buffering for Server-Sent Events (SSE) & Streams
+                  proxy_buffering off;
+                  proxy_cache off;
+                  chunked_transfer_encoding off;
+                  
+                  # Keep connections active without aggressive timeouts
                   proxy_read_timeout 86400s;
                   proxy_send_timeout 86400s;
               }
