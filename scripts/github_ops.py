@@ -76,4 +76,19 @@ def wait_for_completion(workflow_id, timeout=600, interval=10):
     raise TimeoutError(f"Workflow {workflow_id} did not complete within {timeout}s")
 
 if __name__ == '__main__':
-    print("✅ GitHub ops module loaded")
+    # CLI mode for testing
+    import sys
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == '--create':
+            print(create_workflow_file(sys.argv[2], sys.argv[3]))
+        elif cmd == '--delete':
+            delete_workflow_file(sys.argv[2], sys.argv[3])
+        elif cmd == '--trigger':
+            trigger_workflow(sys.argv[2])
+        elif cmd == '--wait':
+            print(wait_for_completion(sys.argv[2]))
+        elif cmd == '--download':
+            print(json.dumps(download_artifact(sys.argv[2])))
+        elif cmd == '--count-running':
+            print(get_running_workers(sys.argv[2]))
