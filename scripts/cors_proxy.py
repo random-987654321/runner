@@ -6,25 +6,20 @@ import urllib.error
 import asyncio
 import websockets
 
-# Configuration mapped precisely to the new Hermes framework defaults
-TARGET_HTTP = "http://127.0.0.1:11434"
-TARGET_WS = "ws://127.0.0.1:11434"
+TARGET_HTTP = "http://127.0.0.1:3000"
+TARGET_WS = "ws://127.0.0.1:3000"
 PROXY_PORT_HTTP = 19000
 PROXY_PORT_WS = 19001
 
-# --- LAYER 1: HTTP REST PROXY & CORS STRIPPER ---
 class CORSProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # Keeps the workflow run logging clear
+        pass 
 
     def handle_proxy(self):
         url = f"{TARGET_HTTP}{self.path}"
-        # Strip hostile origin and host footprints passed down by external browser networks
         req_headers = {k: v for k, v in self.headers.items() if k.lower() not in ['host', 'origin']}
-        
-        # Rewrite the mapping to mimic safe local address rules natively
         req_headers['Origin'] = TARGET_HTTP
-        req_headers['Host'] = "127.0.0.1:11434"
+        req_headers['Host'] = "127.0.0.1:3000"
         
         content_length = int(self.headers.get('Content-Length', 0))
         req_data = self.rfile.read(content_length) if content_length > 0 else None
@@ -54,7 +49,6 @@ def run_http_proxy():
     server = http.server.HTTPServer(('127.0.0.1', PROXY_PORT_HTTP), CORSProxyHandler)
     server.serve_forever()
 
-# --- LAYER 2: ASYNC WEBSOCKET INTERCEPTOR ---
 async def ws_forward(src, dst):
     try:
         async for message in src:
@@ -63,7 +57,7 @@ async def ws_forward(src, dst):
         pass
 
 async def ws_handler(client_ws):
-    headers = {"Origin": TARGET_HTTP, "Host": "127.0.0.1:11434"}
+    headers = {"Origin": TARGET_HTTP, "Host": "127.0.0.1:3000"}
     try:
         async with websockets.connect(TARGET_WS + client_ws.path, extra_headers=headers) as target_ws:
             await asyncio.gather(
@@ -78,7 +72,5 @@ async def main_ws():
         await asyncio.Future()
 
 if __name__ == '__main__':
-    # Initialize standard REST thread mapping
     threading.Thread(target=run_http_proxy, daemon=True).start()
-    # Execute structural socket listener loops
     asyncio.run(main_ws())
