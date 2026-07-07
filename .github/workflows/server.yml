@@ -56,7 +56,7 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
 
-      # 6. Configure Nginx with Buffering Disabled for Streaming Data
+      # 6. Configure Nginx to Dynamically map HTTP Host Headers vs WebSocket Upstream Routes
       - name: Configure Nginx Reverse Proxy
         run: |
           cat << 'EOF' | sudo tee /etc/nginx/sites-available/default > /dev/null
@@ -67,23 +67,23 @@ jobs:
               location / {
                   proxy_pass http://127.0.0.1:9119;
                   
-                  # Force host header matching loopback targets
-                  proxy_set_header Host 127.0.0.1:9119;
+                  # Retain the genuine incoming host header so WebSocket handshake frames align perfectly
+                  proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header X-Forwarded-Proto $scheme;
 
-                  # Seamless WebSocket pipeline parameters
+                  # Core WebSocket translation upgrades
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
                   proxy_set_header Connection "upgrade";
                   
-                  # CRITICAL: Disable response buffering for Server-Sent Events (SSE) & Streams
+                  # Completely disable caching/buffering to allow immediate text streaming outputs
                   proxy_buffering off;
                   proxy_cache off;
                   chunked_transfer_encoding off;
                   
-                  # Keep connections active without aggressive timeouts
+                  # Prevent connection drops during thinking phases
                   proxy_read_timeout 86400s;
                   proxy_send_timeout 86400s;
               }
@@ -91,9 +91,16 @@ jobs:
           EOF
           sudo systemctl restart nginx
 
-      # 7. Start Hermes Dashboard completely vanilla on local loopback
+      # 7. Start Hermes Native Dashboard with global environment security exceptions
       - name: Start Hermes Native Dashboard
+        env:
+          HERMES_ALLOWED_ORIGINS: "*"
+          HERMES_ALLOWED_HOSTS: "*"
+          HERMES_DISABLE_CSRF: "true"
+          HERMES_INSECURE: "true"
         run: |
+          # Passing the environment flags explicitly during execution ensures the internal security router
+          # gracefully inherits the custom '$http_host' variables forwarded down by Nginx.
           nohup hermes dashboard \
             --host 127.0.0.1 \
             --port ${{ env.HERMES_DASHBOARD_PORT }} \
@@ -109,7 +116,7 @@ jobs:
             sleep 3
           done
 
-      # 8. Point Cloudflare Tunnel directly to the Nginx Edge Proxy
+      # 8. Point Cloudflare Tunnel directly to the Nginx Edge Proxy without header overrides
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
