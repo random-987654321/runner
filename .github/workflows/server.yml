@@ -17,29 +17,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      # ---------- Setup Ollama via official action ----------
+      - name: Setup Ollama
+        uses: mintlify/setup-ollama@v1
+        with:
+          version: latest
+
+      # ---------- Install Hermes Agent ----------
+      - name: Install Hermes Agent
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl jq
-          curl -fsSL https://ollama.com/install.sh | sh
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
+
+      # ---------- Install Cloudflared ----------
+      - name: Install Cloudflared
+        run: |
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Start Ollama & pull model
+      # ---------- Pull the model ----------
+      - name: Pull Ollama model
         run: |
-          pkill -f ollama || true
-          sleep 2
-          ollama serve &
-          sleep 10
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Configure Hermes with authentication
+      # ---------- Configure Hermes authentication ----------
+      - name: Configure Hermes with auth
         run: |
           mkdir -p ~/.hermes
-          # Generate a random password and secret
+          # Generate random credentials
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
           cat > ~/.hermes/.env << EOF
@@ -49,27 +55,27 @@ jobs:
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
+      # ---------- Start Hermes Dashboard ----------
       - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
-          # Load auth variables from .env
           set -a; source ~/.hermes/.env; set +a
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
-          sleep 10
-          for i in {1..30}; do
+          sleep 15
+          for i in {1..20}; do
             if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
               echo "✅ Dashboard ready"
               break
             fi
-            echo "⏳ Waiting for dashboard... ($i/30)"
+            echo "⏳ Waiting for dashboard... ($i/20)"
             sleep 2
           done
 
+      # ---------- Start Cloudflare Tunnel ----------
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
           nohup ./cloudflared tunnel --url http://localhost:${{ env.HERMES_PORT }} > tunnel.log 2>&1 &
-          TUNNEL_URL=""
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -84,6 +90,7 @@ jobs:
           fi
           echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
 
+      # ---------- Print access ----------
       - name: Print access
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
