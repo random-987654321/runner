@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) with Encrypted socat Terminal
+name: Queen (Hermes + Ollama) with Fast Raw socat Terminal
 
 on:
   workflow_dispatch:
@@ -36,21 +36,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y socat openssl nodejs npm
+          sudo apt-get install -y socat nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Generate SSL certificate (valid for 10 years) ----------
-      - name: Generate SSL certificate
-        run: |
-          openssl genrsa -out /tmp/server.key 2048
-          openssl req -new -key /tmp/server.key -x509 -days 3650 -out /tmp/server.crt -subj "/CN=localhost"
-          cat /tmp/server.key /tmp/server.crt > /tmp/server.pem
-          chmod 600 /tmp/server.key /tmp/server.pem
-
-      # ---------- Start encrypted socat terminal server ----------
+      # ---------- Start raw socat terminal server ----------
       - name: Start socat server
         run: |
-          nohup socat OPENSSL-LISTEN:${{ env.SOCAT_PORT }},fork,reuseaddr,cert=/tmp/server.pem,verify=0 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
+          # Raw TCP – encryption handled by Holesail
+          nohup socat TCP-LISTEN:${{ env.SOCAT_PORT }},fork,reuseaddr EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
           sleep 3
           netstat -tulpn | grep :${{ env.SOCAT_PORT }} || { echo "❌ socat not listening"; exit 1; }
 
@@ -95,7 +88,7 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To get a FAST encrypted terminal on the runner:"
+          echo "🌐 To get the FASTEST encrypted terminal on the runner:"
           echo ""
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
@@ -109,10 +102,10 @@ jobs:
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SOCAT_PORT }}"
           echo ""
           echo "   4. In another terminal, connect with socat:"
-          echo "      socat PTY,raw,echo=0,stderr OPENSSL-CONNECT:localhost:${{ env.SOCAT_PORT }},verify=0"
+          echo "      socat PTY,raw,echo=0,stderr TCP:localhost:${{ env.SOCAT_PORT }}"
           echo ""
-          echo "   ✅ That's it – NO certificate file needed on your side."
-          echo "   You now have a FAST terminal (encrypted, but faster than SSH)!"
+          echo "   ✅ That's it! Holesail encrypts the tunnel end‑to‑end."
+          echo "   This is FASTER than SSH and FASTER than OpenSSL."
           echo ""
           echo "💡 To run Hermes: hermes chat --model ${{ env.OLLAMA_MODEL }}"
           echo "================================================================="
