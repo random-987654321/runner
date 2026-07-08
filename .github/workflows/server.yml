@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl
+          sudo apt-get install -y curl jq
           curl -fsSL https://ollama.com/install.sh | sh
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
@@ -36,30 +36,32 @@ jobs:
           sleep 10
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Configure Hermes
+      - name: Configure Hermes with authentication
         run: |
           mkdir -p ~/.hermes
-          cat > ~/.hermes/config.yaml << EOF
-          model:
-            provider: ollama
-            model: ${{ env.OLLAMA_MODEL }}
-            baseUrl: http://localhost:11434
-          gateway:
-            port: ${{ env.HERMES_PORT }}
-            host: 0.0.0.0
+          # Generate a random password and secret
+          PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+          SECRET=$(openssl rand -base64 32)
+          cat > ~/.hermes/.env << EOF
+          HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
+          HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$PASSWORD
+          HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
           EOF
+          echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
       - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
-          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} &
+          # Load auth variables from .env
+          set -a; source ~/.hermes/.env; set +a
+          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
           sleep 10
-          for i in {1..20}; do
-            if curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
+          for i in {1..30}; do
+            if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
               echo "✅ Dashboard ready"
               break
             fi
-            echo "⏳ Waiting for dashboard... ($i/20)"
+            echo "⏳ Waiting for dashboard... ($i/30)"
             sleep 2
           done
 
@@ -87,9 +89,12 @@ jobs:
           TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
         run: |
           echo "================================================================="
-          echo "🌐 Hermes Agent Web Dashboard is available at:"
-          echo "   $TUNNEL_URL"
+          echo "🌐 Hermes Agent Web Dashboard: $TUNNEL_URL"
           echo ""
-          echo "💡 Open this URL in your browser and start chatting!"
+          echo "🔐 Login credentials:"
+          echo "   Username: admin"
+          echo "   Password: ${{ env.ADMIN_PASSWORD }}"
+          echo ""
+          echo "💡 Open the URL and log in with the credentials above."
           echo "================================================================="
           sleep infinity
