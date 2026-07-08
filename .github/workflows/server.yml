@@ -55,28 +55,58 @@ jobs:
           sudo mkdir -p /run/sshd
           sudo chmod 755 /run/sshd
 
-      # ---------- Configure SSH on port 2222 ----------
+      # ---------- Configure SSH on port 2222 (fixed) ----------
       - name: Configure SSH
         run: |
-          sudo sed -i 's/^#Port.*/Port ${{ env.SSH_PORT }}/' /etc/ssh/sshd_config
-          sudo sed -i 's/^Port.*/Port ${{ env.SSH_PORT }}/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          # Backup original config
+          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+          
+          # Force port change using multiple methods
+          sudo sed -i '/^Port/d' /etc/ssh/sshd_config
+          echo "Port ${{ env.SSH_PORT }}" | sudo tee -a /etc/ssh/sshd_config
+          
+          # Enable password authentication
+          sudo sed -i '/^PasswordAuthentication/d' /etc/ssh/sshd_config
+          echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config
+          
+          # Disable root login
+          sudo sed -i '/^PermitRootLogin/d' /etc/ssh/sshd_config
+          echo "PermitRootLogin no" | sudo tee -a /etc/ssh/sshd_config
+          
           # Validate configuration
           sudo sshd -t || { echo "❌ Invalid SSH config"; exit 1; }
+          
+          # Show the port configuration
+          grep -E "^(Port|PasswordAuthentication)" /etc/ssh/sshd_config
 
       # ---------- Start SSH server ----------
       - name: Start SSH
         run: |
+          # Kill any process on port 2222
           sudo fuser -k ${{ env.SSH_PORT }}/tcp || true
+          
+          # Restart SSH with new config
+          sudo systemctl daemon-reload
           sudo systemctl restart ssh
           sleep 3
+          
+          # Show status
           sudo systemctl status ssh --no-pager
 
-      # ---------- Verify SSH is listening ----------
+      # ---------- Verify SSH is listening on port 2222 ----------
       - name: Verify SSH
         run: |
-          sudo netstat -tulpn | grep :${{ env.SSH_PORT }} || { echo "❌ SSH not listening on port ${{ env.SSH_PORT }}"; exit 1; }
+          if sudo netstat -tulpn | grep :${{ env.SSH_PORT }}; then
+            echo "✅ SSH is listening on port ${{ env.SSH_PORT }}"
+          else
+            echo "❌ SSH is NOT listening on port ${{ env.SSH_PORT }}"
+            echo "Current listening ports:"
+            sudo netstat -tulpn | grep ssh
+            # Fallback: try to start sshd manually
+            sudo /usr/sbin/sshd -p ${{ env.SSH_PORT }} -D &
+            sleep 3
+            sudo netstat -tulpn | grep :${{ env.SSH_PORT }} || { echo "❌ SSH failed to start on port ${{ env.SSH_PORT }}"; exit 1; }
+          fi
 
       # ---------- Start Ollama service ----------
       - name: Start Ollama
