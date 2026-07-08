@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) with Holesail Shell
+name: Queen (Hermes + Ollama) with SSH via Holesail
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 env:
   OLLAMA_MODEL: granite4:tiny-h
-  SHELL_PORT: 2222
+  SSH_PORT: 22
 
 jobs:
   queen:
@@ -31,30 +31,32 @@ jobs:
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install socat & Holesail ----------
-      - name: Install socat and Holesail
+      # ---------- Install Holesail and SSH server ----------
+      - name: Install Holesail and OpenSSH
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y socat nodejs npm
+          sudo apt-get install -y openssh-server nodejs npm
           sudo npm install -g holesail
+          # Create a password for the runner user (so we can SSH with password)
+          sudo passwd runner <<< "runner123\nrunner123"
+
+      # ---------- Start SSH server ----------
+      - name: Start SSH server
+        run: |
+          sudo service ssh start
+          # Verify SSH is running
+          sudo netstat -tulpn | grep :22 || echo "SSH not running"
 
       # ---------- Start Ollama service ----------
       - name: Start Ollama
         run: ollama serve &
 
-      # ---------- Start shell server via socat ----------
-      - name: Start shell server
-        run: |
-          # socat listens on port 2222 and spawns a bash shell for each connection
-          socat TCP-LISTEN:${{ env.SHELL_PORT }},fork EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
-          sleep 2
-
-      # ---------- Expose shell port via Holesail ----------
-      - name: Expose shell with Holesail
+      # ---------- Expose SSH port via Holesail ----------
+      - name: Expose SSH with Holesail
         id: holesail
         run: |
-          # Start Holesail server exposing port 2222
-          holesail --live ${{ env.SHELL_PORT }} --public > holesail.log 2>&1 &
+          # Expose port 22 with Holesail – bind to 0.0.0.0 to allow connections
+          holesail --live ${{ env.SSH_PORT }} --public > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
           if [ -z "$CONNECTION_KEY" ]; then
@@ -73,20 +75,23 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To get a shell on the runner:"
+          echo "🌐 To SSH into the runner:"
           echo ""
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Connect to the runner's shell port:"
-          echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SHELL_PORT }}"
+          echo "   2. Connect to the runner's SSH port:"
+          echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SSH_PORT }}"
           echo ""
-          echo "   3. In another terminal, connect to the local forwarded port:"
-          echo "      nc localhost ${{ env.SHELL_PORT }}"
+          echo "   3. In another terminal, SSH into the forwarded port:"
+          echo "      ssh runner@localhost -p ${{ env.SSH_PORT }}"
           echo ""
-          echo "   4. You now have a bash shell on the runner!"
+          echo "   Password is: runner123"
+          echo ""
+          echo "   4. You now have a full SSH session on the runner!"
           echo "      Run 'hermes chat --model ${{ env.OLLAMA_MODEL }}' to start chatting."
+          echo "      Or start the dashboard: hermes dashboard --host 0.0.0.0 --port 18789"
           echo ""
-          echo "💡 The connection is direct P2P – no lag!"
+          echo "💡 The connection is direct P2P – no lag, no relay servers!"
           echo "================================================================="
           sleep infinity
