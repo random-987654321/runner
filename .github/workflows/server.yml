@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) with Fully Interactive Shell (Socat)
+name: Queen (Hermes + Ollama) with Full Interactive Shell
 
 on:
   workflow_dispatch:
@@ -17,39 +17,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Setup Ollama ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install socat and Holesail ----------
       - name: Install socat and Holesail
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y socat nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Start Ollama service ----------
       - name: Start Ollama
         run: ollama serve &
 
-      # ---------- Start fully interactive shell server ----------
-      - name: Start interactive shell server
+      - name: Start fully interactive shell server
         run: |
-          # This provides a full TTY – supports Ctrl+C, Ctrl+Z, tab completion, history, etc.
-          socat TCP-LISTEN:${{ env.SHELL_PORT }},fork EXEC:'bash -li',pty,stderr,setsid,sigint,sane &
+          socat TCP-LISTEN:${{ env.SHELL_PORT }},fork EXEC:'env TERM=xterm-256color bash -li',pty,stderr,setsid,sigint,sane &
           sleep 2
 
-      # ---------- Expose shell port via Holesail ----------
       - name: Expose shell with Holesail
         id: holesail
         run: |
@@ -63,7 +56,6 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-      # ---------- Print access instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -72,30 +64,25 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To get a FULLY INTERACTIVE bash shell (with everything):"
+          echo "🌐 To get a FULL interactive bash shell:"
           echo ""
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Install socat on your local machine (optional but recommended):"
-          echo "      # Ubuntu/Debian: sudo apt-get install socat"
-          echo "      # macOS: brew install socat"
-          echo ""
-          echo "   3. Start the Holesail client (keep this terminal open):"
+          echo "   2. Start the Holesail client (keep this terminal open):"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   4. In a NEW terminal, connect with one of these:"
+          echo "   3. In a NEW terminal, connect with:"
+          echo "      # Best (PTY, full resize):"
+          echo "      socat PTY,raw,echo=0 TCP:localhost:${{ env.SHELL_PORT }}"
           echo ""
-          echo "      # Option A – using socat (best experience):"
-          echo "      socat - TCP:localhost:${{ env.SHELL_PORT }}"
+          echo "      # If that hangs, try the file:`tty` version:"
+          echo "      socat file:\`tty\`,raw,echo=0 TCP:localhost:${{ env.SHELL_PORT }}"
           echo ""
-          echo "      # Option B – using netcat (works too):"
+          echo "      # Simple (no resize, but works):"
           echo "      nc localhost ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   That's it! You now have a full, interactive bash shell."
-          echo "   Try: Ctrl+C, Ctrl+Z, tab completion, arrow keys, etc."
-          echo ""
-          echo "   5. Run Hermes:"
-          echo "      hermes chat --model ${{ env.OLLAMA_MODEL }}"
+          echo "   4. You now have a fully interactive shell!"
+          echo "      Run 'hermes chat --model ${{ env.OLLAMA_MODEL }}' to start chatting."
           echo "================================================================="
           sleep infinity
