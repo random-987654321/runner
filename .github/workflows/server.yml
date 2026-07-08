@@ -17,21 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Install dependencies ----------
-      - name: Install Ollama & Hermes Agent
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl
           curl -fsSL https://ollama.com/install.sh | sh
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          # Add Hermes to PATH
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
-          # Install Cloudflared
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ---------- Start Ollama ----------
       - name: Start Ollama & pull model
         run: |
           pkill -f ollama || true
@@ -40,7 +36,6 @@ jobs:
           sleep 10
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # ---------- Configure Hermes Agent ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
@@ -52,28 +47,22 @@ jobs:
           gateway:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
-            controlUi:
-              enabled: true
-              allowedOrigins:
-                - "*"
           EOF
 
-      # ---------- Start Hermes Gateway ----------
-      - name: Start Hermes Gateway
+      - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
-          hermes gateway start --host 0.0.0.0 --port ${{ env.HERMES_PORT }} &
+          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} &
           sleep 10
-          # Verify it's running
           for i in {1..20}; do
             if curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
-              echo "✅ Gateway ready"
+              echo "✅ Dashboard ready"
               break
             fi
+            echo "⏳ Waiting for dashboard... ($i/20)"
             sleep 2
           done
 
-      # ---------- Start Cloudflare Tunnel ----------
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
@@ -93,16 +82,14 @@ jobs:
           fi
           echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
 
-      # ---------- Print access ----------
       - name: Print access
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
         run: |
           echo "================================================================="
-          echo "🌐 Hermes Agent Web UI is available at:"
+          echo "🌐 Hermes Agent Web Dashboard is available at:"
           echo "   $TUNNEL_URL"
           echo ""
           echo "💡 Open this URL in your browser and start chatting!"
           echo "================================================================="
-          # Keep runner alive
           sleep infinity
