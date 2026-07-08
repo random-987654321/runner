@@ -10,7 +10,7 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  DOCKER_PORT: 9119
+  HERMES_DASHBOARD_PORT: 9119
 
 jobs:
   queen:
@@ -19,89 +19,93 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Install required system components natively
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl netcat-openbsd
-          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
+      # 1. Prepare Python environment natively on the runner host
+      - name: Setup Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      # 2. Setup Ollama Engine natively for optimal speed
+      # 2. Setup Ollama Engine natively on the runner host
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      # 3. Pull base model weights and scale context window to 64K
+      # 3. Pull weights and automatically scale context window to 64K
       - name: Build 64K Context Agent Model Variant
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
+          
           echo "FROM ${{ env.OLLAMA_MODEL }}" > Modelfile
           echo "PARAMETER num_ctx 64000" >> Modelfile
           ollama create granite4-64k -f Modelfile
-
-      # 4. Spin up Cloudflare Tunnel natively pointing to the incoming Docker port
-      - name: Start Cloudflare Tunnel Connection
-        run: |
-          ./cloudflared tunnel --url http://127.0.0.1:${{ env.DOCKER_PORT }} > tunnel.log 2>&1 &
           
-          echo "⏳ Catching TryCloudflare edge address registration..."
+          echo "✅ Custom 64K Context Model Variant successfully registered:"
+          ollama list
+
+      # 4. Install the official Nous Research Hermes Agent stack
+      - name: Install Hermes Agent Locally
+        run: |
+          python -m pip install --upgrade pip
+          pip install "hermes-agent[web,pty]"
+          
+          # Initialize standard workspace config path structures
+          mkdir -p ~/.hermes
+          cat << 'EOF' > ~/.hermes/config.yaml
+          provider: "ollama"
+          model: "granite4-64k"
+          providers:
+            ollama:
+              base_url: "http://127.0.0.1:11434"
+          EOF
+
+      # 5. Combined Thread Execution: Launches the Tunnel, extracts the host, and starts the Dashboard
+      - name: Launch Orchestrated Control Plane
+        run: |
+          # A. Download cloudflared natively
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+          
+          # B. Kick off the cloudflared daemon pointing to our loopback destination inside this thread
+          ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > cloudflared.log 2>&1 &
+          
+          # C. Block until the edge route url registers successfully
+          echo "⏳ Catching dynamic public edge route URL..."
+          TUNNEL_HOST=""
+          TUNNEL_URL=""
+          
           for i in {1..20}; do
-            if [ -f tunnel.log ]; then
-              URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -f cloudflared.log ]; then
+              URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1)
               if [ -n "$URL" ]; then 
                 CLEAN_HOST=$(echo "$URL" | sed 's|https://||')
-                echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-                echo "TUNNEL_HOST=$CLEAN_HOST" >> $GITHUB_ENV
+                TUNNEL_URL="$URL"
+                TUNNEL_HOST="$CLEAN_HOST"
                 echo "✅ URL Captured: $URL"
                 break
               fi
             fi
             sleep 3
           done
-
-      # 5. Build config space and launch the unified container infrastructure
-      - name: Launch Containerized Hermes Dashboard
-        run: |
-          mkdir -p ~/.hermes
           
-          # Configure internal provider map pointing to host machine's Ollama runtime
-          cat << 'EOF' > ~/.hermes/config.yaml
-          provider: "ollama"
-          model: "granite4-64k"
-          providers:
-            ollama:
-              base_url: "http://host.docker.internal:11434"
-          EOF
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to secure an ephemeral Cloudflare Tunnel destination route."
+            exit 1
+          fi
 
-          cat << 'EOF' > docker-compose.yml
-          version: '3.8'
-          services:
-            hermes:
-              image: python:3.11-slim
-              working_dir: /app
-              # Runs the true UI dashboard web app on loopback inside the container to clear auth validations
-              command: >
-                sh -c "pip install -q --upgrade pip && 
-                       pip install -q 'hermes-agent[web,pty]' && 
-                       hermes dashboard --host 127.0.0.1 --port 8000 --allowed-hosts '${{ env.TUNNEL_HOST }}' --no-open --skip-build"
-              network_mode: "host"
-              environment:
-                HERMES_ALLOWED_ORIGINS: "*"
-                HERMES_DISABLE_CSRF: "true"
-                HERMES_INSECURE: "true"
-              volumes:
-                - ~/.hermes:/root/.hermes
-              extra_hosts:
-                - "host.docker.internal:host-gateway"
-          EOF
-
-          docker compose up -d
-
-      # 6. Verify end-to-end container delivery and hold session alive
-      - name: Print Orchestration Access Route & Keep Alive
-        run: |
+          # D. Print access routing blocks clearly to the runtime logs
           echo "================================================================="
           echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
-          echo "👉 ${{ env.TUNNEL_URL }}"
+          echo "👉 $TUNNEL_URL"
           echo "================================================================="
-          sleep infinity
+          
+          # E. Inject bypass rules to ensure WebSocket connection durability
+          export HERMES_ALLOWED_ORIGINS="*"
+          export HERMES_DISABLE_CSRF="true"
+          export HERMES_INSECURE="true"
+          
+          # F. Execute the dashboard in the foreground on the main runner thread
+          hermes dashboard \
+            --host 127.0.0.1 \
+            --port ${{ env.HERMES_DASHBOARD_PORT }} \
+            --allowed-hosts "$TUNNEL_HOST" \
+            --no-open \
+            --skip-build
