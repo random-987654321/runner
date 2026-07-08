@@ -9,6 +9,7 @@ permissions:
 env:
   OLLAMA_MODEL: granite4:tiny-h
   SSH_PORT: 2222
+  HERMES_PORT: 18789
 
 jobs:
   queen:
@@ -31,40 +32,66 @@ jobs:
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install dependencies ----------
-      - name: Install Holesail and SSH server
+      # ---------- Install Holesail and SSH server ----------
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y openssh-server nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Set SSH password (non-interactive) ----------
+      # ---------- Set SSH password ----------
       - name: Set SSH password
         run: |
           echo "runner:runner123" | sudo chpasswd
 
-      # ---------- Configure SSH to listen on port 2222 ----------
+      # ---------- Generate SSH host keys (critical!) ----------
+      - name: Generate SSH host keys
+        run: |
+          sudo ssh-keygen -A
+
+      # ---------- Configure SSH on port 2222 ----------
       - name: Configure SSH
         run: |
-          # Change SSH port to 2222
-          sudo sed -i 's/^#Port 22/Port ${{ env.SSH_PORT }}/' /etc/ssh/sshd_config
-          sudo sed -i 's/^Port 22/Port ${{ env.SSH_PORT }}/' /etc/ssh/sshd_config
-          # Enable password auth
+          sudo sed -i 's/^#Port.*/Port ${{ env.SSH_PORT }}/' /etc/ssh/sshd_config
+          sudo sed -i 's/^Port.*/Port ${{ env.SSH_PORT }}/' /etc/ssh/sshd_config
           sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          # Validate configuration before starting
+          sudo sshd -t || { echo "❌ Invalid SSH config"; exit 1; }
 
       # ---------- Start SSH server ----------
       - name: Start SSH
         run: |
-          sudo service ssh restart
-          sudo systemctl status ssh || echo "SSH service status check"
-          sudo netstat -tulpn | grep :${{ env.SSH_PORT }} || echo "SSH not running on port ${{ env.SSH_PORT }}"
+          # Ensure no process is using the port
+          sudo fuser -k ${{ env.SSH_PORT }}/tcp || true
+          sudo systemctl restart ssh
+          sleep 3
+          sudo systemctl status ssh --no-pager
+
+      # ---------- Verify SSH is listening ----------
+      - name: Verify SSH
+        run: |
+          sudo netstat -tulpn | grep :${{ env.SSH_PORT }} || { echo "❌ SSH not listening on port ${{ env.SSH_PORT }}"; exit 1; }
 
       # ---------- Start Ollama service ----------
       - name: Start Ollama
         run: ollama serve &
 
-      # ---------- Expose SSH port via Holesail ----------
+      # ---------- (Optional) Start Hermes Dashboard ----------
+      - name: Start Hermes Dashboard
+        run: |
+          export PATH="$HOME/.hermes/bin:$PATH"
+          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
+          sleep 10
+          for i in {1..10}; do
+            if curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
+              echo "✅ Hermes Dashboard ready"
+              break
+            fi
+            sleep 2
+          done
+
+      # ---------- Expose SSH via Holesail ----------
       - name: Expose SSH with Holesail
         id: holesail
         run: |
@@ -78,7 +105,7 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-      # ---------- Print instructions ----------
+      # ---------- Print access instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -92,7 +119,7 @@ jobs:
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Connect to the runner's SSH port (forward to local port ${{ env.SSH_PORT }}):"
+          echo "   2. Connect to the runner's SSH port:"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SSH_PORT }}"
           echo ""
           echo "   3. In another terminal, SSH into the forwarded port:"
