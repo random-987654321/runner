@@ -19,11 +19,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Spin up Ollama Engine Natively on the runner for maximum hardware acceleration
+      # 1. Setup Python natively on the runner host
+      - name: Setup Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 2. Spin up Ollama Engine Natively on the runner for maximum hardware acceleration
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      # 2. Pull base model weights and automatically extend context to 64K
+      # 3. Pull base weights and automatically extend context to 64K
       - name: Build 64K Context Agent Model Variant
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
@@ -36,68 +42,61 @@ jobs:
           echo "✅ Custom 64K Context Model Variant successfully registered:"
           ollama list
 
-      # 3. Provision isolated bridge infrastructure
-      - name: Create Isolated Container Network
+      # 4. Install Hermes Agent framework natively onto the runner host
+      - name: Install Hermes Agent Locally
         run: |
-          docker network create hermes-net
+          python -m pip install --upgrade pip
+          pip install "hermes-agent[web,pty]"
+          
+          # Build standard workspace configuration structures
+          mkdir -p ~/.hermes
+          echo 'provider: "ollama"' > ~/.hermes/config.yaml
+          echo 'model: "granite4-64k"' >> ~/.hermes/config.yaml
+          echo 'providers:' >> ~/.hermes/config.yaml
+          echo '  ollama:' >> ~/.hermes/config.yaml
+          echo '    base_url: "http://127.0.0.1:11434"' >> ~/.hermes/config.yaml
 
-      # 4. Spin up Hermes Agent Dashboard inside a network-isolated container environment
-      - name: Launch Hermes Container
+      # 5. Spin up Cloudflare Tunnel client natively by downloading the binary directly
+      - name: Start Cloudflare Tunnel Natively
         run: |
-          docker run -d \
-            --name hermes-dashboard \
-            --network hermes-net \
-            -p ${{ env.HERMES_DASHBOARD_PORT }}:${{ env.HERMES_DASHBOARD_PORT }} \
-            -e HERMES_ALLOWED_ORIGINS="*" \
-            -e HERMES_ALLOWED_HOSTS="*" \
-            -e HERMES_DISABLE_CSRF="true" \
-            -e HERMES_INSECURE="true" \
-            -v ~/.hermes:/root/.hermes \
-            python:3.11-slim /bin/bash -c "
-              pip install --upgrade pip && \
-              pip install 'hermes-agent[web,pty]' && \
-              mkdir -p /root/.hermes && \
-              echo 'provider: \"ollama\"' > /root/.hermes/config.yaml && \
-              echo 'model: \"granite4-64k\"' >> /root/.hermes/config.yaml && \
-              echo 'providers:' >> /root/.hermes/config.yaml && \
-              echo '  ollama:' >> /root/.hermes/config.yaml && \
-              echo '    base_url: \"http://host.docker.internal:11434\"' >> /root/.hermes/config.yaml && \
-              hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_DASHBOARD_PORT }} --no-open --skip-build
-            "
-
-          echo "⏳ Waiting for containerized application boot sequence..."
-          sleep 15
-          docker logs hermes-dashboard
-
-      # 5. Direct the Cloudflare Tunnel client with correct HTTP host header parameters
-      - name: Start Cloudflare Tunnel Container
-        run: |
-          docker run -d \
-            --name cloudflared-tunnel \
-            --network hermes-net \
-            cloudflare/cloudflared:latest \
-            tunnel \
-            --url http://hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header "hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}" \
-            --no-tls-verify
-
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+          
+          # Point the ad-hoc tunnel to the native runner port
+          ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > cloudflared.log 2>&1 &
+          
           echo "⏳ Catching dynamic public edge route URL..."
-          # Active loop to reliably catch the ephemeral address from container logs
+          # Active loop to reliably catch the ephemeral address from the log file
           for i in {1..20}; do
-            URL=$(docker logs cloudflared-tunnel 2>&1 | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1)
-            if [ -n "$URL" ]; then 
-              echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-              echo "✅ URL Captured: $URL"
-              break
+            if [ -f cloudflared.log ]; then
+              URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1)
+              if [ -n "$URL" ]; then 
+                echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
+                echo "✅ URL Captured: $URL"
+                break
+              fi
             fi
             sleep 3
           done
 
-      # 6. Output direct URL access routes and sustain active keep-alive loop
-      - name: Print Orchestration Access Route & Keep Alive
+      # 6. Boot the Hermes Dashboard natively with reverse proxy bypass filters enabled
+      - name: Launch Hermes Dashboard & Keep Alive
         run: |
           echo "================================================================="
           echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
           echo "👉 ${{ env.TUNNEL_URL }}"
           echo "================================================================="
-          sleep infinity
+          
+          # Inject generic global environment fallback rules
+          export HERMES_ALLOWED_ORIGINS="*"
+          export HERMES_ALLOWED_HOSTS="*"
+          export HERMES_DISABLE_CSRF="true"
+          export HERMES_INSECURE="true"
+          
+          # --insecure allows non-loopback bindings to prevent Host matching drops over Cloudflare
+          hermes dashboard \
+            --host 0.0.0.0 \
+            --port ${{ env.HERMES_DASHBOARD_PORT }} \
+            --insecure \
+            --no-open \
+            --skip-build
