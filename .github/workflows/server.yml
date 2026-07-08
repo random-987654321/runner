@@ -19,7 +19,7 @@ jobs:
 
       # ---------- Setup Ollama via official action ----------
       - name: Setup Ollama
-        uses: mintlify/setup-ollama@v1
+        uses: ai-action/setup-ollama@v2
         with:
           version: latest
 
