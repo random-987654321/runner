@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) with Fast Raw socat Terminal
+name: Queen (Hermes + Ollama) with Holesail Shell
 
 on:
   workflow_dispatch:
@@ -8,8 +8,7 @@ permissions:
 
 env:
   OLLAMA_MODEL: granite4:tiny-h
-  SOCAT_PORT: 2222
-  HERMES_PORT: 18789
+  SHELL_PORT: 2222
 
 jobs:
   queen:
@@ -32,44 +31,30 @@ jobs:
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install socat and Holesail ----------
-      - name: Install dependencies
+      # ---------- Install socat & Holesail ----------
+      - name: Install socat and Holesail
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y socat nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Start raw socat terminal server ----------
-      - name: Start socat server
-        run: |
-          # Raw TCP – encryption handled by Holesail
-          nohup socat TCP-LISTEN:${{ env.SOCAT_PORT }},fork,reuseaddr EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
-          sleep 3
-          netstat -tulpn | grep :${{ env.SOCAT_PORT }} || { echo "❌ socat not listening"; exit 1; }
-
       # ---------- Start Ollama service ----------
       - name: Start Ollama
         run: ollama serve &
 
-      # ---------- Start Hermes Dashboard ----------
-      - name: Start Hermes Dashboard
+      # ---------- Start shell server via socat ----------
+      - name: Start shell server
         run: |
-          export PATH="$HOME/.hermes/bin:$PATH"
-          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
-          sleep 10
-          for i in {1..10}; do
-            if curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
-              echo "✅ Hermes Dashboard ready"
-              break
-            fi
-            sleep 2
-          done
+          # socat listens on port 2222 and spawns a bash shell for each connection
+          socat TCP-LISTEN:${{ env.SHELL_PORT }},fork EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
+          sleep 2
 
-      # ---------- Expose socat port via Holesail ----------
-      - name: Expose socat with Holesail
+      # ---------- Expose shell port via Holesail ----------
+      - name: Expose shell with Holesail
         id: holesail
         run: |
-          holesail --live ${{ env.SOCAT_PORT }} --public > holesail.log 2>&1 &
+          # Start Holesail server exposing port 2222
+          holesail --live ${{ env.SHELL_PORT }} --public > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
           if [ -z "$CONNECTION_KEY" ]; then
@@ -79,7 +64,7 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-      # ---------- Print access instructions ----------
+      # ---------- Print instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -88,25 +73,20 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To get the FASTEST encrypted terminal on the runner:"
+          echo "🌐 To get a shell on the runner:"
           echo ""
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Install socat on your local machine:"
-          echo "      # Ubuntu/Debian: sudo apt-get install socat"
-          echo "      # macOS: brew install socat"
-          echo "      # Windows: install via WSL or Cygwin"
+          echo "   2. Connect to the runner's shell port:"
+          echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   3. Connect to the runner's socat port:"
-          echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SOCAT_PORT }}"
+          echo "   3. In another terminal, connect to the local forwarded port:"
+          echo "      nc localhost ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   4. In another terminal, connect with socat:"
-          echo "      socat PTY,raw,echo=0,stderr TCP:localhost:${{ env.SOCAT_PORT }}"
+          echo "   4. You now have a bash shell on the runner!"
+          echo "      Run 'hermes chat --model ${{ env.OLLAMA_MODEL }}' to start chatting."
           echo ""
-          echo "   ✅ That's it! Holesail encrypts the tunnel end‑to‑end."
-          echo "   This is FASTER than SSH and FASTER than OpenSSL."
-          echo ""
-          echo "💡 To run Hermes: hermes chat --model ${{ env.OLLAMA_MODEL }}"
+          echo "💡 The connection is direct P2P – no lag!"
           echo "================================================================="
           sleep infinity
