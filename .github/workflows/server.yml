@@ -1,6 +1,8 @@
 name: Queen Orchestrator
+
 on:
   workflow_dispatch:
+
 permissions:
   contents: write
   actions: write
@@ -8,114 +10,98 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  DOCKER_PORT: 8000
+  DOCKER_PORT: 9119
 
 jobs:
   queen:
     runs-on: ubuntu-latest
-    timeout-mins: 360
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
+      # 1. Install required system components natively
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd
-          
+          sudo apt-get install -y curl netcat-openbsd
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Setup Ollama Engine (Native for Speed)
+      # 2. Setup Ollama Engine natively for optimal speed
+      - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      - name: Pull Ollama Model Weights (Native)
-        run: ollama pull ${{ env.OLLAMA_MODEL }}
-
-      - name: Verify Ollama is Ready
+      # 3. Pull base model weights and scale context window to 64K
+      - name: Build 64K Context Agent Model Variant
         run: |
-          echo "⏳ Waiting for Ollama API..."
-          for i in {1..30}; do
-            if nc -z 127.0.0.1 11434; then
-              echo "✅ Ollama is online!"
-              break
+          ollama pull ${{ env.OLLAMA_MODEL }}
+          echo "FROM ${{ env.OLLAMA_MODEL }}" > Modelfile
+          echo "PARAMETER num_ctx 64000" >> Modelfile
+          ollama create granite4-64k -f Modelfile
+
+      # 4. Spin up Cloudflare Tunnel natively pointing to the incoming Docker port
+      - name: Start Cloudflare Tunnel Connection
+        run: |
+          ./cloudflared tunnel --url http://127.0.0.1:${{ env.DOCKER_PORT }} > tunnel.log 2>&1 &
+          
+          echo "⏳ Catching TryCloudflare edge address registration..."
+          for i in {1..20}; do
+            if [ -f tunnel.log ]; then
+              URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+              if [ -n "$URL" ]; then 
+                CLEAN_HOST=$(echo "$URL" | sed 's|https://||')
+                echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
+                echo "TUNNEL_HOST=$CLEAN_HOST" >> $GITHUB_ENV
+                echo "✅ URL Captured: $URL"
+                break
+              fi
             fi
-            sleep 2
+            sleep 3
           done
 
-      # Write the docker-compose file that runs the unified gateway
-      - name: Write Docker Compose File
+      # 5. Build config space and launch the unified container infrastructure
+      - name: Launch Containerized Hermes Dashboard
         run: |
           mkdir -p ~/.hermes
           
-          # NOTE: We use host.docker.internal:11434 so the container can find 
-          # the natively running Ollama outside the container!
+          # Configure internal provider map pointing to host machine's Ollama runtime
           cat << 'EOF' > ~/.hermes/config.yaml
           provider: "ollama"
-          model: "granite4:tiny-h"
+          model: "granite4-64k"
           providers:
             ollama:
               base_url: "http://host.docker.internal:11434"
           EOF
-          
+
           cat << 'EOF' > docker-compose.yml
           version: '3.8'
           services:
             hermes:
-              image: python:3.12-slim
+              image: python:3.11-slim
               working_dir: /app
-              # Install Hermes and start the unified backend/frontend gateway
-              command: sh -c "pip install -q 'hermes-agent[web,pty]' && hermes serve --host 0.0.0.0 --port 8000"
+              # Runs the true UI dashboard web app on loopback inside the container to clear auth validations
+              command: >
+                sh -c "pip install -q --upgrade pip && 
+                       pip install -q 'hermes-agent[web,pty]' && 
+                       hermes dashboard --host 127.0.0.1 --port 8000 --allowed-hosts '${{ env.TUNNEL_HOST }}' --no-open --skip-build"
+              network_mode: "host"
               environment:
                 HERMES_ALLOWED_ORIGINS: "*"
-                HERMES_ALLOWED_HOSTS: "*"
                 HERMES_DISABLE_CSRF: "true"
                 HERMES_INSECURE: "true"
-              ports:
-                - "${{ env.DOCKER_PORT }}:8000"
               volumes:
                 - ~/.hermes:/root/.hermes
-              # Crucial: Allows the container to resolve the host machine's Ollama
               extra_hosts:
                 - "host.docker.internal:host-gateway"
           EOF
 
-      # Start the Docker container in the background
-      - name: Start Hermes Unified Gateway via Docker
-        run: |
-          docker compose up -d --build
-          
-          echo "⏳ Waiting for Docker container to bind to port ${{ env.DOCKER_PORT }}..."
-          for i in {1..30}; do
-            if nc -z 127.0.0.1 ${{ env.DOCKER_PORT }}; then
-              echo "✅ Docker Gateway is online!"
-              break
-            fi
-            sleep 3
-          done
+          docker compose up -d
 
-      # Point tunnel directly to the unified Docker port
-      - name: Start Cloudflare Tunnel Connection
-        id: tunnel
-        run: |
-          # NO --http-host-header hack needed here! Docker handles host networking cleanly.
-          nohup ./cloudflared tunnel \
-            --url http://127.0.0.1:${{ env.DOCKER_PORT }} > tunnel.log 2>&1 &
-          
-          echo "⏳ Catching TryCloudflare edge address registration..."
-          for i in {1..20}; do
-            URL=$(grep -oP 'https://[a-zA-Z00-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then 
-              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
-              break
-            fi
-            sleep 3
-          done
-          sleep 5
-
+      # 6. Verify end-to-end container delivery and hold session alive
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
           echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
-          echo "👉 ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "👉 ${{ env.TUNNEL_URL }}"
           echo "================================================================="
           sleep infinity
