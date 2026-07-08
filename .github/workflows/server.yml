@@ -69,16 +69,13 @@ jobs:
           
           # C. Block until the edge route url registers successfully
           echo "⏳ Catching dynamic public edge route URL..."
-          TUNNEL_HOST=""
           TUNNEL_URL=""
           
           for i in {1..20}; do
             if [ -f cloudflared.log ]; then
               URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1)
               if [ -n "$URL" ]; then 
-                CLEAN_HOST=$(echo "$URL" | sed 's|https://||')
                 TUNNEL_URL="$URL"
-                TUNNEL_HOST="$CLEAN_HOST"
                 echo "✅ URL Captured: $URL"
                 break
               fi
@@ -102,10 +99,10 @@ jobs:
           export HERMES_DISABLE_CSRF="true"
           export HERMES_INSECURE="true"
           
-          # F. Execute the dashboard in the foreground on the main runner thread
+          # F. Execute the dashboard with the valid --insecure flag to disable Host validation drops
           hermes dashboard \
             --host 127.0.0.1 \
             --port ${{ env.HERMES_DASHBOARD_PORT }} \
-            --allowed-hosts "$TUNNEL_HOST" \
+            --insecure \
             --no-open \
             --skip-build
