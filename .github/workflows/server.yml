@@ -56,7 +56,6 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           
-      # STEP 1: ONLY run the backend server. We ditch the dashboard process!
       - name: Start Hermes Backend Server
         env:
           HERMES_ALLOWED_ORIGINS: "*"
@@ -76,10 +75,9 @@ jobs:
             sleep 2
           done
 
-      # STEP 2: Nginx serves the UI files natively AND proxies the backend
+      # FIXED: Added chmod to allow Nginx to read the files
       - name: Configure Nginx as Static Server & Proxy
         run: |
-          # Find the pre-compiled frontend files hidden in the pip package
           WEB_DIST=$(find /home/runner/.local -path "*/hermes_cli/web_dist" -type d | head -n 1)
           
           if [ -z "$WEB_DIST" ]; then
@@ -89,11 +87,14 @@ jobs:
           
           echo "📂 Found frontend at: $WEB_DIST"
           
+          # Grant Nginx (www-data) permission to read the frontend files
+          chmod -R a+rX "$WEB_DIST"
+          
           sudo tee /etc/nginx/sites-available/hermes > /dev/null <<EOF
           server {
               listen ${{ env.HERMES_PUBLIC_PORT }};
               
-              # 1. Serve frontend files directly from the pip package
+              # 1. Serve frontend files directly
               location / {
                   root $WEB_DIST;
                   try_files \$uri \$uri/ /index.html;
