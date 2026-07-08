@@ -1,17 +1,14 @@
-name: Queen Orchestrator (Hermes Agent)
+name: Queen (Hermes Agent + Ollama)
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
-  actions: write
 
 env:
-  MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
   HERMES_PORT: 18789
-  SCRIPT_DIR: /tmp/queen
 
 jobs:
   queen:
@@ -20,37 +17,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      # ---------- Install dependencies ----------
+      - name: Install Ollama & Hermes Agent
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl git nodejs npm python3 python3-pip jq
+          sudo apt-get install -y curl
           curl -fsSL https://ollama.com/install.sh | sh
-          # Install Hermes Agent (from NousResearch)
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          # Ensure hermes is in PATH
+          # Add Hermes to PATH
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.hermes/bin:$PATH"
+          # Install Cloudflared
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Start Ollama
+      # ---------- Start Ollama ----------
+      - name: Start Ollama & pull model
         run: |
+          pkill -f ollama || true
+          sleep 2
           ollama serve &
-          sleep 5
+          sleep 10
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Setup scripts
-        run: |
-          mkdir -p ${{ env.SCRIPT_DIR }}
-          cp scripts/* ${{ env.SCRIPT_DIR }}/ 2>/dev/null || true
-          chmod +x ${{ env.SCRIPT_DIR }}/*.sh
-
-      - name: Configure Hermes Agent
-        env:
-          SCRIPT_DIR: ${{ env.SCRIPT_DIR }}
-          HERMES_PORT: ${{ env.HERMES_PORT }}
+      # ---------- Configure Hermes Agent ----------
+      - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
-          # Create a minimal config
           cat > ~/.hermes/config.yaml << EOF
           model:
             provider: ollama
@@ -58,25 +51,20 @@ jobs:
             baseUrl: http://localhost:11434
           gateway:
             port: ${{ env.HERMES_PORT }}
+            host: 0.0.0.0
             controlUi:
               enabled: true
-          skills:
-            - name: run_worker
-              type: command
-              command: $SCRIPT_DIR/worker_launcher.sh
-              description: "Execute a query in a temporary GitHub Actions worker."
-              parameters:
-                query:
-                  type: string
-                  description: "The user query to execute"
+              allowedOrigins:
+                - "*"
           EOF
-          # Validate config
-          hermes config validate || echo "Config validation warning (continuing)"
 
+      # ---------- Start Hermes Gateway ----------
       - name: Start Hermes Gateway
         run: |
-          hermes gateway start &
-          sleep 5
+          export PATH="$HOME/.hermes/bin:$PATH"
+          hermes gateway start --host 0.0.0.0 --port ${{ env.HERMES_PORT }} &
+          sleep 10
+          # Verify it's running
           for i in {1..20}; do
             if curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
               echo "✅ Gateway ready"
@@ -85,37 +73,36 @@ jobs:
             sleep 2
           done
 
+      # ---------- Start Cloudflare Tunnel ----------
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
           nohup ./cloudflared tunnel --url http://localhost:${{ env.HERMES_PORT }} > tunnel.log 2>&1 &
+          TUNNEL_URL=""
           for i in {1..30}; do
-            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then echo "tunnel_url=$URL" >> $GITHUB_OUTPUT; break; fi
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Tunnel URL: $TUNNEL_URL"
+              break
+            fi
             sleep 3
           done
+          if [ -z "$TUNNEL_URL" ]; then
+            cat tunnel.log
+            exit 1
+          fi
+          echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
 
-      - name: Update allowed origins
+      # ---------- Print access ----------
+      - name: Print access
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
         run: |
-          # Hermes Agent may need CORS settings; we update config
-          sed -i "s|controlUi:.*|controlUi:\n    enabled: true\n    allowedOrigins: [\"$TUNNEL_URL\"]|" ~/.hermes/config.yaml
-          pkill -f "hermes gateway" || true
-          sleep 2
-          hermes gateway start &
-          sleep 5
-
-      - name: Print access
-        run: |
           echo "================================================================="
-          echo "🌐 Hermes Agent Web UI: ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "🌐 Hermes Agent Web UI is available at:"
+          echo "   $TUNNEL_URL"
           echo ""
-          echo "📋 Configuration:"
-          echo "   - Model: ${{ env.OLLAMA_MODEL }}"
-          echo "   - Max workers: ${{ env.MAX_WORKERS }}"
-          echo "   - Gateway port: ${{ env.HERMES_PORT }}"
-          echo ""
-          echo "💡 Just ask anything. The Queen will automatically create workers."
+          echo "💡 Open this URL in your browser and start chatting!"
           echo "================================================================="
+          # Keep runner alive
           sleep infinity
