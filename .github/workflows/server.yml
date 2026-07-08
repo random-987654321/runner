@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) via SSH
+name: Queen (Hermes Agent + Ollama + Holesail)
 
 on:
   workflow_dispatch:
@@ -31,15 +31,12 @@ jobs:
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install tmate ----------
-      - name: Install tmate
+      # ---------- Install Holesail ----------
+      - name: Install Holesail
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y tmate
-          # Alternatively, download latest release:
-          # curl -L -o tmate.tar.gz https://github.com/tmate-io/tmate/releases/latest/download/tmate-linux-amd64.tar.gz
-          # tar -xzf tmate.tar.gz
-          # sudo mv tmate-linux-amd64/tmate /usr/local/bin/
+          sudo apt-get install -y nodejs npm
+          sudo npm install -g holesail
 
       # ---------- Create Hermes config ----------
       - name: Configure Hermes
@@ -54,7 +51,10 @@ jobs:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
           EOF
-          # Auth credentials
+
+      # ---------- Configure dashboard auth ----------
+      - name: Configure Hermes authentication
+        run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
           cat > ~/.hermes/.env << EOF
@@ -80,42 +80,51 @@ jobs:
               echo "✅ Dashboard ready"
               break
             fi
+            echo "⏳ Waiting for dashboard... ($i/20)"
             sleep 2
           done
 
-      # ---------- Start tmate (SSH) ----------
-      - name: Start tmate
-        id: tmate
+      # ---------- Expose Dashboard via Holesail ----------
+      - name: Expose Dashboard with Holesail
+        id: holesail
         run: |
-          # Start tmate in the background and capture the connection string
-          tmate -F > /tmp/tmate_output.log 2>&1 &
-          # Wait for the SSH connection string to appear
-          for i in {1..30}; do
-            if grep -q "ssh session:" /tmp/tmate_output.log; then
-              SSH_STRING=$(grep "ssh session:" /tmp/tmate_output.log | head -1)
-              echo "SSH_STRING=$SSH_STRING" >> $GITHUB_OUTPUT
-              break
-            fi
-            sleep 2
-          done
-          cat /tmp/tmate_output.log
+          # Start Holesail server exposing port 18789
+          # The --public flag makes the key visible in logs
+          holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
+          sleep 10
+          # Extract the connection key from logs
+          CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
+          if [ -z "$CONNECTION_KEY" ]; then
+            echo "❌ Failed to get Holesail connection key"
+            cat holesail.log
+            exit 1
+          fi
+          echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
+          echo "✅ Holesail key: $CONNECTION_KEY"
 
-      # ---------- Print instructions ----------
+      # ---------- Print access instructions ----------
       - name: Print access
         env:
-          SSH_STRING: ${{ steps.tmate.outputs.SSH_STRING }}
+          CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
         run: |
           echo "================================================================="
-          echo "🔑 SSH into the runner using:"
-          echo "   $SSH_STRING"
+          echo "🔑 Holesail Connection Key:"
+          echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 Once connected, forward the dashboard port to your local machine:"
-          echo "   ssh -L 18789:localhost:${{ env.HERMES_PORT }} ..."
+          echo "🌐 To access the Hermes dashboard from your browser:"
+          echo ""
+          echo "   1. Install Holesail on your local machine:"
+          echo "      npm install -g holesail"
+          echo ""
+          echo "   2. Connect to the runner's Holesail server:"
+          echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
+          echo ""
+          echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
           echo ""
           echo "🔐 Dashboard credentials:"
           echo "   Username: admin"
           echo "   Password: ${{ env.ADMIN_PASSWORD }}"
           echo ""
-          echo "💡 Then open http://localhost:18789 in your browser."
+          echo "💡 The connection is direct P2P - no lag, no relay servers!"
           echo "================================================================="
           sleep infinity
