@@ -17,35 +17,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Setup Ollama via official action ----------
       - name: Setup Ollama
-        uses: ai-action/setup-ollama@v2
-        with:
-          version: latest
+        uses: ai-action/setup-ollama@v1
 
-      # ---------- Install Hermes Agent ----------
+      - name: Pull Ollama model
+        run: ollama pull ${{ env.OLLAMA_MODEL }}
+
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install Cloudflared ----------
       - name: Install Cloudflared
         run: |
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ---------- Pull the model ----------
-      - name: Pull Ollama model
-        run: |
-          ollama pull ${{ env.OLLAMA_MODEL }}
+      - name: Start Ollama service
+        run: ollama serve &
 
-      # ---------- Configure Hermes authentication ----------
       - name: Configure Hermes with auth
         run: |
           mkdir -p ~/.hermes
-          # Generate random credentials
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
           cat > ~/.hermes/.env << EOF
@@ -55,7 +49,6 @@ jobs:
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
-      # ---------- Start Hermes Dashboard ----------
       - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
@@ -67,11 +60,9 @@ jobs:
               echo "✅ Dashboard ready"
               break
             fi
-            echo "⏳ Waiting for dashboard... ($i/20)"
             sleep 2
           done
 
-      # ---------- Start Cloudflare Tunnel ----------
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
@@ -84,13 +75,8 @@ jobs:
             fi
             sleep 3
           done
-          if [ -z "$TUNNEL_URL" ]; then
-            cat tunnel.log
-            exit 1
-          fi
           echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
 
-      # ---------- Print access ----------
       - name: Print access
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
@@ -98,10 +84,7 @@ jobs:
           echo "================================================================="
           echo "🌐 Hermes Agent Web Dashboard: $TUNNEL_URL"
           echo ""
-          echo "🔐 Login credentials:"
-          echo "   Username: admin"
-          echo "   Password: ${{ env.ADMIN_PASSWORD }}"
-          echo ""
-          echo "💡 Open the URL and log in with the credentials above."
+          echo "🔐 Username: admin"
+          echo "🔐 Password: ${{ env.ADMIN_PASSWORD }}"
           echo "================================================================="
           sleep infinity
