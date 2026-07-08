@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) with Full Interactive Shell
+name: Queen (Hermes + Ollama) with Fast Interactive Shell
 
 on:
   workflow_dispatch:
@@ -40,7 +40,7 @@ jobs:
 
       - name: Start fully interactive shell server
         run: |
-          socat TCP-LISTEN:${{ env.SHELL_PORT }},fork EXEC:'env TERM=xterm-256color bash -li',pty,stderr,setsid,sigint,sane &
+          socat TCP-LISTEN:${{ env.SHELL_PORT }},nodelay,fork EXEC:'env TERM=xterm-256color bash -li',pty,stderr,setsid,sigint,sane &
           sleep 2
 
       - name: Expose shell with Holesail
@@ -64,25 +64,35 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To get a FULL interactive bash shell:"
+          echo "🌐 To get a FAST, FULLY INTERACTIVE shell:"
           echo ""
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Start the Holesail client (keep this terminal open):"
+          echo "   2. Install socat (optional, but recommended):"
+          echo "      # Ubuntu/Debian: sudo apt-get install socat"
+          echo "      # macOS: brew install socat"
+          echo ""
+          echo "   3. Start the Holesail client (keep this terminal open):"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   3. In a NEW terminal, connect with:"
-          echo "      # Best (PTY, full resize):"
-          echo "      socat PTY,raw,echo=0 TCP:localhost:${{ env.SHELL_PORT }}"
+          echo "   4. In a NEW terminal, connect with one of these:"
           echo ""
-          echo "      # If that hangs, try the file:`tty` version:"
-          echo "      socat file:\`tty\`,raw,echo=0 TCP:localhost:${{ env.SHELL_PORT }}"
+          echo "      # Option A (fastest, minimal overhead):"
+          echo "      socat - TCP:localhost:${{ env.SHELL_PORT }},nodelay"
           echo ""
-          echo "      # Simple (no resize, but works):"
+          echo "      # Option B (full PTY with resize support – slightly slower):"
+          echo "      socat file:\`tty\`,raw,echo=0 TCP:localhost:${{ env.SHELL_PORT }},nodelay"
+          echo ""
+          echo "      # Option C (no socat needed – just works):"
           echo "      nc localhost ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   4. You now have a fully interactive shell!"
+          echo "   5. You now have a fully interactive bash shell!"
           echo "      Run 'hermes chat --model ${{ env.OLLAMA_MODEL }}' to start chatting."
+          echo ""
+          echo "💡 The server uses nodelay for low latency. The shell supports:"
+          echo "   - Up/Down arrows (history)   - Tab completion"
+          echo "   - Ctrl+C (SIGINT)            - Ctrl+Z (job control)"
+          echo "   - Command editing            - Proper colors"
           echo "================================================================="
           sleep infinity
