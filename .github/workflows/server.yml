@@ -9,6 +9,7 @@ permissions:
 env:
   OLLAMA_MODEL: granite4:tiny-h
   HERMES_PORT: 18789
+  HERMES_DEFAULT_MODEL: granite4:tiny-h
 
 jobs:
   queen:
@@ -34,7 +35,7 @@ jobs:
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Configure Ollama provider
+      - name: Create Hermes config with model
         run: |
           mkdir -p ~/.hermes
           cat > ~/.hermes/config.yaml << EOF
@@ -42,16 +43,12 @@ jobs:
             provider: ollama
             model: ${{ env.OLLAMA_MODEL }}
             baseUrl: http://localhost:11434
-          agents:
-            default:
-              model: ${{ env.OLLAMA_MODEL }}
-              systemPrompt: "You are a helpful assistant."
           gateway:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
           EOF
 
-      - name: Configure Hermes authentication
+      - name: Configure dashboard auth
         run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
@@ -65,9 +62,10 @@ jobs:
       - name: Start Ollama service
         run: ollama serve &
 
-      - name: Start Hermes Dashboard
+      - name: Start Hermes Dashboard (with model env)
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
+          export HERMES_DEFAULT_MODEL="${{ env.OLLAMA_MODEL }}"
           set -a; source ~/.hermes/.env; set +a
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
           sleep 15
@@ -76,7 +74,6 @@ jobs:
               echo "✅ Dashboard ready"
               break
             fi
-            echo "⏳ Waiting for dashboard... ($i/20)"
             sleep 2
           done
 
@@ -104,6 +101,6 @@ jobs:
           echo "🔐 Username: admin"
           echo "🔐 Password: ${{ env.ADMIN_PASSWORD }}"
           echo ""
-          echo "💡 The model 'granite4:tiny-h' is configured as the default."
+          echo "💡 Model is set to '${{ env.OLLAMA_MODEL }}'."
           echo "================================================================="
           sleep infinity
