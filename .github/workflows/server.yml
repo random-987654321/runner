@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) with Holesail Shell
+name: Queen (Hermes + Ollama) with Interactive Shell
 
 on:
   workflow_dispatch:
@@ -17,43 +17,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Setup Ollama ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install socat & Holesail ----------
       - name: Install socat and Holesail
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y socat nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Start Ollama service ----------
       - name: Start Ollama
         run: ollama serve &
 
-      # ---------- Start shell server via socat ----------
-      - name: Start shell server
+      # ---------- Improved interactive shell server ----------
+      - name: Start interactive shell server
         run: |
-          # socat listens on port 2222 and spawns a bash shell for each connection
-          socat TCP-LISTEN:${{ env.SHELL_PORT }},fork EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
+          socat TCP-LISTEN:${{ env.SHELL_PORT }},fork EXEC:'script -q -c /bin/bash',pty,raw,echo=0 &
           sleep 2
 
-      # ---------- Expose shell port via Holesail ----------
       - name: Expose shell with Holesail
         id: holesail
         run: |
-          # Start Holesail server exposing port 2222
           holesail --live ${{ env.SHELL_PORT }} --public > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
@@ -64,7 +57,6 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-      # ---------- Print instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -73,20 +65,18 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To get a shell on the runner:"
+          echo "🌐 To get a FULL bash shell (with history, colors, tab completion):"
           echo ""
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Connect to the runner's shell port:"
+          echo "   2. Start Holesail client (keep this terminal open):"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   3. In another terminal, connect to the local forwarded port:"
+          echo "   3. In a NEW terminal, connect with:"
           echo "      nc localhost ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   4. You now have a bash shell on the runner!"
-          echo "      Run 'hermes chat --model ${{ env.OLLAMA_MODEL }}' to start chatting."
-          echo ""
-          echo "💡 The connection is direct P2P – no lag!"
+          echo "   That's it! You'll get a full interactive bash shell."
+          echo "   Run 'hermes chat --model ${{ env.OLLAMA_MODEL }}' to start chatting."
           echo "================================================================="
           sleep infinity
