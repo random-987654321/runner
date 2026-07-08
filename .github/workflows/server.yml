@@ -8,7 +8,7 @@ permissions:
 
 env:
   OLLAMA_MODEL: granite4:tiny-h
-  SSH_PORT: 22
+  SSH_PORT: 2222
 
 jobs:
   queen:
@@ -31,8 +31,8 @@ jobs:
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install Holesail and SSH server ----------
-      - name: Install dependencies
+      # ---------- Install dependencies ----------
+      - name: Install Holesail and SSH server
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y openssh-server nodejs npm
@@ -43,22 +43,22 @@ jobs:
         run: |
           echo "runner:runner123" | sudo chpasswd
 
-      # ---------- Configure SSH server ----------
+      # ---------- Configure SSH to listen on port 2222 ----------
       - name: Configure SSH
         run: |
-          # Allow password authentication
+          # Change SSH port to 2222
+          sudo sed -i 's/^#Port 22/Port ${{ env.SSH_PORT }}/' /etc/ssh/sshd_config
+          sudo sed -i 's/^Port 22/Port ${{ env.SSH_PORT }}/' /etc/ssh/sshd_config
+          # Enable password auth
           sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          # Allow root login if needed (optional)
-          sudo sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
 
       # ---------- Start SSH server ----------
       - name: Start SSH
         run: |
           sudo service ssh restart
           sudo systemctl status ssh || echo "SSH service status check"
-          # Verify SSH is listening
-          sudo netstat -tulpn | grep :22 || echo "SSH not running"
+          sudo netstat -tulpn | grep :${{ env.SSH_PORT }} || echo "SSH not running on port ${{ env.SSH_PORT }}"
 
       # ---------- Start Ollama service ----------
       - name: Start Ollama
@@ -92,7 +92,7 @@ jobs:
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Connect to the runner's SSH port:"
+          echo "   2. Connect to the runner's SSH port (forward to local port ${{ env.SSH_PORT }}):"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SSH_PORT }}"
           echo ""
           echo "   3. In another terminal, SSH into the forwarded port:"
