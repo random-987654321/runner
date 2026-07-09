@@ -39,6 +39,7 @@ jobs:
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
           echo "🌐 Starting llama-server"
+          cd llama-b9940
           ./llama-server \
             -m model.gguf \
             --no-mmap \
