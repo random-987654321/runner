@@ -23,9 +23,9 @@ jobs:
 
       - name: Build llama-server with RPC support
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
-          cd llama.cpp-b8487
+          cd llama.cpp-master
           mkdir build && cd build
           cmake .. -DGGML_NATIVE=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
           cmake --build . --config Release -j4 --target llama-server
@@ -35,7 +35,7 @@ jobs:
          
       - name: Download model
         run: |
-          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
+          MODEL_URL="https://huggingface.co/deepreinforce-ai/Ornith-1.0-9B-GGUF/resolve/main/ornith-1.0-9b-Q4_K_M.gguf"
           curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
           if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
             echo "✅ Valid GGUF file downloaded"
