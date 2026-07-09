@@ -45,7 +45,6 @@ jobs:
             -tb 4 \
             -fa on \
             -ngl 0 \
-            -np 1 \ 
             &
           
           for i in {1..600}; do
