@@ -17,9 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Setup Ollama ----------
+      # ---------- Setup Ollama with version that supports "launch" ----------
       - name: Setup Ollama
-        uses: ai-action/setup-ollama@v1
+        uses: ai-action/setup-ollama@v2
+        with:
+          version: latest  # or 0.6.0
 
       - name: Pull the model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
@@ -41,11 +43,9 @@ jobs:
           echo "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$PASSWORD" >> $GITHUB_ENV
           echo "HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET" >> $GITHUB_ENV
 
-      # ---------- Start Hermes via Ollama launch ----------
-      - name: Launch Hermes with Granite4
+      # ---------- Launch Hermes with Ollama ----------
+      - name: Launch Hermes
         run: |
-          # The launch command pulls the necessary Hermes Agent and runs it
-          # with the specified model and extra args (--host, --port, --no-open)
           ollama launch hermes --model ${{ env.OLLAMA_MODEL }} -- \
             --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
           sleep 15
@@ -57,7 +57,7 @@ jobs:
             exit 1
           fi
 
-      # ---------- Expose Hermes via Holesail ----------
+      # ---------- Expose via Holesail ----------
       - name: Expose with Holesail
         id: holesail
         run: |
@@ -89,7 +89,5 @@ jobs:
           echo "   2. Connect: holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
           echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
           echo "   4. Log in with the credentials above."
-          echo ""
-          echo "💡 Everything is handled by 'ollama launch' – no manual Hermes config needed."
           echo "================================================================="
           sleep infinity
