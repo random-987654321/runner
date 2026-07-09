@@ -36,9 +36,7 @@ jobs:
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           cd ~/.hermes/hermes-agent
-          # Activate the virtual environment created by the installer
           source venv/bin/activate
-          # Install the web and pty extras (needed for dashboard and chat)
           uv pip install -e ".[web,pty]"
 
       # ---------- Install Holesail ----------
@@ -82,13 +80,13 @@ jobs:
             echo "✅ Ollama already running"
           fi
 
-      # ---------- Start Hermes Server (API + Web UI in one process) ----------
+      # ---------- Start Hermes Server (API + Web UI) ----------
       - name: Start Hermes Server
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
-          # Use hermes serve with --web to serve both the API and the Web UI
-          # This ensures the Gateway is "On" and the provider is loaded.
+          # Use hermes serve with the --web flag to serve both API and UI
+          # This is the most reliable way to have both the gateway and dashboard
           hermes serve --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --web > server.log 2>&1 &
           SERVER_PID=$!
           echo "Server PID: $SERVER_PID"
@@ -140,7 +138,6 @@ jobs:
           echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
           echo "   4. Log in with the credentials above."
           echo ""
-          echo "💡 The server is now running with both the API and Web UI."
-          echo "   Gateway Status should show as 'On'."
+          echo "💡 The server now runs both the API and Web UI."
           echo "================================================================="
           sleep infinity
