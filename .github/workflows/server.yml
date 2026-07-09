@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Setup Ollama with version that supports "launch" ----------
+      # ---------- Setup Ollama 0.6.0 (supports "launch") ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v2
         with:
-          version: latest  # or 0.6.0
+          version: 0.6.0
 
       - name: Pull the model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
@@ -46,10 +46,10 @@ jobs:
       # ---------- Launch Hermes with Ollama ----------
       - name: Launch Hermes
         run: |
+          # The launch command works with Ollama >= 0.5.0
           ollama launch hermes --model ${{ env.OLLAMA_MODEL }} -- \
             --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
           sleep 15
-          # Health check
           if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
             echo "✅ Hermes Gateway ready"
           else
