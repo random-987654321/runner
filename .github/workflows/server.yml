@@ -31,13 +31,14 @@ jobs:
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install Web UI dependencies ----------
+      # ---------- Install Web UI dependencies (activate venv) ----------
       - name: Install Hermes Web UI dependencies
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
-          # The installer clones the repo to ~/.hermes/hermes-agent
           cd ~/.hermes/hermes-agent
-          # Install the "web" and "pty" extras (needed for dashboard and chat)
+          # Activate the virtual environment created by the installer
+          source venv/bin/activate
+          # Install the web and pty extras
           uv pip install -e ".[web,pty]"
 
       # ---------- Install Holesail ----------
@@ -87,7 +88,7 @@ jobs:
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
           # Start the dashboard on all interfaces with custom port
-          # --no-open prevents the browser from opening (headless environment)
+          # --no-open prevents browser from opening (headless environment)
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open > dashboard.log 2>&1 &
           DASHBOARD_PID=$!
           echo "Dashboard PID: $DASHBOARD_PID"
