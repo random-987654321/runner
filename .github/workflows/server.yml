@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 env:
-  OLLAMA_MODEL: ornith:9b              # Model optimized for agentic coding
+  OLLAMA_MODEL: ornith:9b
   HERMES_PORT: 18789
 
 jobs:
@@ -25,7 +25,7 @@ jobs:
 
       # ---------- Setup Ollama ----------
       - name: Setup Ollama
-        uses: ai-action/setup-ollama@v2
+        uses: ai-action/setup-ollama@v1
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
@@ -41,7 +41,7 @@ jobs:
       - name: Install Holesail
         run: sudo npm install -g holesail
 
-      # ---------- Configure Hermes for Ollama ----------
+      # ---------- Configure Hermes for Ollama (with API key) ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
@@ -50,6 +50,7 @@ jobs:
             default: "${{ env.OLLAMA_MODEL }}"
             provider: "custom"
             base_url: "http://localhost:11434/v1"
+            api_key: ""
           gateway:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
@@ -74,11 +75,7 @@ jobs:
           cd ~/.hermes/hermes-agent
           uv pip install -e ".[web,pty]" || pip install -e ".[web,pty]"
 
-      # ---------- Start Ollama service ----------
-      - name: Start Ollama
-        run: ollama serve &
-
-      # ---------- Start Hermes Dashboard ----------
+      # ---------- Start Hermes Dashboard (Ollama is already running) ----------
       - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
@@ -133,6 +130,6 @@ jobs:
           echo "   Password: ${{ env.ADMIN_PASSWORD }}"
           echo ""
           echo "💡 Model: ${{ env.OLLAMA_MODEL }} (5.6 GB, Q4_K_M)"
-          echo "💡 The connection is direct P2P - no lag, no relay servers!"
+          echo "💡 API key is set to empty string (custom provider)."
           echo "================================================================="
           sleep infinity
