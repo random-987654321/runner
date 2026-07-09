@@ -1,4 +1,4 @@
-name: Queen (Hermes via Ollama Launch + Holesail)
+name: Queen (Hermes Agent + Ollama + Holesail)
 
 on:
   workflow_dispatch:
@@ -17,14 +17,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Setup Ollama 0.6.0 (supports "launch") ----------
+      # ---------- Setup Ollama ----------
       - name: Setup Ollama
-        uses: ai-action/setup-ollama@v2
-        with:
-          version: 0.6.0
+        uses: ai-action/setup-ollama@v1
 
-      - name: Pull the model
+      - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
+
+      # ---------- Install Hermes Agent ----------
+      - name: Install Hermes Agent
+        run: |
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          echo "$HOME/.hermes/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.hermes/bin:$PATH"
 
       # ---------- Install Holesail ----------
       - name: Install Holesail
@@ -33,31 +38,70 @@ jobs:
           sudo apt-get install -y nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Generate auth credentials ----------
-      - name: Generate auth credentials
+      # ---------- Configure Hermes provider ----------
+      - name: Configure Hermes
+        run: |
+          mkdir -p ~/.hermes
+          # Use setup to ensure everything is configured
+          hermes setup --provider ollama --model ${{ env.OLLAMA_MODEL }} --non-interactive || true
+          # Alternatively, set config manually
+          hermes config set models.providers.ollama.baseUrl "http://localhost:11434"
+          hermes config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
+          hermes config set agents.default.model "ollama/granite4:tiny-h"
+          # Verify
+          echo "✅ Current model:"
+          hermes config show | grep -A5 "ollama" || echo "⚠️ No Ollama config found"
+
+      # ---------- Set up dashboard auth ----------
+      - name: Configure authentication
         run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
+          cat > ~/.hermes/.env << EOF
+          HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
+          HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$PASSWORD
+          HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
+          EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-          echo "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin" >> $GITHUB_ENV
-          echo "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-          echo "HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET" >> $GITHUB_ENV
 
-      # ---------- Launch Hermes with Ollama ----------
-      - name: Launch Hermes
+      # ---------- Start Ollama (if not already running) ----------
+      - name: Start Ollama if needed
         run: |
-          # The launch command works with Ollama >= 0.5.0
-          ollama launch hermes --model ${{ env.OLLAMA_MODEL }} -- \
-            --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
-          sleep 15
-          if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
-            echo "✅ Hermes Gateway ready"
+          if ! pgrep -x "ollama" > /dev/null; then
+            ollama serve &
+            sleep 5
           else
-            echo "❌ Hermes failed to start"
+            echo "✅ Ollama already running"
+          fi
+
+      # ---------- Start Hermes Gateway (the core service) ----------
+      - name: Start Hermes Gateway
+        run: |
+          export PATH="$HOME/.hermes/bin:$PATH"
+          set -a; source ~/.hermes/.env; set +a
+          # Start the gateway in the background and capture logs
+          hermes gateway start --host 0.0.0.0 --port ${{ env.HERMES_PORT }} > gateway.log 2>&1 &
+          GATEWAY_PID=$!
+          echo "Gateway PID: $GATEWAY_PID"
+          sleep 15
+          # Check if it's still running
+          if ps -p $GATEWAY_PID > /dev/null; then
+            echo "✅ Gateway is running (PID: $GATEWAY_PID)"
+          else
+            echo "❌ Gateway died. Logs:"
+            cat gateway.log
+            exit 1
+          fi
+          # Check if it's responding to API
+          if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
+            echo "✅ Gateway is responding"
+          else
+            echo "❌ Gateway not responding. Logs:"
+            cat gateway.log
             exit 1
           fi
 
-      # ---------- Expose via Holesail ----------
+      # ---------- Expose Gateway via Holesail ----------
       - name: Expose with Holesail
         id: holesail
         run: |
@@ -71,7 +115,7 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-      # ---------- Print access ----------
+      # ---------- Print access instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -89,5 +133,8 @@ jobs:
           echo "   2. Connect: holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
           echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
           echo "   4. Log in with the credentials above."
+          echo ""
+          echo "💡 The gateway is now running and will respond to chat requests."
           echo "================================================================="
+          # Keep the runner alive
           sleep infinity
