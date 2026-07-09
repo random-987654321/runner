@@ -18,7 +18,7 @@ jobs:
         run: |
           wget https://github.com/ggml-org/llama.cpp/releases/download/b9940/llama-b9940-bin-ubuntu-x64.tar.gz    
           tar -xzf llama-b9940-bin-ubuntu-x64.tar.gz
-          cd llama-b9940
+          cp llama-b9940/llama-server .
           chmod +x llama-server
          
       - name: Download model
@@ -39,7 +39,6 @@ jobs:
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
           echo "🌐 Starting llama-server"
-          cd llama-b9940
           ./llama-server \
             -m model.gguf \
             --no-mmap \
@@ -48,6 +47,7 @@ jobs:
             -fa on \
             -ngl 0 \
             -c 4096 \
+            --jinja \
             &
           
           for i in {1..600}; do
