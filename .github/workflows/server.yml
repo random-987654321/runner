@@ -38,7 +38,7 @@ jobs:
           sudo apt-get install -y nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Configure Hermes (using config set - more reliable) ----------
+      # ---------- Configure Hermes (using config set) ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
@@ -46,8 +46,11 @@ jobs:
           hermes config set models.providers.ollama.baseUrl "http://localhost:11434"
           hermes config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
           hermes config set agents.default.model "ollama/granite4:tiny-h"
-          # Verify
-          echo "✅ Current model: $(hermes config get agents.default.model)"
+          # Show config to verify
+          echo "✅ Current config:"
+          hermes config show | grep -A5 "ollama" || echo "⚠️ No Ollama config found"
+          # Validate
+          hermes config check || echo "⚠️ Config validation warning"
 
       # ---------- Configure dashboard auth ----------
       - name: Configure Hermes authentication
@@ -61,9 +64,16 @@ jobs:
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
-      # ---------- Start Ollama service ----------
-      - name: Start Ollama
-        run: ollama serve &
+      # ---------- Start Ollama service (only if not already running) ----------
+      - name: Start Ollama if not running
+        run: |
+          if ! pgrep -x "ollama" > /dev/null; then
+            echo "Starting Ollama..."
+            ollama serve &
+            sleep 5
+          else
+            echo "✅ Ollama already running"
+          fi
 
       # ---------- Start Hermes Dashboard ----------
       - name: Start Hermes Dashboard
@@ -71,7 +81,7 @@ jobs:
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
           # Verify model is set before starting
-          hermes config get agents.default.model
+          echo "Model configured: $(hermes config show | grep -E 'model|provider' || echo 'unknown')"
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
           sleep 15
           for i in {1..20}; do
