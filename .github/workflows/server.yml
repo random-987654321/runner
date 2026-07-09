@@ -41,13 +41,13 @@ jobs:
           chmod +x llama-server
           ./llama-server \
             -m ../model.gguf \
-            --no-mmap \
             -t 4 \
             -tb 4 \
             -fa on \
             -ngl 0 \
             -c 4096 \
             --jinja \
+            --think \
             &
           
           for i in {1..600}; do
