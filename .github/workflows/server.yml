@@ -8,7 +8,8 @@ permissions:
 
 env:
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_PORT: 18789
+  GATEWAY_PORT: 8642
+  DASHBOARD_PORT: 18789
 
 jobs:
   queen:
@@ -58,8 +59,8 @@ jobs:
           echo "✅ Configuration:"
           hermes config show
 
-      # ---------- Configure authentication ----------
-      - name: Configure authentication
+      # ---------- Configure authentication for gateway ----------
+      - name: Configure gateway auth
         run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
@@ -67,6 +68,8 @@ jobs:
           HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
           HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$PASSWORD
           HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
+          # Gateway API auth
+          API_SERVER_KEY=$SECRET
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
@@ -80,36 +83,60 @@ jobs:
             echo "✅ Ollama already running"
           fi
 
-      # ---------- Start Hermes Server (API + Web UI) ----------
-      - name: Start Hermes Server
+      # ---------- Start Hermes Gateway (API server) ----------
+      - name: Start Hermes Gateway
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
-          # Use hermes serve with the --web flag to serve both API and UI
-          # This is the most reliable way to have both the gateway and dashboard
-          hermes serve --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --web > server.log 2>&1 &
-          SERVER_PID=$!
-          echo "Server PID: $SERVER_PID"
-          # Wait for the server to initialize
-          for i in {1..30}; do
-            if curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
-              echo "✅ Server is responding"
-              break
-            fi
-            echo "⏳ Waiting for server... ($i/30)"
-            sleep 2
-          done
-          if ! curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
-            echo "❌ Server not responding. Logs:"
-            cat server.log
+          # Configure gateway via environment variables
+          export API_SERVER_ENABLED=true
+          export API_SERVER_HOST=0.0.0.0
+          export API_SERVER_PORT=${{ env.GATEWAY_PORT }}
+          export API_SERVER_KEY=$API_SERVER_KEY
+          # Start the gateway in the background
+          hermes gateway start > gateway.log 2>&1 &
+          GATEWAY_PID=$!
+          echo "Gateway PID: $GATEWAY_PID"
+          sleep 10
+          if ps -p $GATEWAY_PID > /dev/null; then
+            echo "✅ Gateway is running"
+          else
+            echo "❌ Gateway died. Logs:"
+            cat gateway.log
             exit 1
           fi
 
-      # ---------- Expose via Holesail ----------
+      # ---------- Start Hermes Dashboard (Web UI) ----------
+      - name: Start Hermes Dashboard
+        run: |
+          export PATH="$HOME/.hermes/bin:$PATH"
+          set -a; source ~/.hermes/.env; set +a
+          # Start dashboard pointing to the local gateway
+          # Use environment variable to set gateway URL
+          export HERMES_GATEWAY_URL=http://localhost:${{ env.GATEWAY_PORT }}
+          hermes dashboard --host 0.0.0.0 --port ${{ env.DASHBOARD_PORT }} --no-open > dashboard.log 2>&1 &
+          DASHBOARD_PID=$!
+          echo "Dashboard PID: $DASHBOARD_PID"
+          # Wait for dashboard to respond
+          for i in {1..30}; do
+            if curl -s http://localhost:${{ env.DASHBOARD_PORT }}/health > /dev/null; then
+              echo "✅ Dashboard is responding"
+              break
+            fi
+            echo "⏳ Waiting for dashboard... ($i/30)"
+            sleep 2
+          done
+          if ! curl -s http://localhost:${{ env.DASHBOARD_PORT }}/health > /dev/null; then
+            echo "❌ Dashboard not responding. Logs:"
+            cat dashboard.log
+            exit 1
+          fi
+
+      # ---------- Expose Dashboard via Holesail ----------
       - name: Expose with Holesail
         id: holesail
         run: |
-          holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
+          holesail --live ${{ env.DASHBOARD_PORT }} --public > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
           if [ -z "$CONNECTION_KEY" ]; then
@@ -119,7 +146,7 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-      # ---------- Print access ----------
+      # ---------- Print access instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -134,10 +161,11 @@ jobs:
           echo ""
           echo "🌐 To access the Hermes Web UI:"
           echo "   1. Install Holesail: npm install -g holesail"
-          echo "   2. Connect: holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
-          echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
+          echo "   2. Connect: holesail \"$CONNECTION_KEY\" --port ${{ env.DASHBOARD_PORT }}"
+          echo "   3. Open http://localhost:${{ env.DASHBOARD_PORT }} in your browser"
           echo "   4. Log in with the credentials above."
           echo ""
-          echo "💡 The server now runs both the API and Web UI."
+          echo "💡 The gateway is running on port ${{ env.GATEWAY_PORT }} (local only)."
+          echo "   The dashboard connects to it automatically."
           echo "================================================================="
           sleep infinity
