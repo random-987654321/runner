@@ -1,4 +1,4 @@
-name: Queen (Hermes Agent + Ollama + Holesail)
+name: Queen (Hermes Agent Web UI + Ollama + Holesail)
 
 on:
   workflow_dispatch:
@@ -31,6 +31,15 @@ jobs:
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
+      # ---------- Install Web UI dependencies ----------
+      - name: Install Hermes Web UI dependencies
+        run: |
+          export PATH="$HOME/.hermes/bin:$PATH"
+          # The installer clones the repo to ~/.hermes/hermes-agent
+          cd ~/.hermes/hermes-agent
+          # Install the "web" and "pty" extras (needed for dashboard and chat)
+          uv pip install -e ".[web,pty]"
+
       # ---------- Install Holesail ----------
       - name: Install Holesail
         run: |
@@ -38,18 +47,19 @@ jobs:
           sudo apt-get install -y nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Configure Hermes provider ----------
+      # ---------- Configure Hermes (model provider) ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
-          # Set Ollama provider
+          export PATH="$HOME/.hermes/bin:$PATH"
+          # Set Ollama as the provider
           hermes config set models.providers.ollama.baseUrl "http://localhost:11434"
           hermes config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
           hermes config set agents.default.model "ollama/granite4:tiny-h"
           echo "✅ Configuration:"
           hermes config show
 
-      # ---------- Configure dashboard auth ----------
+      # ---------- Configure dashboard authentication ----------
       - name: Configure authentication
         run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
@@ -71,32 +81,32 @@ jobs:
             echo "✅ Ollama already running"
           fi
 
-      # ---------- Start Hermes Dashboard ----------
+      # ---------- Start Hermes Dashboard (Web UI) ----------
       - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
-          # Start the dashboard – this will serve both the UI and the API
+          # Start the dashboard on all interfaces with custom port
+          # --no-open prevents the browser from opening (headless environment)
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open > dashboard.log 2>&1 &
           DASHBOARD_PID=$!
           echo "Dashboard PID: $DASHBOARD_PID"
-          sleep 15
-          if ps -p $DASHBOARD_PID > /dev/null; then
-            echo "✅ Dashboard is running (PID: $DASHBOARD_PID)"
-          else
-            echo "❌ Dashboard died. Logs:"
-            cat dashboard.log
-            exit 1
-          fi
-          if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
-            echo "✅ Dashboard is responding"
-          else
+          # Wait longer for the server to initialize
+          for i in {1..30}; do
+            if curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
+              echo "✅ Dashboard is responding"
+              break
+            fi
+            echo "⏳ Waiting for dashboard... ($i/30)"
+            sleep 2
+          done
+          if ! curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
             echo "❌ Dashboard not responding. Logs:"
             cat dashboard.log
             exit 1
           fi
 
-      # ---------- Expose via Holesail ----------
+      # ---------- Expose Dashboard via Holesail ----------
       - name: Expose with Holesail
         id: holesail
         run: |
@@ -110,7 +120,7 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-      # ---------- Print access ----------
+      # ---------- Print access instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -123,12 +133,18 @@ jobs:
           echo "   Username: admin"
           echo "   Password: ${{ env.ADMIN_PASSWORD }}"
           echo ""
-          echo "🌐 To access the Hermes Web UI:"
-          echo "   1. Install Holesail: npm install -g holesail"
-          echo "   2. Connect: holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
+          echo "🌐 To access the Hermes Web UI from your browser:"
+          echo ""
+          echo "   1. Install Holesail on your local machine:"
+          echo "      npm install -g holesail"
+          echo ""
+          echo "   2. Connect to the runner's Holesail server:"
+          echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
+          echo ""
           echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
+          echo ""
           echo "   4. Log in with the credentials above."
           echo ""
-          echo "💡 The dashboard is now running and should be able to chat."
+          echo "💡 The connection is direct P2P – no lag, no relay servers!"
           echo "================================================================="
           sleep infinity
