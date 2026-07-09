@@ -17,25 +17,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ---------- Setup Ollama ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
 
+      # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
+      # ---------- Install Holesail ----------
       - name: Install Holesail
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Corrected Configuration ----------
+      # ---------- Configure Hermes ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
@@ -43,11 +46,16 @@ jobs:
           hermes config set models.providers.ollama.baseUrl "http://localhost:11434"
           hermes config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
           hermes config set agents.default.model "ollama/granite4:tiny-h"
-          # Show config for verification
           echo "✅ Configuration:"
           hermes config show
 
-      # ---------- Authentication ----------
+      # ---------- Install Hermes Gateway ----------
+      - name: Install Hermes Gateway
+        run: |
+          export PATH="$HOME/.hermes/bin:$PATH"
+          hermes gateway install
+
+      # ---------- Configure authentication ----------
       - name: Configure authentication
         run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
@@ -59,6 +67,7 @@ jobs:
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
+      # ---------- Start Ollama (if not already running) ----------
       - name: Start Ollama if needed
         run: |
           if ! pgrep -x "ollama" > /dev/null; then
@@ -68,18 +77,18 @@ jobs:
             echo "✅ Ollama already running"
           fi
 
-      # ---------- Corrected: Start Hermes Gateway ----------
+      # ---------- Start Hermes Gateway (with environment variables) ----------
       - name: Start Hermes Gateway
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
-          # Use environment variables for host/port (not CLI flags)
+          # Use environment variables to configure the API server
           export API_SERVER_ENABLED=true
           export API_SERVER_HOST=0.0.0.0
           export API_SERVER_PORT=${{ env.HERMES_PORT }}
           export API_SERVER_KEY=$(openssl rand -base64 32)
           echo "API Server Key: $API_SERVER_KEY"
-          # Start gateway (no --host or --port)
+          # Start the gateway (it should now use the env vars)
           hermes gateway start > gateway.log 2>&1 &
           GATEWAY_PID=$!
           echo "Gateway PID: $GATEWAY_PID"
@@ -99,6 +108,7 @@ jobs:
             exit 1
           fi
 
+      # ---------- Expose Gateway via Holesail ----------
       - name: Expose with Holesail
         id: holesail
         run: |
@@ -112,6 +122,7 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
+      # ---------- Print access ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
