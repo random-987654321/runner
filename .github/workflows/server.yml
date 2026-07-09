@@ -43,12 +43,11 @@ jobs:
             -m ../model.gguf \
             -t 4 \
             -tb 4 \
-            -fa on \
+            -fa 1 \
             -ngl 0 \
-            -c 70000 \
             -np 1 \      
-            -ctk q4_0 \
-            -ctv q4_0 \
+            --cpu-strict 1 \     
+            --cpu-range 0-3 \ 
             &
           
           for i in {1..600}; do
