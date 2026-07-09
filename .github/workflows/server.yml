@@ -17,42 +17,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Setup Ollama ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install Holesail ----------
       - name: Install Holesail
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Configure Hermes provider ----------
+      # ---------- Corrected Configuration ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
-          # Use setup to ensure everything is configured
-          hermes setup --provider ollama --model ${{ env.OLLAMA_MODEL }} --non-interactive || true
-          # Alternatively, set config manually
+          # Configure Ollama provider
           hermes config set models.providers.ollama.baseUrl "http://localhost:11434"
           hermes config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
           hermes config set agents.default.model "ollama/granite4:tiny-h"
-          # Verify
-          echo "✅ Current model:"
-          hermes config show | grep -A5 "ollama" || echo "⚠️ No Ollama config found"
+          # Show config for verification
+          echo "✅ Configuration:"
+          hermes config show
 
-      # ---------- Set up dashboard auth ----------
+      # ---------- Authentication ----------
       - name: Configure authentication
         run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
@@ -64,7 +59,6 @@ jobs:
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
-      # ---------- Start Ollama (if not already running) ----------
       - name: Start Ollama if needed
         run: |
           if ! pgrep -x "ollama" > /dev/null; then
@@ -74,17 +68,22 @@ jobs:
             echo "✅ Ollama already running"
           fi
 
-      # ---------- Start Hermes Gateway (the core service) ----------
+      # ---------- Corrected: Start Hermes Gateway ----------
       - name: Start Hermes Gateway
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
-          # Start the gateway in the background and capture logs
-          hermes gateway start --host 0.0.0.0 --port ${{ env.HERMES_PORT }} > gateway.log 2>&1 &
+          # Use environment variables for host/port (not CLI flags)
+          export API_SERVER_ENABLED=true
+          export API_SERVER_HOST=0.0.0.0
+          export API_SERVER_PORT=${{ env.HERMES_PORT }}
+          export API_SERVER_KEY=$(openssl rand -base64 32)
+          echo "API Server Key: $API_SERVER_KEY"
+          # Start gateway (no --host or --port)
+          hermes gateway start > gateway.log 2>&1 &
           GATEWAY_PID=$!
           echo "Gateway PID: $GATEWAY_PID"
           sleep 15
-          # Check if it's still running
           if ps -p $GATEWAY_PID > /dev/null; then
             echo "✅ Gateway is running (PID: $GATEWAY_PID)"
           else
@@ -92,7 +91,6 @@ jobs:
             cat gateway.log
             exit 1
           fi
-          # Check if it's responding to API
           if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
             echo "✅ Gateway is responding"
           else
@@ -101,7 +99,6 @@ jobs:
             exit 1
           fi
 
-      # ---------- Expose Gateway via Holesail ----------
       - name: Expose with Holesail
         id: holesail
         run: |
@@ -115,7 +112,6 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-      # ---------- Print access instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -136,5 +132,4 @@ jobs:
           echo ""
           echo "💡 The gateway is now running and will respond to chat requests."
           echo "================================================================="
-          # Keep the runner alive
           sleep infinity
