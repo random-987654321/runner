@@ -25,7 +25,7 @@ jobs:
 
       # ---------- Setup Ollama ----------
       - name: Setup Ollama
-        uses: ai-action/setup-ollama@v1
+        uses: ai-action/setup-ollama@v2
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
