@@ -38,19 +38,16 @@ jobs:
           sudo apt-get install -y nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Create Hermes config ----------
+      # ---------- Configure Hermes (using config set - more reliable) ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
-          cat > ~/.hermes/config.yaml << EOF
-          model:
-            provider: ollama
-            model: ${{ env.OLLAMA_MODEL }}
-            baseUrl: http://localhost:11434
-          gateway:
-            port: ${{ env.HERMES_PORT }}
-            host: 0.0.0.0
-          EOF
+          # Configure Ollama provider
+          hermes config set models.providers.ollama.baseUrl "http://localhost:11434"
+          hermes config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
+          hermes config set agents.default.model "ollama/granite4:tiny-h"
+          # Verify
+          echo "✅ Current model: $(hermes config get agents.default.model)"
 
       # ---------- Configure dashboard auth ----------
       - name: Configure Hermes authentication
@@ -73,6 +70,8 @@ jobs:
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
+          # Verify model is set before starting
+          hermes config get agents.default.model
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
           sleep 15
           for i in {1..20}; do
@@ -88,11 +87,8 @@ jobs:
       - name: Expose Dashboard with Holesail
         id: holesail
         run: |
-          # Start Holesail server exposing port 18789
-          # The --public flag makes the key visible in logs
           holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
           sleep 10
-          # Extract the connection key from logs
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
           if [ -z "$CONNECTION_KEY" ]; then
             echo "❌ Failed to get Holesail connection key"
