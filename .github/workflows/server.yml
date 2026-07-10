@@ -1,4 +1,4 @@
-name: Queen (Hermes Agent + Ollama + Holesail)
+name: Queen (Hermes Agent Web UI + Ollama + Holesail)
 
 on:
   workflow_dispatch:
@@ -17,12 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Install system dependencies ----------
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl xz-utils nodejs npm
-          # xz-utils is required by the Hermes installer [reference:1]
       # ---------- Setup Ollama ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
@@ -33,33 +27,38 @@ jobs:
       # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
-          # Official Hermes installer [reference:2]
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
+      # ---------- Install Web UI dependencies ----------
+      - name: Install Hermes Web UI dependencies
+        run: |
+          export PATH="$HOME/.hermes/bin:$PATH"
+          cd ~/.hermes/hermes-agent
+          # Activate the virtual environment created by the installer
+          source venv/bin/activate
+          # Install the web and pty extras (needed for dashboard and chat)
+          uv pip install -e ".[web,pty]"
       # ---------- Install Holesail ----------
       - name: Install Holesail
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y nodejs npm
           sudo npm install -g holesail
-      # ---------- Create Hermes config ----------
+      # ---------- Configure Hermes (model provider) ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
-          cat > ~/.hermes/config.yaml << EOF
-          model:
-            provider: ollama
-            model: ${{ env.OLLAMA_MODEL }}
-            baseUrl: http://localhost:11434
-          gateway:
-            port: ${{ env.HERMES_PORT }}
-            host: 0.0.0.0
-          EOF
-          # For local Ollama, the provider can be set to "Custom Endpoint" with
-          # base URL http://localhost:11434/v1 and no API key [reference:3]
-      # ---------- Configure dashboard authentication ----------
-      - name: Configure Hermes authentication
+          export PATH="$HOME/.hermes/bin:$PATH"
+          # Set Ollama as the provider
+          hermes config set models.providers.ollama.baseUrl "http://localhost:11434"
+          hermes config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
+          hermes config set agents.default.model "ollama/granite4:tiny-h"
+          echo "✅ Configuration:"
+          hermes config show
+      # ---------- Configure authentication ----------
+      - name: Configure authentication
         run: |
-          # The dashboard requires auth when bound to non-loopback addresses [reference:4]
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
           cat > ~/.hermes/.env << EOF
@@ -68,51 +67,53 @@ jobs:
           HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-      # ---------- Install web + pty extras for dashboard ----------
-      - name: Install dashboard dependencies
+      # ---------- Start Ollama (if not already running) ----------
+      - name: Start Ollama if needed
         run: |
-          export PATH="$HOME/.hermes/bin:$PATH"
-          # The dashboard needs FastAPI/Uvicorn and ptyprocess [reference:5]
-          cd ~/.hermes/hermes-agent
-          uv pip install -e ".[web,pty]" || pip install -e ".[web,pty]"
-      # ---------- Start Ollama service ----------
-      - name: Start Ollama
-        run: ollama serve &
-
-      # ---------- Start Hermes Dashboard ----------
-      - name: Start Hermes Dashboard
+          if ! pgrep -x "ollama" > /dev/null; then
+            ollama serve &
+            sleep 5
+          else
+            echo "✅ Ollama already running"
+          fi
+      # ---------- Start Hermes Server (API + Web UI in one process) ----------
+      - name: Start Hermes Server
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
-          # --host 0.0.0.0 binds to all interfaces [reference:6]
-          # --no-open prevents browser from opening automatically [reference:7]
-          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
-          sleep 15
-          for i in {1..20}; do
-            if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
-              echo "✅ Dashboard ready"
+          # Use hermes serve with --web to serve both the API and the Web UI
+          # This ensures the Gateway is "On" and the provider is loaded.
+          hermes serve --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --web > server.log 2>&1 &
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
+          # Wait for the server to initialize
+          for i in {1..30}; do
+            if curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
+              echo "✅ Server is responding"
               break
             fi
-            echo "⏳ Waiting for dashboard... ($i/20)"
+            echo "⏳ Waiting for server... ($i/30)"
             sleep 2
           done
-      # ---------- Expose Dashboard via Holesail ----------
-      - name: Expose Dashboard with Holesail
+          if ! curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
+            echo "❌ Server not responding. Logs:"
+            cat server.log
+            exit 1
+          fi
+      # ---------- Expose via Holesail ----------
+      - name: Expose with Holesail
         id: holesail
         run: |
-          # Start Holesail server exposing port HERMES_PORT
-          # --public makes the key visible in logs for retrieval
           holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
           if [ -z "$CONNECTION_KEY" ]; then
-            echo "❌ Failed to get Holesail connection key"
+            echo "❌ Failed to get Holesail key"
             cat holesail.log
             exit 1
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
-          echo "✅ Holesail key: $CONNECTION_KEY"
-      # ---------- Print access instructions ----------
+      # ---------- Print access ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -121,20 +122,17 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To access the Hermes dashboard from your browser:"
-          echo ""
-          echo "   1. Install Holesail on your local machine:"
-          echo "      npm install -g holesail"
-          echo ""
-          echo "   2. Connect to the runner's Holesail server:"
-          echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
-          echo ""
-          echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
-          echo ""
           echo "🔐 Dashboard credentials:"
           echo "   Username: admin"
           echo "   Password: ${{ env.ADMIN_PASSWORD }}"
           echo ""
-          echo "💡 The connection is direct P2P - no lag, no relay servers!"
+          echo "🌐 To access the Hermes Web UI:"
+          echo "   1. Install Holesail: npm install -g holesail"
+          echo "   2. Connect: holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
+          echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
+          echo "   4. Log in with the credentials above."
+          echo ""
+          echo "💡 The server is now running with both the API and Web UI."
+          echo "   Gateway Status should show as 'On'."
           echo "================================================================="
           sleep infinity
