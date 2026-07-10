@@ -23,7 +23,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y curl xz-utils nodejs npm
           # xz-utils is required by the Hermes installer [reference:1]
-
       # ---------- Setup Ollama ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
@@ -38,12 +37,10 @@ jobs:
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
-
       # ---------- Install Holesail ----------
       - name: Install Holesail
         run: |
           sudo npm install -g holesail
-
       # ---------- Create Hermes config ----------
       - name: Configure Hermes
         run: |
@@ -59,7 +56,6 @@ jobs:
           EOF
           # For local Ollama, the provider can be set to "Custom Endpoint" with
           # base URL http://localhost:11434/v1 and no API key [reference:3]
-
       # ---------- Configure dashboard authentication ----------
       - name: Configure Hermes authentication
         run: |
@@ -72,7 +68,6 @@ jobs:
           HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-
       # ---------- Install web + pty extras for dashboard ----------
       - name: Install dashboard dependencies
         run: |
@@ -80,7 +75,6 @@ jobs:
           # The dashboard needs FastAPI/Uvicorn and ptyprocess [reference:5]
           cd ~/.hermes/hermes-agent
           uv pip install -e ".[web,pty]" || pip install -e ".[web,pty]"
-
       # ---------- Start Ollama service ----------
       - name: Start Ollama
         run: ollama serve &
@@ -102,7 +96,6 @@ jobs:
             echo "⏳ Waiting for dashboard... ($i/20)"
             sleep 2
           done
-
       # ---------- Expose Dashboard via Holesail ----------
       - name: Expose Dashboard with Holesail
         id: holesail
@@ -119,7 +112,6 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
           echo "✅ Holesail key: $CONNECTION_KEY"
-
       # ---------- Print access instructions ----------
       - name: Print access
         env:
