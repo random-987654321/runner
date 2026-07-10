@@ -1,4 +1,4 @@
-name: P2P Inference Mesh (Holesail)
+name: server
 
 on:
   workflow_dispatch:
@@ -31,10 +31,6 @@ jobs:
           fi
       
       - name: Start llama-server and Cloudflare tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
           echo "🌐 Starting llama-server"
           cd llama-b9940
@@ -85,22 +81,6 @@ jobs:
             tail -50 tunnel.log
             exit 1
           fi
-          CHAT_REPO="${{ github.repository_owner }}/chat"
-          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
-          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-          if [ "$SHA" != "null" ]; then
-            PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-              -d "$PAYLOAD"
-          fi
-          echo "::notice::Frontend URL: https://$CHAT_REPO"
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
   
