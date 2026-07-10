@@ -62,17 +62,20 @@ jobs:
       - name: Install Holesail
         run: sudo npm install -g holesail
 
-      - name: Configure Hermes (CLI)
+    # ---------- Configure Hermes for Ollama (with API key) ----------
+      - name: Configure Hermes
         run: |
-          export PATH="$HOME/.hermes/bin:$PATH"
-          hermes config set model.provider custom
-          hermes config set model.base_url "http://localhost:11434/v1"
-          hermes config set model.api_key "no-key-required"
-          hermes config set model.default "${{ env.OLLAMA_MODEL }}"
-          hermes config set model.context_length ${{ env.OLLAMA_NUM_CTX }}
-          hermes config set model.api_mode chat_completions
-          hermes config set gateway.port ${{ env.HERMES_PORT }}
-          hermes config set gateway.host 0.0.0.0
+          mkdir -p ~/.hermes
+          cat > ~/.hermes/config.yaml << EOF
+          model:
+            default: "${{ env.OLLAMA_MODEL }}"
+            provider: "custom"
+            base_url: "http://localhost:11434/v1"
+            api_key: "sk-no-key-required"
+          gateway:
+            port: ${{ env.HERMES_PORT }}
+            host: 0.0.0.0
+          EOF
 
       - name: Configure Hermes authentication
         run: |
