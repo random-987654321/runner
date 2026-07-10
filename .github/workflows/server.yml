@@ -5,6 +5,12 @@ on:
 
 env:
   OLLAMA_MODEL: granite4:tiny-h
+  OLLAMA_NUM_THREADS: 4
+  OLLAMA_NUM_CTX: 2048
+  OLLAMA_FLASH_ATTENTION: 1
+  OLLAMA_KV_CACHE_SIZE: 512
+  OLLAMA_NUMA: 1
+  OLLAMA_LLAMA_CPP_ARGS: "-t 4 -tb 4 -fa on -ctk q4_0 -ctv q4_0 --cpu-strict 1 --cpu-range 0-3 -c 2048"
   HERMES_PORT: 18789
 
 jobs:
@@ -14,26 +20,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl xz-utils nodejs npm util-linux
 
-      - name: Setup Ollama (with custom runner args)
+      - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
-        env:
-          OLLAMA_LLAMA_CPP_ARGS: "-t 4 -tb 4 -fa on -ctk q4_0 -ctv q4_0 --cpu-strict 1 --cpu-range 0-3 -c 2048"
-          OLLAMA_KV_CACHE_SIZE: 512
-          OLLAMA_NUMA: 1
-          OLLAMA_NUM_CTX: 2048
-          OLLAMA_NUM_THREADS: 4
-          OLLAMA_FLASH_ATTENTION: 1
 
-      - name: Lock memory & start Ollama with CPU affinity
+      - name: Start Ollama with CPU affinity and real‑time priority (using sudo)
         run: |
-          ulimit -l unlimited
-          taskset -c 0-3 chrt -r 99 ollama serve &
+          # Remove any previous ollama process
+          sudo pkill -f ollama || true
+          sleep 2
+          # Start ollama with CPU pinning and real‑time scheduling
+          sudo -E taskset -c 0-3 chrt -r 99 ollama serve &
           sleep 5
+          # Verify it's running
+          pgrep -f "ollama serve" || echo "⚠️ Ollama not running, but continuing"
 
       - name: Pull model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
@@ -42,6 +46,7 @@ jobs:
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.hermes/bin:$PATH"
 
       - name: Install Holesail
         run: sudo npm install -g holesail
@@ -53,12 +58,12 @@ jobs:
           hermes config set model.base_url "http://localhost:11434/v1"
           hermes config set model.api_key "no-key-required"
           hermes config set model.default "${{ env.OLLAMA_MODEL }}"
-          hermes config set model.context_length 2048
+          hermes config set model.context_length ${{ env.OLLAMA_NUM_CTX }}
           hermes config set model.api_mode chat_completions
           hermes config set gateway.port ${{ env.HERMES_PORT }}
           hermes config set gateway.host 0.0.0.0
 
-      - name: Configure dashboard auth
+      - name: Configure Hermes authentication
         run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
@@ -69,7 +74,7 @@ jobs:
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
-      - name: Install dashboard deps
+      - name: Install dashboard dependencies
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           cd ~/.hermes/hermes-agent
@@ -89,12 +94,17 @@ jobs:
             sleep 2
           done
 
-      - name: Expose via Holesail
+      - name: Expose Dashboard with Holesail
         id: holesail
         run: |
           holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
+          if [ -z "$CONNECTION_KEY" ]; then
+            echo "❌ Failed to get Holesail connection key"
+            cat holesail.log
+            exit 1
+          fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
       - name: Print access
@@ -104,6 +114,6 @@ jobs:
           echo "================================================================="
           echo "🔑 Holesail Key: $CONNECTION_KEY"
           echo "🔐 Username: admin | Password: ${{ env.ADMIN_PASSWORD }}"
-          echo "⚡ Optimizations applied: CPU affinity, real‑time priority, custom runner args, KV cache tuning."
+          echo "⚡ Optimizations applied: CPU affinity, real‑time priority, custom runner args."
           echo "================================================================="
           sleep infinity
