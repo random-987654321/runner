@@ -10,6 +10,7 @@ env:
   MODEL_URL: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
   HERMES_PORT: 18789
   LLAMA_PORT: 8080
+  MODEL_NAME: "granite-4.0-h-tiny"   # Used in Hermes config
 
 jobs:
   queen:
@@ -43,15 +44,20 @@ jobs:
       - name: Install Holesail
         run: sudo npm install -g holesail
 
-      - name: Configure Hermes
+      - name: Configure Hermes (llama.cpp provider)
         run: |
           mkdir -p ~/.hermes
           cat > ~/.hermes/config.yaml << EOF
           model:
-            default: "granite"
-            provider: "custom"
-            base_url: "http://localhost:${{ env.LLAMA_PORT }}/v1"
-            api_key: "sk-no-key-required"
+            provider: custom
+            default: ${{ env.MODEL_NAME }}
+            base_url: http://localhost:${{ env.LLAMA_PORT }}/v1
+            api_key: llama.cpp
+            api_mode: chat_completions
+          auxiliary:
+            session_search:
+              base_url: http://localhost:${{ env.LLAMA_PORT }}/v1
+              api_mode: embeddings
           gateway:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
@@ -106,16 +112,13 @@ jobs:
           set -a; source ~/.hermes/.env; set +a
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
           sleep 15
-          # Check both HTTP and WebSocket endpoints
           for i in {1..20}; do
             if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
-              echo "✅ HTTP API ready"
+              echo "✅ Dashboard ready"
               break
             fi
             sleep 2
           done
-          # WebSocket endpoint is typically /ws – test with a simple curl upgrade (not always possible)
-          # Just log that we're ready.
 
       - name: Expose Dashboard with Holesail
         id: holesail
@@ -133,6 +136,10 @@ jobs:
           echo "🔑 Holesail Key: $CONNECTION_KEY"
           echo "🌐 Connect: holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
           echo "🔐 Username: admin | Password: ${{ env.ADMIN_PASSWORD }}"
-          echo "⚡ llama.cpp is serving the model at http://localhost:${{ env.LLAMA_PORT }}/v1"
+          echo "⚡ llama.cpp serving model '${{ env.MODEL_NAME }}' at http://localhost:${{ env.LLAMA_PORT }}/v1"
+          echo "💡 Hermes Agent is configured with:"
+          echo "   - provider: custom"
+          echo "   - api_key: llama.cpp"
+          echo "   - api_mode: chat_completions"
           echo "================================================================="
           sleep infinity
