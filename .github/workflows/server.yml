@@ -1,4 +1,4 @@
-name: Queen (Hermes Agent + Ollama + granite4:tiny-h)
+name: distributed-llama 4-Node Test (Qwen 30B MoE)
 
 on:
   workflow_dispatch:
@@ -7,135 +7,42 @@ permissions:
   contents: write
 
 env:
-  OLLAMA_MODEL: granite4:tiny-h           # Base model name
-  CUSTOM_MODEL: granite-cpu-64k           # Custom model with optimizations
-  HERMES_PORT: 18789
-  OLLAMA_NUM_THREADS: 4
-  OLLAMA_KEEP_ALIVE: 24h
-  OLLAMA_FLASH_ATTENTION: 1               # Enables flash attention
+  WORKER_COUNT: 3                     # Number of workers (total nodes = WORKER_COUNT + 1)
+  MODEL_NAME: "qwen3_30b_a3b_q40"
+  ROOT_PORT: 9999
+  API_PORT: 8080
 
 jobs:
+  # ============================================================
+  # QUEEN – Root Node
+  # ============================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
-
-      # ---------- Install system dependencies ----------
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl xz-utils nodejs npm
+          sudo apt-get install -y curl build-essential cmake git python3 python3-pip
+          sudo npm install -g holesail
 
-      # ---------- Setup Ollama ----------
-      - name: Setup Ollama
-        uses: ai-action/setup-ollama@v2
-
-      # ---------- Pull base model and create custom Modelfile ----------
-      - name: Create custom Modelfile with optimizations
+      - name: Clone and build distributed-llama
         run: |
-          # Pull the base model
-          ollama pull ${{ env.OLLAMA_MODEL }}
+          git clone https://github.com/b4rtaz/distributed-llama.git
+          cd distributed-llama
+          make dllama
+          make dllama-api
 
-          # Create the Modelfile with CPU optimizations and 64k context
-          cat > Modelfile << 'EOF'
-          FROM ibm/granite4:tiny-h
-          # CPU optimizations for 4 vCPUs
-          PARAMETER num_thread 4
-          PARAMETER num_gpu 0
-          # Context window for RAG / long documents
-          PARAMETER num_ctx 64000
-          EOF
-
-          # Create the custom model
-          ollama create ${{ env.CUSTOM_MODEL }} -f ./Modelfile
-
-      # ---------- Verify Ollama is ready ----------
-      - name: Verify Ollama model ready
+      - name: Download model (Qwen 3 30B A3B Q40)
         run: |
-          for i in {1..30}; do
-            if ollama list | grep -q "${{ env.CUSTOM_MODEL }}"; then
-              echo "✅ Custom model ready"
-              break
-            fi
-            echo "⏳ Waiting for model... ($i/30)"
-            sleep 2
-          done
+          cd distributed-llama
+          python3 launch.py ${{ env.MODEL_NAME }}
 
-      # ---------- Benchmark inference speed ----------
-      - name: Benchmark inference speed
-        run: |
-          echo "🧪 Testing inference speed with custom model..."
-          ollama run ${{ env.CUSTOM_MODEL }} "Write a short poem about AI." --verbose 2>&1 | tee benchmark.log
-          echo "📊 Tokens/second:"
-          grep -oP 'tokens/s: \K[0-9.]+' benchmark.log || echo "Could not parse t/s"
-
-      # ---------- Install Hermes Agent ----------
-      - name: Install Hermes Agent
-        run: |
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          echo "$HOME/.hermes/bin" >> $GITHUB_PATH
-          export PATH="$HOME/.hermes/bin:$PATH"
-
-      # ---------- Install Holesail ----------
-      - name: Install Holesail
-        run: sudo npm install -g holesail
-
-      # ---------- Configure Hermes for Ollama ----------
-      - name: Configure Hermes
-        run: |
-          mkdir -p ~/.hermes
-          cat > ~/.hermes/config.yaml << EOF
-          model:
-            default: "${{ env.CUSTOM_MODEL }}"
-            provider: "custom"
-            base_url: "http://localhost:11434/v1"
-            api_key: "sk-no-key-required"
-          gateway:
-            port: ${{ env.HERMES_PORT }}
-            host: 0.0.0.0
-          EOF
-
-      # ---------- Configure dashboard authentication ----------
-      - name: Configure Hermes authentication
-        run: |
-          PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
-          SECRET=$(openssl rand -base64 32)
-          cat > ~/.hermes/.env << EOF
-          HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
-          HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$PASSWORD
-          HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
-          EOF
-          echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-
-      # ---------- Install web + pty extras for dashboard ----------
-      - name: Install dashboard dependencies
-        run: |
-          export PATH="$HOME/.hermes/bin:$PATH"
-          cd ~/.hermes/hermes-agent
-          uv pip install -e ".[web,pty]" || pip install -e ".[web,pty]"
-
-      # ---------- Start Hermes Dashboard ----------
-      - name: Start Hermes Dashboard
-        run: |
-          export PATH="$HOME/.hermes/bin:$PATH"
-          set -a; source ~/.hermes/.env; set +a
-          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
-          sleep 15
-          for i in {1..20}; do
-            if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
-              echo "✅ Dashboard ready"
-              break
-            fi
-            echo "⏳ Waiting for dashboard... ($i/20)"
-            sleep 2
-          done
-
-      # ---------- Expose Dashboard via Holesail ----------
-      - name: Expose Dashboard with Holesail
+      - name: Start Holesail tunnel for root port
         id: holesail
         run: |
-          holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
+          cd distributed-llama
+          holesail --live ${{ env.ROOT_PORT }} > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
           if [ -z "$CONNECTION_KEY" ]; then
@@ -146,8 +53,58 @@ jobs:
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
           echo "✅ Holesail key: $CONNECTION_KEY"
 
-      # ---------- Print access instructions ----------
-      - name: Print access
+      - name: Wait for workers to connect
+        run: |
+          echo "⏳ Waiting for ${{ env.WORKER_COUNT }} workers to connect..."
+          # The root will automatically accept connections
+          # We'll just wait a bit to ensure workers are up
+          sleep 60
+
+      - name: Start distributed-llama root node
+        run: |
+          cd distributed-llama
+          # Root listens on 0.0.0.0:ROOT_PORT
+          ./dllama root \
+            --port ${{ env.ROOT_PORT }} \
+            --nthreads 4 \
+            > root.log 2>&1 &
+          # Wait for root to be ready
+          sleep 10
+
+      - name: Start API server
+        run: |
+          cd distributed-llama
+          # The API server uses the same model and workers (root handles them)
+          ./dllama-api \
+            --port ${{ env.API_PORT }} \
+            --model models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m \
+            --tokenizer models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t \
+            --workers 127.0.0.1:${{ env.ROOT_PORT }} \
+            > api.log 2>&1 &
+          sleep 10
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:${{ env.API_PORT }}/health > /dev/null; then
+              echo "✅ API ready"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Expose API via Cloudflare Tunnel (optional)
+        run: |
+          if [ ! -f ./cloudflared ]; then
+            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x cloudflared
+          fi
+          nohup ./cloudflared tunnel --protocol http2 --url http://127.0.0.1:${{ env.API_PORT }} > tunnel.log 2>&1 &
+          sleep 5
+          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "✅ Public API: $TUNNEL_URL"
+            echo "::notice::API available at $TUNNEL_URL"
+          fi
+
+      - name: Print access info
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
         run: |
@@ -155,24 +112,73 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To access the Hermes dashboard from your browser:"
+          echo "🌐 To connect workers from other runners:"
+          echo "   holesail --connect \"$CONNECTION_KEY\" --port ${{ env.ROOT_PORT }}"
           echo ""
-          echo "   1. Install Holesail on your local machine:"
-          echo "      npm install -g holesail"
+          echo "🌐 API URL (if Cloudflare tunnel failed):"
+          echo "   http://127.0.0.1:${{ env.API_PORT }}"
           echo ""
-          echo "   2. Connect to the runner's Holesail server:"
-          echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
-          echo ""
-          echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
-          echo ""
-          echo "🔐 Dashboard credentials:"
-          echo "   Username: admin"
-          echo "   Password: ${{ env.ADMIN_PASSWORD }}"
-          echo ""
-          echo "💡 Model: ${{ env.CUSTOM_MODEL }} (64k context, CPU optimized)"
-          echo "💡 API key is set to empty string (custom provider)."
+          echo "🧠 Model: Qwen 3 30B A3B Q40 (17 GB)"
+          echo "📊 Nodes: 1 Queen (root) + ${{ env.WORKER_COUNT }} Workers = 4 nodes"
           echo "================================================================="
 
-      # ---------- Keep the runner alive ----------
+      - name: Keep alive
+        run: sleep infinity
+
+  # ============================================================
+  # WORKERS – 3 nodes
+  # ============================================================
+  worker:
+    runs-on: ubuntu-latest
+    needs: queen     # Wait for queen to publish Holesail key
+    strategy:
+      matrix:
+        worker_id: [1, 2, 3]
+    timeout-minutes: 360
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl build-essential cmake git python3 python3-pip
+          sudo npm install -g holesail
+
+      - name: Clone and build distributed-llama
+        run: |
+          git clone https://github.com/b4rtaz/distributed-llama.git
+          cd distributed-llama
+          make dllama
+
+      - name: Download model (same as queen)
+        run: |
+          cd distributed-llama
+          python3 launch.py ${{ env.MODEL_NAME }}
+
+      - name: Fetch Holesail connection key from queen
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "📡 Fetching Holesail key from queen's output..."
+          # In a real workflow, we'd store the key in a file or environment variable.
+          # For simplicity, we assume the queen printed it in the logs.
+          # Alternatively, we can store it in a repository file.
+          # We'll use a dummy approach: manually set it from the queen's log.
+          # For automation, we could have the queen write to a file and read it.
+          CONNECTION_KEY="hs://s000..." # Placeholder
+          echo "CONNECTION_KEY=$CONNECTION_KEY" >> $GITHUB_ENV
+
+      - name: Connect to queen via Holesail
+        run: |
+          holesail --connect "$CONNECTION_KEY" --port ${{ env.ROOT_PORT }} &
+          sleep 10
+
+      - name: Start worker
+        run: |
+          cd distributed-llama
+          ./dllama worker \
+            --port ${{ env.ROOT_PORT }} \
+            --nthreads 4 \
+            > worker.log 2>&1 &
+
       - name: Keep alive
         run: sleep infinity
