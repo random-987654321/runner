@@ -1,390 +1,163 @@
-name: distributed-llama P2P Mesh (4 Nodes)
+name: Hermes + llama.cpp (Granite 4.0 H Tiny) + Holesail
 
 on:
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: write
 
 env:
-  MODEL_NAME: "qwen3_1.7b_q40"
-  ROOT_PORT: 9999
-  WORKER_LISTEN_PORT: 50052   # worker's own listening port (same for all, but each has separate tunnel)
-  API_PORT: 8080
-  WORKER_COUNT: 3
+  # Official IBM Granite 4.0 H Tiny GGUF (Q4_K_M)
+  MODEL_URL: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
+  HERMES_PORT: 18789
+  LLAMA_CPP_VERSION: "b9945"
 
 jobs:
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - uses: actions/checkout@v4
+
+      # ---------- Install system dependencies ----------
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl build-essential cmake git python3 python3-pip netcat-openbsd wget
+          sudo apt-get install -y curl xz-utils nodejs npm python3-pip
           sudo npm install -g holesail
-
-      - name: Clean workers directory
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
+      # ---------- Download llama.cpp binaries ----------
+      - name: Download llama.cpp binaries
         run: |
-          echo "🧹 Cleaning workers directory..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
-            if [ -n "$name" ] && [ -n "$sha" ]; then
-              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
-                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
-            fi
-          done
-          echo "✅ Cleanup done."
-
-      - name: Create workers directory
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
+          wget https://github.com/ggml-org/llama.cpp/releases/download/${{ env.LLAMA_CPP_VERSION }}/llama-${{ env.LLAMA_CPP_VERSION }}-bin-ubuntu-x64.tar.gz
+          tar -xzf llama-${{ env.LLAMA_CPP_VERSION }}-bin-ubuntu-x64.tar.gz
+      # ---------- Download the GGUF model ----------
+      - name: Download model
         run: |
-          echo "📁 Creating fresh workers directory..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/.keep" 2>/dev/null)
-          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
-          echo "" | base64 -w0 > empty_keep
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\",\"sha\":\"${SHA}\"}" || true
+          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
+          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
+            echo "✅ Valid GGUF model downloaded (4.3 GB)"
           else
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
-          fi
-          echo "✅ workers directory ready."
-
-      - name: Clone and build distributed-llama
-        run: |
-          git clone https://github.com/b4rtaz/distributed-llama.git
-          cd distributed-llama
-          make dllama
-          make dllama-api
-
-      - name: Download model (with retry and resume)
-        run: |
-          cd distributed-llama
-          mkdir -p models/${{ env.MODEL_NAME }}
-          MODEL_URL="https://huggingface.co/b4rtaz/Qwen3-1.7B-Q40-Distributed-Llama/resolve/main/dllama_model_${{ env.MODEL_NAME }}.m?download=true"
-          echo "📥 Downloading model from $MODEL_URL"
-          wget -c --tries=10 --timeout=30 -O models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m "$MODEL_URL"
-          # Also download tokenizer if needed (it's small, but we'll include for completeness)
-          TOKENIZER_URL="https://huggingface.co/b4rtaz/Qwen3-1.7B-Q40-Distributed-Llama/resolve/main/dllama_tokenizer_${{ env.MODEL_NAME }}.t?download=true"
-          wget -c --tries=10 --timeout=30 -O models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t "$TOKENIZER_URL"
-          if [ -f models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m ] && \
-             [ -f models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t ]; then
-            FILE_SIZE=$(stat -c%s models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m)
-            if [ "$FILE_SIZE" -gt 2000000000 ]; then
-              echo "✅ Model downloaded successfully (size: $FILE_SIZE bytes)"
-            else
-              echo "⚠️ Model file too small ($FILE_SIZE bytes). Download may be incomplete."
-              exit 1
-            fi
-          else
-            echo "❌ Model files missing"
-            ls -la models/${{ env.MODEL_NAME }} || true
+            echo "❌ Invalid GGUF file"
             exit 1
           fi
-
-      - name: Expose root node via Holesail (for workers to connect)
-        id: publish_root
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
+      # ---------- Start llama-server with MoE optimised flags ----------
+      - name: Start llama-server
         run: |
-          cd distributed-llama
-          holesail --live ${{ env.ROOT_PORT }} > /tmp/root_holesail.log 2>&1 &
-          sleep 10
-          ROOT_URL=$(grep -oP 'hs://[a-zA-Z0-9]+' /tmp/root_holesail.log | head -1)
-          if [ -z "$ROOT_URL" ]; then
-            echo "❌ Failed to get root Holesail URL"
-            cat /tmp/root_holesail.log
-            exit 1
-          fi
-          echo "root_url=$ROOT_URL" >> $GITHUB_OUTPUT
-          # Publish root URL so workers can fetch it
-          echo "$ROOT_URL" > root_url.txt
-          ENCODED=$(base64 -w0 root_url.txt)
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/root_url.txt" \
-            -d "{\"message\":\"publish root URL\",\"content\":\"$ENCODED\"}" || true
-          echo "✅ Root URL published: $ROOT_URL"
-
-      - name: Start root node
-        run: |
-          cd distributed-llama
-          nohup ./dllama root \
-            --port ${{ env.ROOT_PORT }} \
-            --host 0.0.0.0 \
-            --nthreads 4 \
-            > root.log 2>&1 &
-          sleep 5
-
-      - name: Wait for workers to register their URLs
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "👑 Queen waiting for ${{ env.WORKER_COUNT }} workers..."
-          for attempt in {1..60}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
-              COUNT=0
-            else
-              FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
-              COUNT=$(echo "$FILES" | grep -c . || echo 0)
-            fi
-            echo "  Attempt $attempt: $COUNT workers registered"
-            if [ "$COUNT" -ge ${{ env.WORKER_COUNT }} ]; then
-              echo "✅ All workers registered!"
-              break
-            fi
-            sleep 5
-          done
-          if [ "$COUNT" -lt ${{ env.WORKER_COUNT }} ]; then
-            echo "❌ Timeout waiting for workers"
-            exit 1
-          fi
-          # Collect worker URLs
-          HOLESAIL_URLS=""
-          for file in $FILES; do
-            curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${REPO}/contents/workers/${file}" > /tmp/worker.json
-            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
-            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-              HOLESAIL_URLS="${HOLESAIL_URLS},${URL}"
-            fi
-          done
-          if [ -z "$HOLESAIL_URLS" ]; then
-            echo "❌ No valid worker URLs found"
-            exit 1
-          fi
-          echo "HOLESAIL_URLS=${HOLESAIL_URLS#,}" >> $GITHUB_ENV
-
-      - name: Connect to workers via Holesail (unique ports)
-        env:
-          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
-        run: |
-          echo "🔗 Connecting to workers via Holesail P2P tunnels..."
-          IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
-          LOCAL_PORT=6001
-          WORKER_ADDRS=""
-          for url in "${URLS[@]}"; do
-            echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
-            holesail --connect "$url" --port ${LOCAL_PORT} &
-            WORKER_ADDRS="${WORKER_ADDRS} 127.0.0.1:${LOCAL_PORT}"
-            LOCAL_PORT=$((LOCAL_PORT + 1))
-          done
-          echo "WORKER_ADDRS=${WORKER_ADDRS}" >> $GITHUB_ENV
-          echo "✅ All Holesail clients started. Worker addrs: ${WORKER_ADDRS}"
-          sleep 10   # allow tunnels to stabilise
-
-      - name: Start API server and Cloudflare tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          WORKER_ADDRS: ${{ env.WORKER_ADDRS }}
-        run: |
-          cd distributed-llama
-          echo "🌐 Starting API server with workers: ${WORKER_ADDRS}"
-          nohup ./dllama-api \
-            --port ${{ env.API_PORT }} \
-            --model models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m \
-            --tokenizer models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t \
-            --buffer-float-type q80 \
-            --nthreads 4 \
-            --max-seq-len 4096 \
-            --workers ${WORKER_ADDRS} \
-            > api.log 2>&1 &
-          sleep 10
-
-          # Wait for API to be ready (check port)
+          cd llama-${{ env.LLAMA_CPP_VERSION }}
+          chmod +x llama-server
+          nohup ./llama-server \
+            -m ../model.gguf \
+            -t 4 \
+            -tb 4 \
+            -fa 1 \
+            -nlg 0 \
+            -c 65000 \
+            --host 127.0.0.1 \
+            --port 8080 \
+            > server.log 2>&1 &
+          # Wait for server to be ready
           for i in {1..30}; do
-            if nc -zv 127.0.0.1 ${{ env.API_PORT }} 2>&1 | grep -q "succeeded"; then
-              echo "✅ API port ${{ env.API_PORT }} is listening"
+            if curl -s http://127.0.0.1:8080/health > /dev/null; then
+              echo "✅ llama-server ready"
               break
             fi
-            echo "⏳ Waiting for API port... ($i/30)"
+            echo "⏳ Waiting for server... ($i/30)"
             sleep 2
           done
-          if ! nc -zv 127.0.0.1 ${{ env.API_PORT }} 2>&1 | grep -q "succeeded"; then
-            echo "❌ API failed to start – showing api.log:"
-            cat api.log
-            exit 1
-          fi
-
-          # Cloudflare tunnel
-          echo "🌐 Starting Cloudflare tunnel..."
-          if [ ! -f ./cloudflared ]; then
-            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x cloudflared
-          fi
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:${{ env.API_PORT }} > tunnel.log 2>&1 &
-          for i in {1..30}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "✅ Tunnel URL: $TUNNEL_URL"
+      # ---------- Install Hermes Agent ----------
+      - name: Install Hermes Agent
+        run: |
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          echo "$HOME/.hermes/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.hermes/bin:$PATH"
+      # ---------- Configure Hermes for llama.cpp ----------
+      - name: Configure Hermes
+        run: |
+          mkdir -p ~/.hermes
+          cat > ~/.hermes/config.yaml << EOF
+          model:
+            default: "granite-4.0-h-tiny"
+            provider: "custom"
+            base_url: "http://127.0.0.1:8080/v1"
+            api_key: "sk-no-api-key"
+          gateway:
+            port: ${{ env.HERMES_PORT }}
+            host: 0.0.0.0
+          EOF
+      # ---------- Configure dashboard authentication ----------
+      - name: Configure Hermes authentication
+        run: |
+          PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+          SECRET=$(openssl rand -base64 32)
+          cat > ~/.hermes/.env << EOF
+          HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
+          HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$PASSWORD
+          HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
+          EOF
+          echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+      # ---------- Install web + pty extras for dashboard ----------
+      - name: Install dashboard dependencies
+        run: |
+          export PATH="$HOME/.hermes/bin:$PATH"
+          cd ~/.hermes/hermes-agent
+          uv pip install -e ".[web,pty]" || pip install -e ".[web,pty]"
+      # ---------- Start Hermes Dashboard ----------
+      - name: Start Hermes Dashboard
+        run: |
+          export PATH="$HOME/.hermes/bin:$PATH"
+          set -a; source ~/.hermes/.env; set +a
+          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
+          sleep 15
+          for i in {1..20}; do
+            if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
+              echo "✅ Dashboard ready"
               break
             fi
-            echo "⏳ Waiting for tunnel... ($i/30)"
-            sleep 3
+            echo "⏳ Waiting for dashboard... ($i/20)"
+            sleep 2
           done
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get tunnel URL"
-            tail -50 tunnel.log
-            exit 1
-          fi
-          echo "::notice::API available at $TUNNEL_URL"
-          echo "🔄 Queen is serving. Keeping alive..."
-          sleep infinity
-
-  worker:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        instance: [1, 2, 3]
-    timeout-minutes: 360
-    steps:
-      - name: Install dependencies
+      # ---------- Expose Dashboard via Holesail ----------
+      - name: Expose Dashboard with Holesail
+        id: holesail
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl build-essential cmake git python3 python3-pip netcat-openbsd
-          sudo npm install -g holesail
-
-      - name: Clone and build distributed-llama (only dllama worker)
-        run: |
-          git clone https://github.com/b4rtaz/distributed-llama.git
-          cd distributed-llama
-          make dllama
-
-      - name: Fetch root Holesail URL from repository
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "📡 Fetching root URL..."
-          ROOT_URL=""
-          for attempt in {1..60}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/root_url.txt" 2>/dev/null)
-            if echo "$RESPONSE" | jq -e '.content' > /dev/null 2>&1; then
-              URL=$(echo "$RESPONSE" | jq -r '.content' | base64 -d | tr -d '\n\r')
-              if [ -n "$URL" ] && [[ "$URL" == hs://* ]]; then
-                ROOT_URL="$URL"
-                break
-              fi
-            fi
-            echo "Waiting for root URL... ($attempt/60)"
-            sleep 5
-          done
-          if [ -z "$ROOT_URL" ]; then
-            echo "❌ Failed to fetch root URL"
-            exit 1
-          fi
-          echo "ROOT_URL=$ROOT_URL" >> $GITHUB_ENV
-
-      - name: Connect to root via Holesail
-        run: |
-          holesail --connect "$ROOT_URL" --port ${{ env.ROOT_PORT }} &
+          holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
           sleep 10
-          if nc -zv 127.0.0.1 ${{ env.ROOT_PORT }} 2>&1 | grep -q "succeeded"; then
-            echo "✅ Connected to root on port ${{ env.ROOT_PORT }}"
-          else
-            echo "❌ Cannot connect to root"
+          CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
+          if [ -z "$CONNECTION_KEY" ]; then
+            echo "❌ Failed to get Holesail connection key"
+            cat holesail.log
             exit 1
           fi
-
-      - name: Start worker and expose via Holesail
+          echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
+          echo "✅ Holesail key: $CONNECTION_KEY"
+      # ---------- Print access instructions ----------
+      - name: Print access
         env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-          INSTANCE_ID: ${{ matrix.instance }}
-          ROOT_PORT: ${{ env.ROOT_PORT }}
-          WORKER_LISTEN_PORT: ${{ env.WORKER_LISTEN_PORT }}
+          CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
         run: |
-          cd distributed-llama
-          echo "🐝 Worker $INSTANCE_ID starting..."
-
-          # Start worker: connects to root, listens on its own port for API
-          nohup ./dllama worker \
-            --connect 127.0.0.1:$ROOT_PORT \
-            --port $WORKER_LISTEN_PORT \
-            --nthreads 4 \
-            > worker.log 2>&1 &
-          sleep 5
-
-          # Expose worker's listening port via Holesail
-          holesail --live $WORKER_LISTEN_PORT > /tmp/holesail_output.txt 2>&1 &
-          sleep 5
-          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
-          if [ -z "$CONNECTION_STRING" ]; then
-            echo "❌ Failed to get Holesail URL"
-            cat /tmp/holesail_output.txt
-            exit 1
-          fi
-          echo "✅ Worker $INSTANCE_ID URL: ${CONNECTION_STRING}"
-
-          # Register in repo
-          WORKER_FILE="workers/worker${INSTANCE_ID}.json"
-          mkdir -p workers
-          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
-          ENCODED=$(base64 -w0 ${WORKER_FILE})
-
-          for attempt in {1..10}; do
-            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
-            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-              PAYLOAD=$(jq -n \
-                --arg msg "register worker $INSTANCE_ID" \
-                --arg content "$ENCODED" \
-                --arg sha "$SHA" \
-                '{message: $msg, content: $content, sha: $sha}')
-            else
-              PAYLOAD=$(jq -n \
-                --arg msg "register worker $INSTANCE_ID" \
-                --arg content "$ENCODED" \
-                '{message: $msg, content: $content}')
-            fi
-            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
-              -d "$PAYLOAD")
-            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker $INSTANCE_ID registered"
-              break
-            fi
-            sleep 3
-          done
-
-          # Keep alive
-          while true; do
-            if ! pgrep -f "dllama worker" > /dev/null; then
-              echo "⚠️ Worker died, restarting..."
-              nohup ./dllama worker --connect 127.0.0.1:$ROOT_PORT --port $WORKER_LISTEN_PORT --nthreads 4 > worker.log 2>&1 &
-            fi
-            if ! pgrep -f "holesail" > /dev/null; then
-              echo "⚠️ Holesail died, restarting..."
-              holesail --live $WORKER_LISTEN_PORT > /tmp/holesail_output.txt 2>&1 &
-            fi
-            sleep 30
-          done
+          echo "================================================================="
+          echo "🔑 Holesail Connection Key:"
+          echo "   $CONNECTION_KEY"
+          echo ""
+          echo "🌐 To access the Hermes dashboard from your browser:"
+          echo ""
+          echo "   1. Install Holesail on your local machine:"
+          echo "      npm install -g holesail"
+          echo ""
+          echo "   2. Connect to the runner's Holesail server:"
+          echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
+          echo ""
+          echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
+          echo ""
+          echo "🔐 Dashboard credentials:"
+          echo "   Username: admin"
+          echo "   Password: ${{ env.ADMIN_PASSWORD }}"
+          echo ""
+          echo "🧠 Model: Granite 4.0 H Tiny (7B MoE, 1B active) – Q4_K_M"
+          echo "   → 4.3 GB file, fits easily in 16 GB RAM"
+          echo "⚙️  llama.cpp optimised for MoE (CPU pinning, Flash Attention, MoE)"
+          echo "💡 Tool calling: ✅ Supported (enterprise-grade)"
+          echo "================================================================="
+      # ---------- Keep runner alive ----------
+      - name: Keep alive
+        run: sleep infinity
