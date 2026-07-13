@@ -9,20 +9,20 @@ permissions:
 
 env:
   MODEL_NAME: "qwen3_1.7b_q40"
-  ROOT_PORT: 9999        # root listens for workers
-  WORKER_PORT: 50052     # each worker's internal service port
-  API_PORT: 8080         # API server port
-  WORKER_COUNT: 3        # number of workers
+  ROOT_PORT: 9999
+  WORKER_LISTEN_PORT: 50052   # worker's own listening port (same for all, but each has separate tunnel)
+  API_PORT: 8080
+  WORKER_COUNT: 3
 
 jobs:
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl build-essential cmake git python3 python3-pip netcat-openbsd
+          sudo apt-get install -y curl build-essential cmake git python3 python3-pip netcat-openbsd wget
           sudo npm install -g holesail
 
       - name: Clean workers directory
@@ -75,13 +75,25 @@ jobs:
           make dllama
           make dllama-api
 
-      - name: Download model (only on queen)
+      - name: Download model (with retry and resume)
         run: |
           cd distributed-llama
-          echo "y" | python3 launch.py ${{ env.MODEL_NAME }}
+          mkdir -p models/${{ env.MODEL_NAME }}
+          MODEL_URL="https://huggingface.co/b4rtaz/Qwen3-1.7B-Q40-Distributed-Llama/resolve/main/dllama_model_${{ env.MODEL_NAME }}.m?download=true"
+          echo "📥 Downloading model from $MODEL_URL"
+          wget -c --tries=10 --timeout=30 -O models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m "$MODEL_URL"
+          # Also download tokenizer if needed (it's small, but we'll include for completeness)
+          TOKENIZER_URL="https://huggingface.co/b4rtaz/Qwen3-1.7B-Q40-Distributed-Llama/resolve/main/dllama_tokenizer_${{ env.MODEL_NAME }}.t?download=true"
+          wget -c --tries=10 --timeout=30 -O models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t "$TOKENIZER_URL"
           if [ -f models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m ] && \
              [ -f models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t ]; then
-            echo "✅ Model files downloaded"
+            FILE_SIZE=$(stat -c%s models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m)
+            if [ "$FILE_SIZE" -gt 2000000000 ]; then
+              echo "✅ Model downloaded successfully (size: $FILE_SIZE bytes)"
+            else
+              echo "⚠️ Model file too small ($FILE_SIZE bytes). Download may be incomplete."
+              exit 1
+            fi
           else
             echo "❌ Model files missing"
             ls -la models/${{ env.MODEL_NAME }} || true
@@ -300,24 +312,27 @@ jobs:
             exit 1
           fi
 
-      - name: Start dllama worker and expose via Holesail
+      - name: Start worker and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           INSTANCE_ID: ${{ matrix.instance }}
+          ROOT_PORT: ${{ env.ROOT_PORT }}
+          WORKER_LISTEN_PORT: ${{ env.WORKER_LISTEN_PORT }}
         run: |
           cd distributed-llama
           echo "🐝 Worker $INSTANCE_ID starting..."
-          # Start worker (listens on WORKER_PORT)
+
+          # Start worker: connects to root, listens on its own port for API
           nohup ./dllama worker \
-            --host 0.0.0.0 \
-            --port ${{ env.WORKER_PORT }} \
+            --connect 127.0.0.1:$ROOT_PORT \
+            --port $WORKER_LISTEN_PORT \
             --nthreads 4 \
             > worker.log 2>&1 &
           sleep 5
 
-          # Expose worker port via Holesail
-          holesail --live ${{ env.WORKER_PORT }} > /tmp/holesail_output.txt 2>&1 &
+          # Expose worker's listening port via Holesail
+          holesail --live $WORKER_LISTEN_PORT > /tmp/holesail_output.txt 2>&1 &
           sleep 5
           CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
           if [ -z "$CONNECTION_STRING" ]; then
@@ -325,7 +340,7 @@ jobs:
             cat /tmp/holesail_output.txt
             exit 1
           fi
-          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
+          echo "✅ Worker $INSTANCE_ID URL: ${CONNECTION_STRING}"
 
           # Register in repo
           WORKER_FILE="workers/worker${INSTANCE_ID}.json"
@@ -355,21 +370,21 @@ jobs:
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
               -d "$PAYLOAD")
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker $INSTANCE_ID registered successfully!"
+              echo "✅ Worker $INSTANCE_ID registered"
               break
             fi
             sleep 3
           done
 
-          # Keep worker alive (restart if needed)
+          # Keep alive
           while true; do
             if ! pgrep -f "dllama worker" > /dev/null; then
               echo "⚠️ Worker died, restarting..."
-              nohup ./dllama worker --host 0.0.0.0 --port ${{ env.WORKER_PORT }} --nthreads 4 > worker.log 2>&1 &
+              nohup ./dllama worker --connect 127.0.0.1:$ROOT_PORT --port $WORKER_LISTEN_PORT --nthreads 4 > worker.log 2>&1 &
             fi
             if ! pgrep -f "holesail" > /dev/null; then
               echo "⚠️ Holesail died, restarting..."
-              holesail --live ${{ env.WORKER_PORT }} > /tmp/holesail_output.txt 2>&1 &
+              holesail --live $WORKER_LISTEN_PORT > /tmp/holesail_output.txt 2>&1 &
             fi
             sleep 30
           done
