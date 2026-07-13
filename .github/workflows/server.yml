@@ -32,7 +32,7 @@ jobs:
 
       - name: Start llama-server
         run: |
-          cd llama-b9945-bin-ubuntu-x64
+          cd llama-b9945
           nohup ./llama-server \
             -m ../model.gguf \
             -t 4 -tb 4 -fa -ngl 0 -c 4096 \
