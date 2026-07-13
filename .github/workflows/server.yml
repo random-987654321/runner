@@ -13,9 +13,6 @@ env:
   WORKER_COUNT: 3
 
 jobs:
-  # ============================================================
-  # QUEEN – Root Node + API server
-  # ============================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -36,7 +33,16 @@ jobs:
       - name: Download model (Qwen 3 1.7B Q40 – 2.2 GB)
         run: |
           cd distributed-llama
-          python3 launch.py ${{ env.MODEL_NAME }}
+          # Answer 'n' to skip interactive prompt
+          echo "n" | python3 launch.py ${{ env.MODEL_NAME }}
+          # Verify files exist
+          if [ -f models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m ] && \
+             [ -f models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t ]; then
+            echo "✅ Model files downloaded"
+          else
+            echo "❌ Model files missing"
+            exit 1
+          fi
 
       - name: Start Holesail tunnel and publish key
         id: publish_key
@@ -45,7 +51,6 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           cd distributed-llama
-          # Start Holesail tunnel
           holesail --live ${{ env.ROOT_PORT }} > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
@@ -56,7 +61,6 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
-          # Publish the key to the repository as a file
           echo "$CONNECTION_KEY" > holesail_key.txt
           ENCODED=$(base64 -w0 holesail_key.txt)
           curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
@@ -68,7 +72,6 @@ jobs:
       - name: Start root node
         run: |
           cd distributed-llama
-          # Root listens on 0.0.0.0:$ROOT_PORT
           ./dllama root \
             --port ${{ env.ROOT_PORT }} \
             --nthreads 4 \
@@ -78,13 +81,11 @@ jobs:
       - name: Wait for workers to connect
         run: |
           echo "⏳ Waiting for ${{ env.WORKER_COUNT }} workers to connect..."
-          # The root will automatically accept connections; we wait a bit
           sleep 60
 
       - name: Start API server
         run: |
           cd distributed-llama
-          # Workers connect to root, so we point the API to root
           ./dllama-api \
             --port ${{ env.API_PORT }} \
             --model models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m \
@@ -100,7 +101,7 @@ jobs:
             sleep 2
           done
 
-      - name: Expose API via Cloudflare Tunnel (public access)
+      - name: Expose API via Cloudflare Tunnel (optional)
         run: |
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -122,9 +123,6 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To connect workers manually (if needed):"
-          echo "   holesail --connect \"$CONNECTION_KEY\" --port ${{ env.ROOT_PORT }}"
-          echo ""
           echo "🧠 Model: Qwen 3 1.7B Q40 (2.2 GB) – for testing"
           echo "📊 Nodes: 1 Queen (root) + ${{ env.WORKER_COUNT }} Workers = 4 nodes"
           echo "================================================================="
@@ -132,12 +130,8 @@ jobs:
       - name: Keep alive
         run: sleep infinity
 
-  # ============================================================
-  # WORKERS – Start in parallel with queen (no needs: queen)
-  # ============================================================
   worker:
     runs-on: ubuntu-latest
-    # REMOVED: needs: queen
     strategy:
       matrix:
         worker_id: [1, 2, 3]
@@ -158,9 +152,16 @@ jobs:
       - name: Download model (same as queen)
         run: |
           cd distributed-llama
-          python3 launch.py ${{ env.MODEL_NAME }}
+          echo "n" | python3 launch.py ${{ env.MODEL_NAME }}
+          if [ -f models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m ] && \
+             [ -f models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t ]; then
+            echo "✅ Model files downloaded"
+          else
+            echo "❌ Model files missing"
+            exit 1
+          fi
 
-      - name: Fetch Holesail key from repository (with retry)
+      - name: Fetch Holesail key from repository
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
