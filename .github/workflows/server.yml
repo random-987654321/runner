@@ -5,7 +5,10 @@ on:
 
 env:
   OLLAMA_MODEL: granite4:tiny-h
-  OLLAMA_LLAMA_CPP_ARGS: "-t 4 -tb 4 -fa 1 --cpu-strict 1 --cpu-range 0-3 -c 66000"
+  OLLAMA_FLASH_ATTENTION: 1
+  OLLAMA_NUM_THREADS: 4
+  OLLAMA_KV_CACHE_TYPE: q8_0
+  OLLAMA_CONTEXT_LENGTH: 70000
   HERMES_PORT: 18789
 
 jobs:
