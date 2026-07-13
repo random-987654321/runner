@@ -5,12 +5,7 @@ on:
 
 env:
   OLLAMA_MODEL: granite4:tiny-h
-  OLLAMA_NUM_THREADS: 4
-  OLLAMA_NUM_CTX: 2048
-  OLLAMA_FLASH_ATTENTION: 1
-  OLLAMA_KV_CACHE_SIZE: 512
-  OLLAMA_NUMA: 1
-  OLLAMA_LLAMA_CPP_ARGS: "-t 4 -tb 4 -fa on -ctk q4_0 -ctv q4_0 --cpu-strict 1 --cpu-range 0-3 -c 2048"
+  OLLAMA_LLAMA_CPP_ARGS: "-t 4 -tb 4 -fa 1 --cpu-strict 1 --cpu-range 0-3 -c 66000"
   HERMES_PORT: 18789
 
 jobs:
