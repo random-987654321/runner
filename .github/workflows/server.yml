@@ -25,7 +25,7 @@ jobs:
 
       - name: Download model (Qwen2.5-7B Q4_K_M)
         run: |
-          MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf"
+          MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"
           curl -L -o model.gguf "$MODEL_URL" -f --retry 3
           if [ "$(head -c 4 model.gguf)" != "GGUF" ]; then
             echo "❌ Invalid GGUF"
