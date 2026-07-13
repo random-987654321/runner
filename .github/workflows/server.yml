@@ -25,11 +25,7 @@ jobs:
 
       - name: Start Ollama with CPU affinity (no sudo)
         run: |
-          # Kill any existing ollama process
-          pkill -f ollama || true
-          sleep 2
-          # Start ollama pinned to cores 0-3 with all env vars
-          taskset -c 0-3 ollama serve &
+          ollama serve &
           # Wait for it to be ready
           for i in {1..15}; do
             if curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
