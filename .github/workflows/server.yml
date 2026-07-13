@@ -1,4 +1,4 @@
-name: distributed-llama 4-Node Test (Qwen 30B MoE)
+name: distributed-llama Test (Qwen 1.7B, 4 Nodes)
 
 on:
   workflow_dispatch:
@@ -7,14 +7,14 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 3                     # Number of workers (total nodes = WORKER_COUNT + 1)
-  MODEL_NAME: "qwen3_30b_a3b_q40"
+  MODEL_NAME: "qwen3_1.7b_q40"
   ROOT_PORT: 9999
   API_PORT: 8080
+  WORKER_COUNT: 3
 
 jobs:
   # ============================================================
-  # QUEEN – Root Node
+  # QUEEN – Root Node + API server
   # ============================================================
   queen:
     runs-on: ubuntu-latest
@@ -33,15 +33,19 @@ jobs:
           make dllama
           make dllama-api
 
-      - name: Download model (Qwen 3 30B A3B Q40)
+      - name: Download model (Qwen 3 1.7B Q40 – 2.2 GB)
         run: |
           cd distributed-llama
           python3 launch.py ${{ env.MODEL_NAME }}
 
-      - name: Start Holesail tunnel for root port
-        id: holesail
+      - name: Start Holesail tunnel and publish key
+        id: publish_key
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           cd distributed-llama
+          # Start Holesail tunnel
           holesail --live ${{ env.ROOT_PORT }} > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
@@ -51,30 +55,36 @@ jobs:
             exit 1
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
-          echo "✅ Holesail key: $CONNECTION_KEY"
 
-      - name: Wait for workers to connect
-        run: |
-          echo "⏳ Waiting for ${{ env.WORKER_COUNT }} workers to connect..."
-          # The root will automatically accept connections
-          # We'll just wait a bit to ensure workers are up
-          sleep 60
+          # Publish the key to the repository as a file
+          echo "$CONNECTION_KEY" > holesail_key.txt
+          ENCODED=$(base64 -w0 holesail_key.txt)
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/holesail_key.txt" \
+            -d "{\"message\":\"publish holesail key\",\"content\":\"$ENCODED\"}" || true
+          echo "✅ Holesail key published: $CONNECTION_KEY"
 
-      - name: Start distributed-llama root node
+      - name: Start root node
         run: |
           cd distributed-llama
-          # Root listens on 0.0.0.0:ROOT_PORT
+          # Root listens on 0.0.0.0:$ROOT_PORT
           ./dllama root \
             --port ${{ env.ROOT_PORT }} \
             --nthreads 4 \
             > root.log 2>&1 &
-          # Wait for root to be ready
-          sleep 10
+          sleep 5
+
+      - name: Wait for workers to connect
+        run: |
+          echo "⏳ Waiting for ${{ env.WORKER_COUNT }} workers to connect..."
+          # The root will automatically accept connections; we wait a bit
+          sleep 60
 
       - name: Start API server
         run: |
           cd distributed-llama
-          # The API server uses the same model and workers (root handles them)
+          # Workers connect to root, so we point the API to root
           ./dllama-api \
             --port ${{ env.API_PORT }} \
             --model models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m \
@@ -90,7 +100,7 @@ jobs:
             sleep 2
           done
 
-      - name: Expose API via Cloudflare Tunnel (optional)
+      - name: Expose API via Cloudflare Tunnel (public access)
         run: |
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -106,19 +116,16 @@ jobs:
 
       - name: Print access info
         env:
-          CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
+          CONNECTION_KEY: ${{ steps.publish_key.outputs.connection_key }}
         run: |
           echo "================================================================="
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To connect workers from other runners:"
+          echo "🌐 To connect workers manually (if needed):"
           echo "   holesail --connect \"$CONNECTION_KEY\" --port ${{ env.ROOT_PORT }}"
           echo ""
-          echo "🌐 API URL (if Cloudflare tunnel failed):"
-          echo "   http://127.0.0.1:${{ env.API_PORT }}"
-          echo ""
-          echo "🧠 Model: Qwen 3 30B A3B Q40 (17 GB)"
+          echo "🧠 Model: Qwen 3 1.7B Q40 (2.2 GB) – for testing"
           echo "📊 Nodes: 1 Queen (root) + ${{ env.WORKER_COUNT }} Workers = 4 nodes"
           echo "================================================================="
 
@@ -126,11 +133,11 @@ jobs:
         run: sleep infinity
 
   # ============================================================
-  # WORKERS – 3 nodes
+  # WORKERS – Start in parallel with queen (no needs: queen)
   # ============================================================
   worker:
     runs-on: ubuntu-latest
-    needs: queen     # Wait for queen to publish Holesail key
+    # REMOVED: needs: queen
     strategy:
       matrix:
         worker_id: [1, 2, 3]
@@ -153,19 +160,31 @@ jobs:
           cd distributed-llama
           python3 launch.py ${{ env.MODEL_NAME }}
 
-      - name: Fetch Holesail connection key from queen
+      - name: Fetch Holesail key from repository (with retry)
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "📡 Fetching Holesail key from queen's output..."
-          # In a real workflow, we'd store the key in a file or environment variable.
-          # For simplicity, we assume the queen printed it in the logs.
-          # Alternatively, we can store it in a repository file.
-          # We'll use a dummy approach: manually set it from the queen's log.
-          # For automation, we could have the queen write to a file and read it.
-          CONNECTION_KEY="hs://s000..." # Placeholder
-          echo "CONNECTION_KEY=$CONNECTION_KEY" >> $GITHUB_ENV
+          echo "📡 Fetching Holesail key..."
+          for attempt in {1..60}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/holesail_key.txt" 2>/dev/null)
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null 2>&1; then
+              KEY=$(echo "$RESPONSE" | jq -r '.content' | base64 -d | tr -d '\n\r')
+              if [ -n "$KEY" ]; then
+                echo "Fetched key: $KEY"
+                echo "CONNECTION_KEY=$KEY" >> $GITHUB_ENV
+                break
+              fi
+            fi
+            echo "Waiting for key... ($attempt/60)"
+            sleep 5
+          done
+          if [ -z "$CONNECTION_KEY" ]; then
+            echo "❌ Failed to fetch Holesail key"
+            exit 1
+          fi
 
       - name: Connect to queen via Holesail
         run: |
