@@ -1,4 +1,4 @@
-name: Hermes + llama.cpp (Granite 4.0 H Tiny) + Holesail
+name: Queen (Hermes Agent + Ollama + ornith:9b)
 
 on:
   workflow_dispatch:
@@ -7,10 +7,8 @@ permissions:
   contents: write
 
 env:
-  # Official IBM Granite 4.0 H Tiny GGUF (Q4_K_M)
-  MODEL_URL: "https://huggingface.co/ibm-granite/granite-4.0-h-tiny-GGUF/resolve/main/granite-4.0-h-tiny-Q4_K_M.gguf"
+  OLLAMA_MODEL: granite4:tiny-h
   HERMES_PORT: 18789
-  LLAMA_CPP_VERSION: "b9945"
 
 jobs:
   queen:
@@ -23,54 +21,13 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl xz-utils nodejs npm python3-pip
-          sudo npm install -g holesail
+          sudo apt-get install -y curl xz-utils nodejs npm
+      # ---------- Setup Ollama ----------
+      - name: Setup Ollama
+        uses: ai-action/setup-ollama@v2
 
-      # ---------- Download llama.cpp binaries ----------
-      - name: Download llama.cpp binaries
-        run: |
-          wget https://github.com/ggml-org/llama.cpp/releases/download/${{ env.LLAMA_CPP_VERSION }}/llama-${{ env.LLAMA_CPP_VERSION }}-bin-ubuntu-x64.tar.gz
-          tar -xzf llama-${{ env.LLAMA_CPP_VERSION }}-bin-ubuntu-x64.tar.gz
-
-      # ---------- Download the GGUF model ----------
-      - name: Download model
-        run: |
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
-          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
-            echo "✅ Valid GGUF model downloaded (4.3 GB)"
-          else
-            echo "❌ Invalid GGUF file"
-            exit 1
-          fi
-
-      # ---------- Start llama-server with MoE optimised flags ----------
-      - name: Start llama-server
-        run: |
-          cd llama-${{ env.LLAMA_CPP_VERSION }}
-          chmod +x llama-server
-          nohup ./llama-server \
-            -m ../model.gguf \
-            -t 4 \
-            -tb 4 \
-            -fa 1 \
-            -c 65000 \
-            --no-mmap \
-            --cpu-strict 1 \
-            --cpu-range 0-3 \
-            --cpu-moe \
-            --n-cpu-moe 4 \
-            --host 127.0.0.1 \
-            --port 8080 \
-            > server.log 2>&1 &
-          # Wait for server to be ready
-          for i in {1..30}; do
-            if curl -s http://127.0.0.1:8080/health > /dev/null; then
-              echo "✅ llama-server ready"
-              break
-            fi
-            echo "⏳ Waiting for server... ($i/30)"
-            sleep 2
-          done
+      - name: Pull Ollama model
+        run: ollama pull ${{ env.OLLAMA_MODEL }}
 
       # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
@@ -78,27 +35,24 @@ jobs:
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
+      # ---------- Install Holesail ----------
+      - name: Install Holesail
+        run: sudo npm install -g holesail
 
-      # ---------- Configure Hermes for llama.cpp ----------
+      # ---------- Configure Hermes for Ollama (with API key) ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
           cat > ~/.hermes/config.yaml << EOF
           model:
-            default: "granite-4.0-h-tiny"
+            default: "${{ env.OLLAMA_MODEL }}"
             provider: "custom"
-            base_url: "http://127.0.0.1:8080/v1"
-            api_key: "sk-no-api-key"
+            base_url: "http://localhost:11434/v1"
+            api_key: "sk-no-key-required"
           gateway:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
-          skills:
-            enabled:
-              - terminal
-              - file_editor
-              - web_browser
           EOF
-
       # ---------- Configure dashboard authentication ----------
       - name: Configure Hermes authentication
         run: |
@@ -110,15 +64,13 @@ jobs:
           HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-
       # ---------- Install web + pty extras for dashboard ----------
       - name: Install dashboard dependencies
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           cd ~/.hermes/hermes-agent
           uv pip install -e ".[web,pty]" || pip install -e ".[web,pty]"
-
-      # ---------- Start Hermes Dashboard ----------
+      # ---------- Start Hermes Dashboard (Ollama is already running) ----------
       - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
@@ -133,7 +85,6 @@ jobs:
             echo "⏳ Waiting for dashboard... ($i/20)"
             sleep 2
           done
-
       # ---------- Expose Dashboard via Holesail ----------
       - name: Expose Dashboard with Holesail
         id: holesail
@@ -148,7 +99,6 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
           echo "✅ Holesail key: $CONNECTION_KEY"
-
       # ---------- Print access instructions ----------
       - name: Print access
         env:
@@ -172,12 +122,7 @@ jobs:
           echo "   Username: admin"
           echo "   Password: ${{ env.ADMIN_PASSWORD }}"
           echo ""
-          echo "🧠 Model: Granite 4.0 H Tiny (7B MoE, 1B active) – Q4_K_M"
-          echo "   → 4.3 GB file, fits easily in 16 GB RAM"
-          echo "⚙️  llama.cpp optimised for MoE (CPU pinning, Flash Attention, MoE)"
-          echo "💡 Tool calling: ✅ Supported (enterprise-grade)"
+          echo "💡 Model: ${{ env.OLLAMA_MODEL }} (5.6 GB, Q4_K_M)"
+          echo "💡 API key is set to empty string (custom provider)."
           echo "================================================================="
-
-      # ---------- Keep runner alive ----------
-      - name: Keep alive
-        run: sleep infinity
+          sleep infinity
